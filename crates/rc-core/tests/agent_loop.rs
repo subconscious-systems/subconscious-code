@@ -7,7 +7,8 @@ use rc_core::{
     agent::AgentLoop, model::EventSink, model::FinalizedToolCall, model::Model, model::ModelError,
     model::ModelRequest, model::ModelResponse, model::NullSink, project::project,
     project::verify_invariant, registry::ToolRegistry, tool::Concurrency, tool::Tool, tool::ToolCtx,
-    tool::ToolError, tool::ToolOutcome, turn::Session, turn::ToolCall, turn::Turn,
+    tool::ToolError, tool::ToolOutcome, turn::Session, turn::ToolCall, turn::Turn, AllowAllChecker,
+    Mode, NullPrompter, PermissionChecker, PermissionEngine,
 };
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -71,11 +72,11 @@ async fn loop_runs_tool_then_answers() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry);
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
 
     let mut session = Session::new("s1".into(), std::env::temp_dir(), "mock".into());
     let outcome = agent
-        .run(&mut session, "do it".into(), &NullSink, CancellationToken::new())
+        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
@@ -124,11 +125,11 @@ async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry);
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
 
     let mut session = Session::new("s2".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "x".into(), &NullSink, CancellationToken::new())
+        .run(&mut session, "x".into(), &NullSink, &NullPrompter, CancellationToken::new())
         .await
         .unwrap();
 
@@ -139,5 +140,51 @@ async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
     match &session.messages[2] {
         Turn::ToolResult { result, .. } => assert!(result.render().contains("invalid tool arguments")),
         other => panic!("expected a parse-error tool result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ask_escalation_denied_by_null_prompter_becomes_a_denied_result() {
+    // Default mode, no rules: a mutating tool call escalates to Ask; the
+    // NullPrompter denies it, so the model sees a denied tool result (the tool
+    // never runs). "Edit" isn't even registered — permission is checked first.
+    let registry = Arc::new(ToolRegistry::new(vec![]));
+    let engine = Arc::new(PermissionEngine::new(Mode::Default, vec![], vec![], vec![]))
+        as Arc<dyn PermissionChecker>;
+    let responses = vec![
+        ModelResponse {
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "c1".into(),
+                name: "Edit".into(),
+                arguments: "{}".into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            text: "ok".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(model, registry, engine);
+
+    let mut session = Session::new("s3".into(), std::env::temp_dir(), "mock".into());
+    agent
+        .run(&mut session, "edit it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(verify_invariant(&project(&session.messages)).is_ok());
+    match &session.messages[2] {
+        Turn::ToolResult { result, .. } => {
+            assert!(result.render().contains("denied"), "expected a denied result, got {:?}", result.render())
+        }
+        other => panic!("expected a denied tool result, got {other:?}"),
     }
 }

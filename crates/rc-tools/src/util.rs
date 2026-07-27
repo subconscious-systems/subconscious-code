@@ -2,15 +2,14 @@
 //! read-registry check/recording, atomic writes, line-ending preservation,
 //! output capping, ANSI stripping, and the Bash safety floor.
 //!
-//! The path-scope check here is a *safety floor*; the full permission engine
-//! (deny-read globs, `openat2` RESOLVE_BENEATH, TOCTOU-safe canonicalize) is
-//! M3. The Bash safety floor is a conservative deny-list that over-refuses
-//! rather than under-refuse; M3 replaces it with command parsing + prompts.
+//! Path containment (resolve_within/loose) is re-exported from rc-perm (§7.5 —
+//! one function, used everywhere). The Bash safety floor below is a conservative
+//! deny-list that over-refuses; the rc-perm engine (M3) is authoritative.
 
 use rc_core::{ToolCtx, ToolOutcome};
 use schemars::JsonSchema;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 /// Generate the JSON Schema `parameters` for a `JsonSchema` type, stripping
@@ -67,59 +66,8 @@ pub fn require_current_read(ctx: &ToolCtx, canon: &Path) -> Option<ToolOutcome> 
     None
 }
 
-fn root_canon(root: &Path) -> PathBuf {
-    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
-}
-
-fn under_root(canon: &Path, roots: &[PathBuf]) -> bool {
-    roots.iter().any(|r| canon.starts_with(root_canon(r)))
-}
-
-/// Resolve a path that must already exist (for `Read`/`Edit`/`Grep`): canonicalize
-/// physically (resolves symlinks) and require the result under an allowed root.
-pub fn resolve_within(roots: &[PathBuf], cwd: &Path, candidate: &str) -> Result<PathBuf, String> {
-    let p = Path::new(candidate);
-    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
-    let canon = std::fs::canonicalize(&abs).map_err(|e| format!("{}: {e}", abs.display()))?;
-    if under_root(&canon, roots) {
-        Ok(canon)
-    } else {
-        Err(format!("path outside allowed roots: {}", canon.display()))
-    }
-}
-
-/// Resolve a path that may not exist yet (for `Write` creating a new file):
-/// canonicalize the parent and append the file name, then scope-check.
-pub fn resolve_within_loose(roots: &[PathBuf], cwd: &Path, candidate: &str) -> Result<PathBuf, String> {
-    let p = Path::new(candidate);
-    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
-    if let Ok(canon) = std::fs::canonicalize(&abs) {
-        return if under_root(&canon, roots) {
-            Ok(canon)
-        } else {
-            Err(format!("path outside allowed roots: {}", canon.display()))
-        };
-    }
-    let parent = abs.parent().unwrap_or(Path::new("."));
-    let file_name = abs.file_name().ok_or_else(|| "invalid path".to_string())?;
-    let parent_canon = std::fs::canonicalize(parent).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!(
-                "parent directory {} does not exist — create it first (e.g. `Bash` mkdir -p {})",
-                parent.display(),
-                parent.display()
-            )
-        } else {
-            format!("{}: {e}", parent.display())
-        }
-    })?;
-    let canon = parent_canon.join(file_name);
-    if under_root(&canon, roots) {
-        Ok(canon)
-    } else {
-        Err(format!("path outside allowed roots: {}", canon.display()))
-    }
-}
+// Path containment lives in rc-perm now (§7.5 — one function, used everywhere).
+pub use rc_perm::{resolve_within, resolve_within_loose};
 
 /// Atomic write: temp file in the same dir -> fsync -> rename (§6.2).
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {

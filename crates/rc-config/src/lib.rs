@@ -1,18 +1,21 @@
 //! Layered settings (§10).
 //!
-//! M0 implements a useful subset of the §10.1 precedence stack:
+//! M0 implemented a useful subset of the §10.1 precedence stack:
 //!   compiled defaults → user (`~/.rc/settings.json`) → project
 //!   (`./.rc/settings.json`) → env vars. CLI flags (applied in rc-cli) override
-//!   on top. Enterprise/locked settings, deep-merge of arbitrary keys, JSON
-//!   Schema validation, and hot-reload land in later milestones (G1/G4/G5).
+//!   on top. Enterprise/locked settings, JSON Schema validation, and hot-reload
+//!   land in later milestones (G1/G4/G5).
 //!
 //! The API key is never stored in a settings file — it is resolved from the
 //! env var named by `provider.api_key_env` (default `RC_API_KEY`). `rc doctor`
 //! (G7) will complain loudly if a key-shaped string appears in any file.
+//!
+//! M3 adds the `permissions` block (§7.1/§10.2): allow/ask/deny rule lists,
+//! `defaultMode`, and `additionalDirectories`.
 
 use std::path::{Path, PathBuf};
 
-/// Resolved settings ready to drive a chat client.
+/// Resolved settings ready to drive a chat client + the permission engine.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub base_url: String,
@@ -20,6 +23,20 @@ pub struct Settings {
     pub model: String,
     pub small_model: String,
     pub timeout_ms: u64,
+    pub permissions: PermissionsConfig,
+}
+
+/// The `permissions` block (§7.1/§10.2). Rule strings are parsed by rc-perm.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    pub allow: Vec<String>,
+    pub ask: Vec<String>,
+    pub deny: Vec<String>,
+    /// "default" | "acceptEdits" | "plan" | "bypassPermissions".
+    pub default_mode: String,
+    /// Extra directories the agent may touch, beyond the cwd.
+    pub additional_directories: Vec<String>,
 }
 
 /// On-disk shape of a settings file. Unknown keys are ignored (forward-compat).
@@ -29,6 +46,7 @@ struct SettingsFile {
     provider: Option<ProviderFile>,
     model: Option<String>,
     small_model: Option<String>,
+    permissions: Option<PermissionsConfig>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -53,13 +71,14 @@ impl Settings {
         let mut timeout_ms = DEFAULT_TIMEOUT_MS;
         let mut model = DEFAULT_MODEL.to_string();
         let mut small_model = DEFAULT_SMALL_MODEL.to_string();
+        let mut permissions = PermissionsConfig::default();
 
         // Later layers override earlier ones. User before project so a
         // committed project file beats a user global — matches §10.1 (project
         // is higher precedence than user).
-        let mut layers: Vec<Option<PathBuf>> =
+        let layers: Vec<Option<PathBuf>> =
             vec![user_settings_path(), project_settings_path(project_dir)];
-        for path in layers.drain(..).flatten() {
+        for path in layers.into_iter().flatten() {
             if let Some(file) = read_settings(&path) {
                 if let Some(p) = file.provider {
                     if let Some(u) = p.base_url { base_url = u; }
@@ -68,6 +87,7 @@ impl Settings {
                 }
                 if let Some(m) = file.model { model = m; }
                 if let Some(s) = file.small_model { small_model = s; }
+                if let Some(p) = file.permissions { permissions = p; }
             }
         }
 
@@ -76,12 +96,13 @@ impl Settings {
         if let Ok(v) = std::env::var("RC_MODEL") { if !v.is_empty() { model = v; } }
         if let Ok(v) = std::env::var("RC_SMALL_MODEL") { if !v.is_empty() { small_model = v; } }
         if let Ok(v) = std::env::var("RC_TIMEOUT_MS") { if let Ok(t) = v.parse() { timeout_ms = t; } }
+        if let Ok(v) = std::env::var("RC_DEFAULT_MODE") { if !v.is_empty() { permissions.default_mode = v; } }
 
         let api_key = std::env::var(&api_key_env)
             .ok()
             .filter(|s| !s.is_empty());
 
-        Settings { base_url, api_key, model, small_model, timeout_ms }
+        Settings { base_url, api_key, model, small_model, timeout_ms, permissions }
     }
 }
 

@@ -185,7 +185,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
 dependencies = [
  "find-msvc-tools",
- "shlex",
+ "shlex 2.0.1",
 ]
 
 [[package]]
@@ -1114,6 +1114,7 @@ name = "rc-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rc-perm",
  "rc-proto",
  "serde",
  "serde_json",
@@ -1139,6 +1140,13 @@ version = "0.1.0"
 [[package]]
 name = "rc-perm"
 version = "0.1.0"
+dependencies = [
+ "globset",
+ "serde",
+ "serde_json",
+ "shlex 1.3.0",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "rc-proto"
@@ -1180,6 +1188,7 @@ dependencies = [
  "globset",
  "ignore",
  "rc-core",
+ "rc-perm",
  "regex",
  "schemars",
  "serde",
@@ -1457,6 +1466,12 @@ dependencies = [
  "ryu",
  "serde",
 ]
+
+[[package]]
+name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"

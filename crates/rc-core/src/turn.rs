@@ -109,6 +109,9 @@ pub struct Session {
     pub messages: Vec<Turn>,
     pub mode: AgentMode,
     pub read_registry: SharedReadRegistry,
+    /// Session-scoped permission grants ("Yes, and don't ask again for this"),
+    /// added by the loop from [`crate::prompt::AskResponse::Session`].
+    pub perm_grants: Vec<String>,
 }
 
 impl Session {
@@ -121,6 +124,7 @@ impl Session {
             messages: Vec::new(),
             mode: AgentMode::Default,
             read_registry: Arc::new(std::sync::Mutex::new(ReadRegistry::new())),
+            perm_grants: Vec::new(),
         }
     }
 }

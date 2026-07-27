@@ -5,8 +5,9 @@
 use async_trait::async_trait;
 use rc_core::tool::Tool;
 use rc_core::{
-    AgentLoop, EventSink, FinalizedToolCall, FinishReason, Model, ModelError, ModelRequest,
-    ModelResponse, NullSink, Session, ToolCall, ToolRegistry, Turn, project, verify_invariant,
+    AgentLoop, AllowAllChecker, EventSink, FinalizedToolCall, FinishReason, Model, ModelError,
+    ModelRequest, ModelResponse, NullPrompter, NullSink, PermissionChecker, Session, ToolCall,
+    ToolRegistry, Turn, project, verify_invariant,
 };
 use rc_tools::Read;
 use std::collections::VecDeque;
@@ -58,11 +59,11 @@ async fn read_tool_runs_through_the_loop() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry);
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
 
     let mut session = Session::new("s".into(), dir.path().to_path_buf(), "mock".into());
     agent
-        .run(&mut session, "what's in the file".into(), &NullSink, CancellationToken::new())
+        .run(&mut session, "what's in the file".into(), &NullSink, &NullPrompter, CancellationToken::new())
         .await
         .unwrap();
 

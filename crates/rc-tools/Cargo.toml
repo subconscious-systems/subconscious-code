@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 rc-core = { path = "../rc-core" }
+rc-perm = { path = "../rc-perm" }
 serde.workspace = true
 serde_json.workspace = true
 schemars = "0.8"

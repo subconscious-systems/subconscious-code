@@ -16,6 +16,7 @@
 pub mod agent;
 pub mod model;
 pub mod project;
+pub mod prompt;
 pub mod registry;
 pub mod state;
 pub mod tool;
@@ -26,7 +27,12 @@ pub use model::{
     ChatModel, EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse, NullSink,
 };
 pub use rc_proto::FinishReason;
+pub use prompt::{AskResponse, NullPrompter, Prompter};
 pub use project::{project, verify_invariant};
+pub use rc_perm::{
+    AllowAllChecker, BypassChecker, Decision, Mode, PermissionChecker, PermissionEngine,
+    resolve_within, resolve_within_loose,
+};
 pub use registry::ToolRegistry;
 pub use state::ReadRegistry;
 pub use tool::{Artifact, Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
