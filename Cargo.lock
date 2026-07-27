@@ -1436,7 +1436,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "similar",
+ "similar 2.7.0",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1452,6 +1452,7 @@ dependencies = [
  "rc-core",
  "rc-rt",
  "serde_json",
+ "similar 0.5.0",
 ]
 
 [[package]]
@@ -1787,6 +1788,15 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "similar"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3eda43b31c5a15bbdaadef2c32354240b1d4b551b944b3a021838b3bafff996"
+dependencies = [
+ "unicode-segmentation",
 ]
 
 [[package]]

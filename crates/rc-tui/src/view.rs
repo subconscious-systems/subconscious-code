@@ -6,6 +6,7 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use rc_core::{AgentMode, Usage};
@@ -24,8 +25,10 @@ pub(crate) struct PendingAsk {
 /// [`draw`] (and a `TestBackend` render test) can run with no tokio and no model.
 #[derive(Clone)]
 pub(crate) struct ViewState {
-    pub transcript: Vec<String>,
-    /// In-progress assistant text (flushed to `transcript` on the next boundary).
+    /// Completed transcript entries, parsed to styled lines once (incremental:
+    /// parsed on flush, not re-parsed per frame — §12's O(n²) trap).
+    pub transcript: Vec<Line<'static>>,
+    /// In-progress assistant text (markdown-parsed and flushed on the next boundary).
     pub current_text: String,
     pub mode: AgentMode,
     pub last_usage: Option<Usage>,
@@ -49,15 +52,13 @@ impl ViewState {
         }
     }
 
-    /// Move accumulated assistant text into the transcript (one entry per line).
+    /// Move accumulated assistant text into the transcript, markdown-parsed once.
     pub(crate) fn flush_text(&mut self) {
         if self.current_text.is_empty() {
             return;
         }
         let text = std::mem::take(&mut self.current_text);
-        for line in text.lines() {
-            self.transcript.push(line.to_string());
-        }
+        self.transcript.extend(crate::markdown::parse_blocks(&text));
     }
 }
 
@@ -80,14 +81,13 @@ fn draw_transcript(frame: &mut Frame, state: &ViewState, area: Rect) {
     // Show the bottom of the transcript (latest lines) within the area height.
     let h = area.height as usize;
     let start = state.transcript.len().saturating_sub(h);
-    let mut text = state.transcript[start..].join("\n");
+    let mut lines: Vec<Line<'static>> = state.transcript[start..].to_vec();
+    // The in-progress text is re-parsed each frame (small/growing) — that's the
+    // only per-frame parse; completed turns above are already cached.
     if !state.current_text.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&state.current_text);
+        lines.extend(crate::markdown::parse_blocks(&state.current_text));
     }
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
 }
 
 fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect) {
@@ -185,11 +185,26 @@ mod tests {
     #[test]
     fn transcript_and_streaming_text_render() {
         let mut state = ViewState::new("m".into());
-        state.transcript.push("-> Read README.md".into());
-        state.transcript.push("<- Read: # rc".into());
+        state.transcript.push(Line::from("-> Read README.md"));
+        state.transcript.push(Line::from("<- Read: # rc"));
         state.current_text = "streaming answer".into();
         let screen = rendered(&state);
         assert!(screen.contains("-> Read README.md"), "tool start line: {screen}");
         assert!(screen.contains("streaming answer"), "in-progress text: {screen}");
+    }
+
+    #[test]
+    fn markdown_and_diff_render_in_the_transcript() {
+        // Completed markdown is parsed once on flush; an Edit previews a word diff.
+        let mut state = ViewState::new("m".into());
+        state.transcript.extend(crate::markdown::parse_blocks("# Heading\n\nsome **bold** text"));
+        state.transcript.push(crate::diff::word_diff_line("old word", "new word"));
+        let screen = rendered(&state);
+        assert!(screen.contains("Heading"), "heading: {screen}");
+        assert!(screen.contains("bold"), "bold: {screen}");
+        // The inline word diff interleaves the deleted ("old") and inserted
+        // ("new") tokens, then the shared " word" -> "oldnew word".
+        assert!(screen.contains("oldnew"), "diff interleaves old+new: {screen}");
+        assert!(screen.contains("word"), "diff keeps shared word: {screen}");
     }
 }

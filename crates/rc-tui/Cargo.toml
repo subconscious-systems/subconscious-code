@@ -10,5 +10,6 @@ rc-rt = { path = "../rc-rt" }
 rc-core = { path = "../rc-core" }
 ratatui = "0.29"
 crossterm = "0.28"
+similar = { version = "0.5", features = ["unicode"] }
 anyhow.workspace = true
 serde_json.workspace = true

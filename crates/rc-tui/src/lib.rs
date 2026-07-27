@@ -11,6 +11,8 @@
 //! M4b/M4c.
 
 mod app;
+mod diff;
+mod markdown;
 mod view;
 
 use std::io::Stdout;

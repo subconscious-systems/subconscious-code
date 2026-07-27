@@ -9,10 +9,13 @@
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use rc_core::{AgentMode, AskResponse};
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
+use rc_core::{AgentMode, AskResponse, ToolResultBody};
 use rc_rt::{AgentEvent, EventStream, Runtime, UserAction};
 use serde_json::Value;
 
+use crate::diff;
 use crate::Term;
 use crate::view::{self, PendingAsk, ViewState};
 
@@ -31,8 +34,10 @@ impl App {
     pub(crate) fn new(runtime: Runtime, model_name: String) -> Self {
         let stream = runtime.subscribe();
         let mut view = ViewState::new(model_name);
-        view.transcript
-            .push(format!("rc | model: {} | Shift+Tab cycles mode | Ctrl+C quits", view.model_name));
+        view.transcript.push(Line::from(format!(
+            "rc | model: {} | Shift+Tab cycles mode | Ctrl+C quits",
+            view.model_name
+        )));
         Self { runtime, stream, view, quit: false }
     }
 }
@@ -64,10 +69,9 @@ impl App {
         while let Some(ev) = self.stream.try_next() {
             match ev {
                 Ok(e) => self.apply(e),
-                Err(n) => self
-                    .view
-                    .transcript
-                    .push(format!("[stream lagged {n}; oldest deltas lost]")),
+                Err(n) => self.view.transcript.push(Line::from(format!(
+                    "[stream lagged {n}; oldest deltas lost]"
+                ))),
             }
         }
     }
@@ -76,22 +80,27 @@ impl App {
         let v = &mut self.view;
         match ev {
             AgentEvent::Text(t) => v.current_text.push_str(&t),
-            AgentEvent::Reasoning(r) => v.current_text.push_str(&r), // M4a: inline, no styling
+            AgentEvent::Reasoning(r) => v.current_text.push_str(&r),
             AgentEvent::ToolStart { call } => {
                 v.flush_text();
                 v.transcript
-                    .push(format!("-> {} {}", call.name, summarize_args(&call.arguments)));
+                    .push(tool_start_line(&call.name, &summarize_args(&call.arguments)));
+                // An Edit previews the change as a word-level diff of old -> new.
+                if let Some((path, old, new)) = edit_args(&call.arguments) {
+                    v.transcript.push(Line::styled(format!("  edit {path}"), dim_style()));
+                    v.transcript.push(diff::word_diff_line(&old, &new));
+                }
             }
             AgentEvent::ToolEnd { tool, result, .. } => {
                 v.flush_text();
-                v.transcript.push(format!("<- {}: {}", tool, truncate(&result.render(), 200)));
+                v.transcript.push(tool_end_line(&tool, &result));
             }
             AgentEvent::PermissionAsk { id, tool, input, reason } => {
                 v.flush_text();
                 v.pending_ask = Some(PendingAsk { id, tool, input, reason });
             }
             AgentEvent::PermissionDecision { .. } => v.pending_ask = None,
-            AgentEvent::Iter { .. } => {} // M4a: not surfaced in the transcript.
+            AgentEvent::Iter { .. } => {}
             AgentEvent::Usage(u) => v.last_usage = Some(u),
             AgentEvent::Outcome(_) => {
                 v.flush_text();
@@ -99,7 +108,7 @@ impl App {
             }
             AgentEvent::Error(e) => {
                 v.flush_text();
-                v.transcript.push(format!("! {e}"));
+                v.transcript.push(Line::styled(format!("! {e}"), error_style()));
                 v.busy = false;
             }
             AgentEvent::ModeChanged(m) => v.mode = m,
@@ -147,7 +156,7 @@ impl App {
             KeyCode::Enter => {
                 if !self.view.composer.is_empty() {
                     let text = std::mem::take(&mut self.view.composer);
-                    self.view.transcript.push(format!("> {text}"));
+                    self.view.transcript.push(Line::from(format!("> {text}")));
                     self.runtime.action(UserAction::Submit(text));
                 }
             }
@@ -216,6 +225,41 @@ fn summarize_args(args: &str) -> String {
     truncate(args, 80)
 }
 
+/// A styled "tool starting" line: `-> Name summary`.
+fn tool_start_line(name: &str, summary: &str) -> Line<'static> {
+    Line::styled(format!("-> {name} {summary}"), Style::default().fg(Color::Cyan))
+}
+
+/// A styled "tool finished" line, colored by the result kind.
+fn tool_end_line(tool: &str, result: &ToolResultBody) -> Line<'static> {
+    let body = truncate(&result.render(), 200);
+    let style = match result {
+        ToolResultBody::Ok { .. } => Style::default().fg(Color::Green),
+        ToolResultBody::Error { .. } => Style::default().fg(Color::Red),
+        ToolResultBody::Denied { .. } => Style::default().fg(Color::Yellow),
+        ToolResultBody::Interrupted => Style::default().fg(Color::DarkGray),
+    };
+    Line::styled(format!("<- {tool}: {body}"), style)
+}
+
+/// If `args` is an Edit call carrying `file_path`/`old_string`/`new_string`,
+/// return them (for the word-level diff preview). `None` for creates / missing.
+fn edit_args(args: &str) -> Option<(String, String, String)> {
+    let v: Value = serde_json::from_str(args).ok()?;
+    let path = v.get("file_path")?.as_str()?.to_string();
+    let old = v.get("old_string")?.as_str()?.to_string();
+    let new = v.get("new_string")?.as_str()?.to_string();
+    Some((path, old, new))
+}
+
+fn dim_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn error_style() -> Style {
+    Style::default().fg(Color::Red)
+}
+
 /// Char-safe truncation with an ellipsis.
 pub(crate) fn truncate(s: &str, n: usize) -> String {
     let head: String = s.chars().take(n).collect();
@@ -251,5 +295,27 @@ mod tests {
     fn truncate_is_char_safe() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("héllo", 2), "hé..."); // 2 chars + ellipsis
+    }
+
+    #[test]
+    fn edit_args_extracts_path_old_new() {
+        let args = r#"{"file_path":"/a.rs","old_string":"foo","new_string":"bar"}"#;
+        assert_eq!(
+            edit_args(args),
+            Some(("/a.rs".into(), "foo".into(), "bar".into()))
+        );
+        // Missing old/new (e.g. a create) -> no diff preview.
+        assert!(edit_args(r#"{"file_path":"/a.rs"}"#).is_none());
+        assert!(edit_args("{not json}").is_none());
+    }
+
+    #[test]
+    fn tool_end_line_renders_the_result() {
+        let line = tool_end_line(
+            "Read",
+            &ToolResultBody::Ok { content: "hi".into(), truncated: false },
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Read: hi"), "{text}");
     }
 }
