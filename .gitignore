@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+*.pdb
+# Gitignored local settings (§5.6 G2). The committed .rc/settings.json is NOT ignored.
+.rc/settings.local.json
