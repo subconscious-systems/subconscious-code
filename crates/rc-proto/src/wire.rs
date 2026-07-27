@@ -83,8 +83,9 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-/// Non-streaming request. Streaming (M1) adds `stream_options`, `tools`,
-/// `tool_choice`, `parallel_tool_calls`.
+/// Chat completions request. `stream: false` for the non-streaming path,
+/// `true` for streaming (M1 adds `tools`, `tool_choice`, `parallel_tool_calls`,
+/// `stream_options`). Serialized canonically (§4.6).
 #[derive(Serialize, Debug, Clone)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -94,6 +95,56 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     pub stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tools: Vec<ToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoiceValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// A tool definition in the request's `tools` array (§3.2). Names must match
+/// `^[a-zA-Z0-9_-]{1,64}$`; MCP tools are namespaced `mcp__server__tool`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub ty: ToolType,
+    pub function: FunctionDefinition,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolType {
+    #[default]
+    Function,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: String,
+    /// A JSON Schema object. Generated once per tool and reused; canonical
+    /// serialization (§4.6) makes the on-wire bytes stable across turns.
+    pub parameters: serde_json::Value,
+}
+
+/// `tool_choice`. M1 supports the string forms; the `{type:"function",...}`
+/// pin form is P2.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceValue {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct StreamOptions {
+    /// Request a final chunk carrying `usage` (§3.6). Some backends emit it
+    /// with an empty `choices` array — don't assume `choices[0]` exists.
+    pub include_usage: bool,
 }
 
 /// Non-streaming response. Streaming deltas land in M1 (`rc-proto::stream`).

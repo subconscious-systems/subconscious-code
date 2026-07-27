@@ -1,25 +1,34 @@
 //! `rc` — a terminal agent harness speaking OpenAI-compatible chat completions.
 //!
-//! M0: headless one-shot. `rc -p "say hi"` loads settings, issues a single
-//! non-streaming `/v1/chat/completions` request, and prints the assistant
-//! reply. The agentic loop, tools, TUI, and streaming arrive in M1+.
+//! M1: headless agent loop. `rc -p "what's in <file>"` drives the streaming
+//! loop with the `Read` tool registered, executes the tool call, and prints
+//! the model's final answer. The TUI, more tools, and permissions arrive in
+//! later milestones.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use rc_config::Settings;
-use rc_proto::{ChatClient, CompleteOpts, WireMessage};
+use rc_core::agent::{AgentLoop, LoopOutcome};
+use rc_core::model::{ChatModel, Model, NullSink};
+use rc_core::registry::ToolRegistry;
+use rc_core::tool::Tool;
+use rc_core::turn::{Session, Turn};
+use rc_proto::ChatClient;
+use rc_tools::Read;
 use std::process::ExitCode;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rc",
     version,
     about = "A Claude Code–style agent harness (chat completions backend).",
-    long_about = "M0: headless one-shot. Run `rc -p \"<prompt>\"`. \
-                  Streaming, tools, and the TUI arrive in later milestones."
+    long_about = "M1: headless agent loop with the Read tool. Run \
+                  `rc -p \"<prompt>\"`. The TUI and more tools arrive in later milestones."
 )]
 struct Cli {
-    /// One-shot headless mode: print the response to PROMPT and exit (§5.8 U14).
+    /// One-shot headless mode: run the agent loop for PROMPT and print the answer (§5.8 U14).
     #[arg(short, long, value_name = "PROMPT")]
     print: Option<String>,
 
@@ -57,13 +66,17 @@ async fn run(cli: Cli) -> Result<()> {
     let prompt = match cli.print {
         Some(p) if !p.is_empty() => p,
         _ => anyhow::bail!(
-            "M0 is headless-only. Use `rc -p \"<prompt>\"`. The TUI lands in M4."
+            "M1 is headless-only. Use `rc -p \"<prompt>\"`. The TUI lands in M4."
         ),
     };
 
     let mut settings = Settings::load(&std::env::current_dir()?);
-    if let Some(m) = cli.model { settings.model = m; }
-    if let Some(u) = cli.base_url { settings.base_url = u; }
+    if let Some(m) = cli.model {
+        settings.model = m;
+    }
+    if let Some(u) = cli.base_url {
+        settings.base_url = u;
+    }
 
     tracing::debug!(model = %settings.model, base_url = %settings.base_url, "settings loaded");
 
@@ -72,19 +85,45 @@ async fn run(cli: Cli) -> Result<()> {
         .clone()
         .context("no API key: set $RC_API_KEY (or the var named by provider.api_key_env)")?;
 
-    let client = ChatClient::new(settings.base_url, settings.model.clone(), api_key)?;
-    let messages = vec![WireMessage::User { content: prompt.into() }];
+    let client = Arc::new(ChatClient::new(
+        settings.base_url.clone(),
+        api_key,
+        settings.model.clone(),
+    )?);
+    let model = Arc::new(ChatModel::new(client)) as Arc<dyn Model>;
+    let tools = Arc::new(ToolRegistry::new(vec![
+        Arc::new(Read::new()) as Arc<dyn Tool>,
+    ]));
+    let agent = AgentLoop::new(model, tools);
 
-    let resp = client.complete(&messages, &CompleteOpts::default()).await?;
-    let text = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+    let mut session = Session::new(
+        "session".into(),
+        std::env::current_dir()?,
+        settings.model.clone(),
+    );
+    let outcome = agent
+        .run(&mut session, prompt, &NullSink, CancellationToken::new())
+        .await
+        .context("agent loop failed")?;
 
-    println!("{text}");
+    print_result(&session, outcome);
     Ok(())
+}
+
+/// Print the model's final assistant text. The last non-empty assistant turn is
+/// the answer (a tool-calling turn leaves an earlier empty-content assistant).
+fn print_result(session: &Session, outcome: LoopOutcome) {
+    let text = session.messages.iter().rev().find_map(|t| match t {
+        Turn::Assistant { text, .. } if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    });
+    match text {
+        Some(text) => println!("{text}"),
+        None if outcome == LoopOutcome::ItersExceeded => {
+            eprintln!("warning: iteration budget reached before the model finished")
+        }
+        None => eprintln!("(the model produced no answer text)"),
+    }
 }
 
 fn init_tracing() {

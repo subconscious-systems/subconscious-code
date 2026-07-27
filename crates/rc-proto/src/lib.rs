@@ -15,8 +15,16 @@
 pub mod canonical;
 pub mod client;
 pub mod error;
+pub mod stream;
 pub mod wire;
 
 pub use client::{ChatClient, CompleteOpts};
 pub use error::ProtoError;
-pub use wire::{ChatCompletionResponse, ToolCall, Usage, WireMessage};
+pub use stream::{
+    repair_json, AgentStreamEvent, FinalizedToolCall, FinishReason, SseDecoder, StreamFuser,
+    ToolCallAccumulator,
+};
+pub use wire::{
+    ChatCompletionResponse, FunctionCall, FunctionDefinition, StreamOptions, ToolCall,
+    ToolChoiceValue, ToolDefinition, Usage, WireMessage,
+};

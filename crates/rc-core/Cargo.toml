@@ -6,3 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rc-proto = { path = "../rc-proto" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing.workspace = true
+tokio-util = { workspace = true }
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tokio-util = { workspace = true }
+serde_json.workspace = true
