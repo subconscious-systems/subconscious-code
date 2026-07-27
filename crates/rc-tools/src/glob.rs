@@ -22,6 +22,7 @@ pub struct GlobInput {
     pub path: Option<String>,
 }
 
+#[derive(Default)]
 pub struct Glob;
 
 impl Glob {

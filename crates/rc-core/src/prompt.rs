@@ -1,8 +1,13 @@
-//! The interactive-prompt seam (§7.4). The loop calls [`Prompter::ask`] when a
+//! The interactive-prompt seam (§7.4). The loop `await`s [`Prompter::ask`] when a
 //! tool call escalates to Ask; M3's prompters are crude stdin / always-deny.
-//! The TUI (M4) provides a richer one; `--dangerously-skip-permissions` avoids
-//! asking entirely (via `BypassChecker`).
+//! The TUI (M4) provides a richer one whose `ask` emits an event and awaits a
+//! keypress; `--dangerously-skip-permissions` avoids asking entirely (via
+//! `BypassChecker`). The trait is async so a TUI prompter can render and block
+//! on input without stalling a sync call site — the loop's `&mut grants` borrow
+//! is unaffected: `ask(...).await` yields an owned [`AskResponse`] before the
+//! grant-push arm runs.
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 /// A prompter's response to an Ask.
@@ -19,16 +24,18 @@ pub enum AskResponse {
     Deny(String),
 }
 
+#[async_trait]
 pub trait Prompter: Send + Sync {
-    fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse;
+    async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse;
 }
 
 /// Denies every Ask — for tests and non-interactive headless runs without
 /// `--dangerously-skip-permissions` (so unattended `-p` fails closed on Ask).
 #[derive(Default)]
 pub struct NullPrompter;
+#[async_trait]
 impl Prompter for NullPrompter {
-    fn ask(&self, _tool: &str, _input: &Value, _reason: &str) -> AskResponse {
+    async fn ask(&self, _tool: &str, _input: &Value, _reason: &str) -> AskResponse {
         AskResponse::Deny("no prompter available — running non-interactively".into())
     }
 }

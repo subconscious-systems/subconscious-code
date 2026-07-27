@@ -30,8 +30,9 @@ use tokio_util::sync::CancellationToken;
     name = "rc",
     version,
     about = "A Claude Code–style agent harness (chat completions backend).",
-    long_about = "M1: headless agent loop with the Read tool. Run \
-                  `rc -p \"<prompt>\"`. The TUI and more tools arrive in later milestones."
+    long_about = "M4: a headless one-shot (`rc -p \"<prompt>\"`) or the interactive \
+                  TUI (just `rc`). Either way it speaks an OpenAI-compatible chat \
+                  completions backend."
 )]
 struct Cli {
     /// One-shot headless mode: run the agent loop for PROMPT and print the answer (§5.8 U14).
@@ -74,13 +75,6 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let prompt = match cli.print {
-        Some(p) if !p.is_empty() => p,
-        _ => anyhow::bail!(
-            "M1 is headless-only. Use `rc -p \"<prompt>\"`. The TUI lands in M4."
-        ),
-    };
-
     let mut settings = Settings::load(&std::env::current_dir()?);
     if let Some(m) = cli.model {
         settings.model = m;
@@ -128,32 +122,66 @@ async fn run(cli: Cli) -> Result<()> {
         ))
     };
 
-    // Interactive prompt only on a TTY; non-interactive runs deny on Ask (fail
-    // closed) — `--dangerously-skip-permissions` is the unattended escape hatch.
-    let prompter: Box<dyn Prompter> = if cli.dangerously_skip_permissions || !std::io::stdin().is_terminal() {
-        Box::new(NullPrompter)
-    } else {
-        Box::new(StdinPrompter)
-    };
-
     let extra_dirs: Vec<PathBuf> = settings
         .permissions
         .additional_directories
         .iter()
         .filter_map(|d| std::fs::canonicalize(d).ok())
         .collect();
-
-    let agent = AgentLoop::new(model, tools, permission);
     let mut session = Session::new("session".into(), std::env::current_dir()?, settings.model.clone());
     session.extra_dirs = extra_dirs;
 
+    match cli.print {
+        // Headless one-shot: run one turn and print the answer (§5.8 U14).
+        Some(prompt) if !prompt.is_empty() => {
+            run_headless(model, tools, permission, session, prompt).await
+        }
+        // Otherwise: launch the interactive TUI (M4).
+        _ => run_tui(model, tools, permission, session, settings.model).await,
+    }
+}
+
+/// Headless `-p`: one turn, then print the final assistant text. An interactive
+/// stdin prompter is used only on a TTY; non-interactive runs deny on Ask (fail
+/// closed). `--dangerously-skip-permissions` uses `BypassChecker`, which never
+/// asks, so the prompter is moot in bypass mode.
+async fn run_headless(
+    model: Arc<dyn Model>,
+    tools: Arc<ToolRegistry>,
+    permission: Arc<dyn PermissionChecker>,
+    mut session: Session,
+    prompt: String,
+) -> Result<()> {
+    let prompter: Box<dyn Prompter> = if std::io::stdin().is_terminal() {
+        Box::new(StdinPrompter)
+    } else {
+        Box::new(NullPrompter)
+    };
+    let agent = AgentLoop::new(model, tools, permission);
     let outcome = agent
         .run(&mut session, prompt, &NullSink, &*prompter, CancellationToken::new())
         .await
         .context("agent loop failed")?;
-
     print_result(&session, outcome);
     Ok(())
+}
+
+/// Interactive TUI: wire the agent loop into the rc-rt runtime and hand it to
+/// rc-tui. The TUI is a blocking poll loop, so it runs on a `spawn_blocking`
+/// thread — the rc-rt driver/pump keep running on this runtime's worker pool.
+async fn run_tui(
+    model: Arc<dyn Model>,
+    tools: Arc<ToolRegistry>,
+    permission: Arc<dyn PermissionChecker>,
+    session: Session,
+    model_name: String,
+) -> Result<()> {
+    let agent = Arc::new(AgentLoop::new(model, tools, permission));
+    let runtime = rc_rt::Runtime::new(agent, session);
+    match tokio::task::spawn_blocking(move || rc_tui::run(runtime, model_name)).await {
+        Ok(inner) => inner,
+        Err(join_err) => Err(anyhow::anyhow!("TUI task failed: {join_err}")),
+    }
 }
 
 /// Print the model's final assistant text. The last non-empty assistant turn is
@@ -184,9 +212,12 @@ fn init_tracing() {
 }
 
 /// A crude stdin prompter (§7.4): `y`=once, `s`=session, `a`=always, `n`=deny.
+/// The blocking `read_line` is fine inside the async fn: this prompter only runs
+/// on a TTY under the multi-thread runtime, so one blocked worker is acceptable.
 struct StdinPrompter;
+#[async_trait::async_trait]
 impl Prompter for StdinPrompter {
-    fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse {
+    async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse {
         let suggested = suggested_rule(tool, input);
         eprintln!("━ {tool} requires permission: {reason}");
         eprintln!("  granting rule: {suggested}");

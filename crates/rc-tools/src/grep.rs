@@ -53,6 +53,7 @@ enum Mode {
     Count,
 }
 
+#[derive(Default)]
 pub struct Grep;
 
 impl Grep {
@@ -148,7 +149,7 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
             let rel = path.strip_prefix(&root).unwrap_or(path);
             if let Some(gm) = &glob_matcher {
                 let base = rel.file_name().map(Path::new);
-                let matched = gm.is_match(rel) || base.map_or(false, |b| gm.is_match(b));
+                let matched = gm.is_match(rel) || base.is_some_and(|b| gm.is_match(b));
                 if !matched {
                     continue;
                 }

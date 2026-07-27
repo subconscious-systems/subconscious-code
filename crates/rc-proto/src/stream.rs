@@ -386,6 +386,7 @@ impl SseDecoder {
 /// Stateful reducer from [`ChatCompletionChunk`]s to [`AgentStreamEvent`]s:
 /// accumulates text/reasoning and reassembles tool calls, emitting them
 /// (assembled) when `finish_reason` arrives or the stream ends.
+#[derive(Default)]
 pub struct StreamFuser {
     acc: ToolCallAccumulator,
     finished: bool,
@@ -536,7 +537,7 @@ mod tests {
     /// the accumulator reassembles it exactly — preserving the model's bytes.
     #[test]
     fn accumulator_reassembles_shattered_json() {
-        let mut rng = XorShift::new(0x9e3779b9_7f4a_7c15);
+        let mut rng = XorShift::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..2000 {
             let id = format!("call_{}", rng.range(100));
             let name = ["Read", "Edit", "Bash"][rng.range(3) as usize];
@@ -621,7 +622,7 @@ mod tests {
         // [DONE] and a usage-only chunk.
         let out3 = dec.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n");
         assert_eq!(out3.len(), 1);
-        assert!(dec.is_done() == false, "usage chunk is not [DONE]");
+        assert!(!dec.is_done(), "usage chunk is not [DONE]");
         let out4 = dec.feed(b"data: [DONE]\n\n");
         assert!(out4.is_empty());
         assert!(dec.is_done(), "[DONE] sets done");

@@ -24,6 +24,7 @@ pub struct ReadInput {
     pub limit: Option<u32>,
 }
 
+#[derive(Default)]
 pub struct Read;
 
 impl Read {

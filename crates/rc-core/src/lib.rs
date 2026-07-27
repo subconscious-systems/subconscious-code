@@ -27,6 +27,7 @@ pub use model::{
     ChatModel, EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse, NullSink,
 };
 pub use rc_proto::FinishReason;
+pub use rc_proto::Usage;
 pub use prompt::{AskResponse, NullPrompter, Prompter};
 pub use project::{project, verify_invariant};
 pub use rc_perm::{

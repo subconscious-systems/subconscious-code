@@ -51,12 +51,24 @@ pub enum ModelError {
 }
 
 /// A sink for live agent events (the TUI seam, M4). M1 uses [`NullSink`].
+///
+/// Streaming deltas (`on_text`/`on_reasoning`/`on_tool_start`/`on_finish`) are
+/// driven by [`ChatModel`] from the wire stream. The loop emits the per-turn
+/// lifecycle (`on_iter`/`on_usage`/`on_tool_end`): `on_iter` at the top of each
+/// iteration, `on_usage` once the model returns, and one `on_tool_end` for every
+/// batch item — including denied / parse-error / unknown-tool results — so the
+/// host observes a terminal state for every announced call. Turn-boundary
+/// events (outcome, error, idle) are emitted by the runtime driver, not here.
 pub trait EventSink: Send + Sync {
     fn on_text(&self, _delta: &str) {}
     fn on_reasoning(&self, _delta: &str) {}
     fn on_tool_start(&self, _call: &ToolCall) {}
-    fn on_tool_end(&self, _call_id: &str, _result: &ToolResultBody) {}
     fn on_finish(&self, _reason: &FinishReason) {}
+    /// One terminal result per batch item. `tool` is the call's tool name
+    /// (carried so the host can render a result line without holding the call).
+    fn on_tool_end(&self, _call_id: &str, _tool: &str, _result: &ToolResultBody) {}
+    fn on_iter(&self, _count: u32, _max: u32) {}
+    fn on_usage(&self, _usage: &Usage) {}
 }
 
 #[derive(Default)]

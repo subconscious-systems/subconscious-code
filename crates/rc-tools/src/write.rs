@@ -21,6 +21,7 @@ pub struct WriteInput {
     pub content: String,
 }
 
+#[derive(Default)]
 pub struct Write;
 
 impl Write {

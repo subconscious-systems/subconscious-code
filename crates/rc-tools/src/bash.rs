@@ -32,6 +32,7 @@ pub struct BashInput {
     pub run_in_background: bool,
 }
 
+#[derive(Default)]
 pub struct Bash;
 
 impl Bash {

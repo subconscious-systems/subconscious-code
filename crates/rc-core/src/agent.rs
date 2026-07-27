@@ -60,7 +60,7 @@ impl AgentLoop {
         &self,
         session: &mut Session,
         user_input: String,
-        _sink: &dyn EventSink,
+        sink: &dyn EventSink,
         prompter: &dyn Prompter,
         cancel: CancellationToken,
     ) -> Result<LoopOutcome, LoopError> {
@@ -79,6 +79,7 @@ impl AgentLoop {
             if iters > self.max_iters {
                 return Ok(LoopOutcome::ItersExceeded);
             }
+            sink.on_iter(iters, self.max_iters);
 
             let messages = project(&session.messages);
             let inv = verify_invariant(&messages);
@@ -94,7 +95,10 @@ impl AgentLoop {
                 opts: Default::default(),
             };
             let ModelResponse { text, reasoning, tool_calls, finish_reason, usage } =
-                self.model.complete(req, _sink).await?;
+                self.model.complete(req, sink).await?;
+            if let Some(u) = &usage {
+                sink.on_usage(u);
+            }
 
             let mut assistant_calls = Vec::new();
             let mut exec_list: Vec<ExecItem> = Vec::new();
@@ -142,6 +146,7 @@ impl AgentLoop {
             )
             .await;
             for (call_id, tool, result, duration) in results {
+                sink.on_tool_end(&call_id, &tool, &result);
                 session
                     .messages
                     .push(Turn::ToolResult { call_id, tool, result, duration });
@@ -204,7 +209,7 @@ async fn execute_batch(
                         );
                         false
                     }
-                    Decision::Ask(reason) => match prompter.ask(&call.name, &input, &reason) {
+                    Decision::Ask(reason) => match prompter.ask(&call.name, &input, &reason).await {
                         AskResponse::Once => true,
                         AskResponse::Session(rule) | AskResponse::Always(rule) => {
                             grants.push(rule);

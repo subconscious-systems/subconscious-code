@@ -98,6 +98,31 @@ pub enum AgentMode {
     BypassPermissions,
 }
 
+/// `AgentMode` (the TUI/session-facing enum) and `rc_perm::Mode` (the engine's)
+/// have identical variants. These bridges let the runtime cycle the mode once
+/// and apply it to both the engine (live enforcement) and the session (render).
+impl From<AgentMode> for crate::Mode {
+    fn from(m: AgentMode) -> Self {
+        match m {
+            AgentMode::Default => crate::Mode::Default,
+            AgentMode::AcceptEdits => crate::Mode::AcceptEdits,
+            AgentMode::Plan => crate::Mode::Plan,
+            AgentMode::BypassPermissions => crate::Mode::BypassPermissions,
+        }
+    }
+}
+
+impl From<crate::Mode> for AgentMode {
+    fn from(m: crate::Mode) -> Self {
+        match m {
+            crate::Mode::Default => AgentMode::Default,
+            crate::Mode::AcceptEdits => AgentMode::AcceptEdits,
+            crate::Mode::Plan => AgentMode::Plan,
+            crate::Mode::BypassPermissions => AgentMode::BypassPermissions,
+        }
+    }
+}
+
 /// Minimal session for M1: identity + roots + the turn log + mode + the shared
 /// read registry. Sessions, checkpoints, and persistence land in M5.
 #[derive(Debug, Clone)]
@@ -125,6 +150,28 @@ impl Session {
             mode: AgentMode::Default,
             read_registry: Arc::new(std::sync::Mutex::new(ReadRegistry::new())),
             perm_grants: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Mode;
+
+    #[test]
+    fn agent_mode_round_trips_to_perm_mode() {
+        // The TUI cycles AgentMode; the runtime converts to the engine's Mode and
+        // back. All four variants must survive the round trip (identical enums).
+        for m in [
+            AgentMode::Default,
+            AgentMode::AcceptEdits,
+            AgentMode::Plan,
+            AgentMode::BypassPermissions,
+        ] {
+            let perm: Mode = m.into();
+            let back: AgentMode = perm.into();
+            assert_eq!(back, m, "{m:?} should round-trip through Mode");
         }
     }
 }

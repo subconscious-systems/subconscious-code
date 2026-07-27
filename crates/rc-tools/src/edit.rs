@@ -23,6 +23,7 @@ pub struct EditInput {
     pub replace_all: bool,
 }
 
+#[derive(Default)]
 pub struct Edit;
 
 impl Edit {

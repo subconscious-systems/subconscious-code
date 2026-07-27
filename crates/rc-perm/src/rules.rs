@@ -6,6 +6,7 @@
 use crate::bash::{is_always_ask, is_catastrophic, parse_bash, rule_matches};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -28,6 +29,24 @@ impl Mode {
             "acceptEdits" => Mode::AcceptEdits,
             "plan" => Mode::Plan,
             "bypassPermissions" => Mode::BypassPermissions,
+            _ => Mode::Default,
+        }
+    }
+    /// Stable codec for the `AtomicU8` the engine stores its mode in (so the
+    /// TUI's Shift+Tab can swap it live without a `Mutex`).
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Mode::Default => 0,
+            Mode::AcceptEdits => 1,
+            Mode::Plan => 2,
+            Mode::BypassPermissions => 3,
+        }
+    }
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Mode::AcceptEdits,
+            2 => Mode::Plan,
+            3 => Mode::BypassPermissions,
             _ => Mode::Default,
         }
     }
@@ -104,6 +123,10 @@ pub trait PermissionChecker: Send + Sync {
         roots: &[PathBuf],
         grants: &[String],
     ) -> Decision;
+    /// Live mode cycling (Shift+Tab in the TUI). Default no-op; `PermissionEngine`
+    /// overrides it to swap its mode atomically. `AllowAllChecker`/`BypassChecker`
+    /// keep the default — their decision is mode-independent.
+    fn set_mode(&self, _mode: Mode) {}
 }
 
 /// Allows everything — for tests and scripted loops.
@@ -131,7 +154,7 @@ impl PermissionChecker for BypassChecker {
 }
 
 pub struct PermissionEngine {
-    mode: Mode,
+    mode: AtomicU8,
     deny: Vec<Rule>,
     allow: Vec<Rule>,
     ask: Vec<Rule>,
@@ -140,11 +163,17 @@ pub struct PermissionEngine {
 impl PermissionEngine {
     pub fn new(mode: Mode, deny: Vec<String>, allow: Vec<String>, ask: Vec<String>) -> Self {
         Self {
-            mode,
+            mode: AtomicU8::new(mode.to_u8()),
             deny: parse_rules(&deny),
             allow: parse_rules(&allow),
             ask: parse_rules(&ask),
         }
+    }
+
+    /// Snapshot the current mode (Relaxed: a mid-turn swap is best-effort; the
+    /// next `check` sees it). The four-variant codec keeps this lock-free.
+    fn mode(&self) -> Mode {
+        Mode::from_u8(self.mode.load(Ordering::Relaxed))
     }
 
     fn path_matches(rule: &Rule, input: &Value, cwd: &Path) -> bool {
@@ -174,7 +203,7 @@ impl PermissionEngine {
             .collect()
     }
 
-    fn bash_check(&self, cmd: &str, grants: &[Rule]) -> Decision {
+    fn bash_check(&self, cmd: &str, grants: &[Rule], mode: Mode) -> Decision {
         let parsed = parse_bash(cmd);
         if parsed.unparseable {
             return Decision::Ask("complex or unparseable command — needs approval".into());
@@ -197,7 +226,7 @@ impl PermissionEngine {
         if is_always_ask(cmd) {
             return Decision::Ask("always-ask command (e.g. sudo, force push)".into());
         }
-        if self.mode == Mode::BypassPermissions {
+        if mode == Mode::BypassPermissions {
             return Decision::Allow;
         }
         // deny: any sub-command matching a deny rule → Deny.
@@ -221,7 +250,7 @@ impl PermissionEngine {
         if parsed.subcommands.iter().any(|s| ask_specs.iter().any(|r| rule_matches(r, s))) {
             return Decision::Ask("asked by a rule".into());
         }
-        mode_default("Bash", self.mode)
+        mode_default("Bash", mode)
     }
 }
 
@@ -234,6 +263,7 @@ impl PermissionChecker for PermissionEngine {
         _roots: &[PathBuf],
         grants: &[String],
     ) -> Decision {
+        let mode = self.mode();
         let grants = parse_rules(grants);
 
         // Session grants for path tools: a matching grant → Allow.
@@ -247,12 +277,12 @@ impl PermissionChecker for PermissionEngine {
 
         if tool == "Bash" {
             if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                return self.bash_check(cmd, &grants);
+                return self.bash_check(cmd, &grants, mode);
             }
             return Decision::Ask("Bash call without a command".into());
         }
 
-        if self.mode == Mode::BypassPermissions {
+        if mode == Mode::BypassPermissions {
             return Decision::Allow;
         }
         // deny → allow → ask, first match wins.
@@ -271,7 +301,11 @@ impl PermissionChecker for PermissionEngine {
                 return Decision::Ask("asked by a rule".into());
             }
         }
-        mode_default(tool, self.mode)
+        mode_default(tool, mode)
+    }
+
+    fn set_mode(&self, mode: Mode) {
+        self.mode.store(mode.to_u8(), Ordering::Relaxed);
     }
 }
 
@@ -377,5 +411,37 @@ mod tests {
         // /etc/passwd exists on macOS/Linux and is not under the temp root.
         let res = crate::path::resolve_within(&roots, &cwd, "/etc/passwd");
         assert!(res.is_err(), "expected an outside-roots refusal, got {res:?}");
+    }
+
+    #[test]
+    fn set_mode_changes_the_default_decision_live() {
+        // The TUI's Shift+Tab calls set_mode to swap the engine's mode atomically;
+        // the next check sees it without rebuilding the engine.
+        let e = eng(Mode::Default, &[], &[], &[]);
+        assert!(matches!(
+            e.check("Edit", &json!({"file_path": "/tmp/x"}), &cwd(), &roots(), &[]),
+            Decision::Ask(_)
+        ));
+        e.set_mode(Mode::Plan);
+        assert!(matches!(
+            e.check("Edit", &json!({"file_path": "/tmp/x"}), &cwd(), &roots(), &[]),
+            Decision::Deny(_)
+        ));
+        // Non-mutating tools still allow in Plan mode.
+        assert!(matches!(
+            e.check("Read", &json!({"file_path": "/tmp/x"}), &cwd(), &roots(), &[]),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn allow_all_set_mode_is_a_no_op() {
+        // AllowAllChecker keeps the trait's default set_mode (mode-independent).
+        let a = AllowAllChecker;
+        a.set_mode(Mode::Plan);
+        assert!(matches!(
+            a.check("Edit", &json!({"file_path": "/tmp/x"}), &cwd(), &roots(), &[]),
+            Decision::Allow
+        ));
     }
 }
