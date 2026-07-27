@@ -30,13 +30,13 @@ impl ReadRegistry {
         self.entries.insert(path, (mtime, hash));
     }
 
-    /// Has this exact path been read at this exact mtime?
-    pub fn is_current(&self, path: &Path, mtime: SystemTime) -> bool {
-        matches!(self.entries.get(path), Some((m, _)) if *m == mtime)
-    }
-
     /// Has the path been read at all (any version)?
     pub fn has_read(&self, path: &Path) -> bool {
         self.entries.contains_key(path)
+    }
+
+    /// The recorded (mtime, hash) for a path, if it's been read.
+    pub fn get(&self, path: &Path) -> Option<&(SystemTime, String)> {
+        self.entries.get(path)
     }
 }

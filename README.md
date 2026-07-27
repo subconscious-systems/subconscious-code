@@ -4,9 +4,10 @@ A terminal agent harness (a Claude Code–style agent) written in first-party
 Rust, speaking the OpenAI-compatible `/v1/chat/completions` backend. Single
 static binary; no Python, no Node.
 
-## Status — M0 (skeleton)
+## Status — M2 (core tools)
 
-Headless one-shot works against any OpenAI-compatible endpoint:
+Headless agent loop (`-p`) with the built-in tools — `Read`, `Write`, `Edit`, `Glob`,
+`Grep`, and a foreground `Bash` — against any OpenAI-compatible endpoint:
 
 ```sh
 export RC_API_KEY=...

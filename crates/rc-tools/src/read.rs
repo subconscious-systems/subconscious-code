@@ -1,25 +1,19 @@
-//! The `Read` tool (§6.1) + read-registry recording.
-//!
-//! Output is `cat -n` style (`%6d\t<line>`), 1-based, default 2000 lines, lines
-//! truncated at 2000 chars. Empty file → sentinel; binary (NUL in first 8KB) →
-//! refused with type info. Reads record into the shared registry so later
+//! The `Read` tool (§6.1). Output is `cat -n`, 1-based, default 2000 lines,
+//! lines truncated at 2000 chars. Empty file → sentinel; binary (NUL in first
+//! 8KB) → refused. Reads record into the shared registry (via `util`) so later
 //! `Write`/`Edit` can enforce "read before mutate".
 
+use crate::util::{params_schema, record_read, resolve_within};
 use async_trait::async_trait;
 use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 const DEFAULT_LIMIT: u32 = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 const BINARY_SCAN: usize = 8192;
 
-/// `Read` input. Schemas are generated via `schemars` and serialized
-/// canonically on the wire (§4.6); key order is stable regardless of derive
-/// output order.
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadInput {
     /// Absolute path to the file.
@@ -105,8 +99,7 @@ prefix."
 
         record_read(ctx, &canon);
 
-        let rendered = render_lines(&text, inp.offset, inp.limit);
-        Ok(ToolOutcome::ok(rendered))
+        Ok(ToolOutcome::ok(render_lines(&text, inp.offset, inp.limit)))
     }
 }
 
@@ -140,64 +133,12 @@ fn truncate_line(line: &str) -> String {
     format!("{head} …[+{} chars truncated]", chars.len() - MAX_LINE_CHARS)
 }
 
-/// Record a read in the shared registry (path → (mtime, blake3)) for the
-/// "read before mutate" rule (M2, §6.2/§6.3).
-fn record_read(ctx: &ToolCtx, canon: &Path) {
-    let mtime = std::fs::metadata(canon).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-    let bytes = std::fs::read(canon).unwrap_or_default();
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    if let Ok(mut reg) = ctx.read_registry.lock() {
-        reg.record(canon.to_path_buf(), mtime, hash);
-    }
-}
-
-/// Basic path-scope check (M3 hardens this: deny-read globs, `openat2`
-/// RESOLVE_BENEATH, TOCTOU-safe canonicalize). Resolve symlinks physically
-/// and require the result to live under an allowed root.
-fn resolve_within(roots: &[PathBuf], cwd: &Path, candidate: &str) -> Result<PathBuf, String> {
-    let p = Path::new(candidate);
-    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
-    let canon = std::fs::canonicalize(&abs)
-        .map_err(|e| format!("{}: {e}", abs.display()))?;
-    for root in roots {
-        let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        if canon.starts_with(&root_canon) {
-            return Ok(canon);
-        }
-    }
-    Err(format!("path outside allowed roots: {}", canon.display()))
-}
-
-/// Generate the JSON Schema `parameters` for a `JsonSchema` type, stripping
-/// `$schema`/`title` to keep the on-wire object clean. Canonical serialization
-/// (§4.6) makes the byte form stable regardless of derive key order.
-fn params_schema<T: JsonSchema>() -> Value {
-    let root = schemars::schema_for!(T);
-    let mut v = serde_json::to_value(&root).expect("schema is serializable");
-    if let Value::Object(map) = &mut v {
-        map.remove("$schema");
-        map.remove("title");
-    }
-    v
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rc_core::state::ReadRegistry;
+    use crate::util::test_ctx;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx(dir: &Path) -> ToolCtx {
-        ToolCtx {
-            cwd: dir.to_path_buf(),
-            allowed_roots: vec![dir.to_path_buf()],
-            cancel: CancellationToken::new(),
-            read_registry: Arc::new(Mutex::new(ReadRegistry::new())),
-        }
-    }
 
     #[tokio::test]
     async fn reads_a_file_with_line_numbers() {
@@ -205,7 +146,7 @@ mod tests {
         let path = dir.path().join("hello.txt");
         std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &ctx(dir.path()))
+            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
             .await
             .unwrap();
         match out {
@@ -224,7 +165,7 @@ mod tests {
         let path = dir.path().join("empty.txt");
         std::fs::write(&path, "").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &ctx(dir.path()))
+            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
             .await
             .unwrap();
         match out {
@@ -239,7 +180,7 @@ mod tests {
         let path = dir.path().join("bin.dat");
         std::fs::write(&path, b"abc\x00def").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &ctx(dir.path()))
+            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
             .await
             .unwrap();
         match out {
@@ -255,7 +196,7 @@ mod tests {
         let path = outside.path().join("secret.txt");
         std::fs::write(&path, "nope").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &ctx(dir.path()))
+            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
             .await
             .unwrap();
         match out {
@@ -271,7 +212,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("r.txt");
         std::fs::write(&path, "x").unwrap();
-        let c = ctx(dir.path());
+        let c = test_ctx(dir.path());
         let _ = Read::new()
             .call(json!({"file_path": path.to_string_lossy().to_string()}), &c)
             .await

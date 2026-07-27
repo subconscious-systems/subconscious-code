@@ -14,7 +14,7 @@ use rc_core::registry::ToolRegistry;
 use rc_core::tool::Tool;
 use rc_core::turn::{Session, Turn};
 use rc_proto::ChatClient;
-use rc_tools::Read;
+use rc_tools::{Bash, Edit, Glob, Grep, Read, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -93,6 +93,11 @@ async fn run(cli: Cli) -> Result<()> {
     let model = Arc::new(ChatModel::new(client)) as Arc<dyn Model>;
     let tools = Arc::new(ToolRegistry::new(vec![
         Arc::new(Read::new()) as Arc<dyn Tool>,
+        Arc::new(Write::new()) as Arc<dyn Tool>,
+        Arc::new(Edit::new()) as Arc<dyn Tool>,
+        Arc::new(Glob::new()) as Arc<dyn Tool>,
+        Arc::new(Grep::new()) as Arc<dyn Tool>,
+        Arc::new(Bash::new()) as Arc<dyn Tool>,
     ]));
     let agent = AgentLoop::new(model, tools);
 
