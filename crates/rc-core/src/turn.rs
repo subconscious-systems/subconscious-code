@@ -83,13 +83,18 @@ impl ToolResultBody {
     /// (§8.5 microcompaction seam). A tail sentinel records the elision count
     /// and the `truncated` flag is set. Non-`Ok` variants are returned unchanged.
     /// This is a bounded per-result cap, not full summary-turn compaction.
+    ///
+    /// The cap is in *bytes* (the context-window unit), not characters: a body of
+    /// multibyte UTF-8 must not slip `cap` chars (up to 4×cap bytes) through. The
+    /// cut is floored to a char boundary so the head is always valid UTF-8.
     pub fn truncate_body(&self, cap: usize) -> ToolResultBody {
         match self {
             ToolResultBody::Ok { content, truncated: _ } => {
                 if content.len() <= cap {
                     return self.clone();
                 }
-                let head: String = content.chars().take(cap).collect();
+                let head = floor_char_boundary(content, cap);
+                let head = &content[..head];
                 let elided = content.len() - head.len();
                 ToolResultBody::Ok {
                     content: format!("{head}\n[… {elided} bytes truncated]"),
@@ -211,6 +216,28 @@ mod tests {
     }
 
     #[test]
+    fn truncate_body_respects_byte_cap_for_multibyte_utf8() {
+        // The §8.5 cap is in *bytes*, not characters. A body of N multibyte
+        // chars (2 bytes each) over a `cap` must produce a head of at most
+        // `cap` bytes — `.chars().take(cap)` would wrongly keep `cap` chars
+        // (i.e. 2*cap bytes), blowing the window it's meant to protect.
+        let body = ToolResultBody::Ok { content: "é".repeat(100), truncated: false };
+        let cap = 50;
+        let out = body.truncate_body(cap);
+        let ToolResultBody::Ok { content, truncated } = out else { panic!() };
+        assert!(truncated, "must be flagged truncated");
+        // head (≤ cap bytes) + sentinel must not exceed cap + a small sentinel budget.
+        assert!(
+            content.len() <= cap + 64,
+            "byte cap violated: {} > {} — content={:?}",
+            content.len(),
+            cap + 64,
+            content
+        );
+        assert!(content.contains("truncated"));
+    }
+
+    #[test]
     fn turn_serde_round_trips() {
         // A representative turn of each kind must survive a serialize→deserialize
         // cycle (the JSONL persistence path, M5).
@@ -279,4 +306,17 @@ mod duration_millis {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         Ok(Duration::from_millis(u64::deserialize(d)?))
     }
+}
+
+/// Largest index `≤ cap` that lands on a UTF-8 char boundary in `s`, so a
+/// byte-based truncation yields valid UTF-8. Walks back at most 3 bytes (the
+/// max lead-byte length). `cap` is clamped to `s.len()`. (Std gained
+/// `str::floor_char_boundary` in 1.80, but this workspace targets 1.75.)
+fn floor_char_boundary(s: &str, cap: usize) -> usize {
+    let cap = cap.min(s.len());
+    let mut i = cap;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }

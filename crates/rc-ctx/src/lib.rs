@@ -360,7 +360,8 @@ fn inline_file(rel: &str, root: &Path) -> String {
     };
     let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if text.len() > INLINE_FILE_CAP {
-        let head: String = text.chars().take(INLINE_FILE_CAP).collect();
+        let head = floor_char_boundary(text, INLINE_FILE_CAP);
+        let head = &text[..head];
         let elided = text.len() - head.len();
         return format!(
             "\n```{lang}\n{head}\n…[{elided} more bytes truncated — use Read for the full file]\n```\n"
@@ -390,6 +391,18 @@ fn truncate_tool_results(turns: &[Turn]) -> Vec<Turn> {
             other => other.clone(),
         })
         .collect()
+}
+
+/// Largest index `≤ cap` that lands on a UTF-8 char boundary in `s`, so a
+/// byte-based truncation yields valid UTF-8. Walks back at most 3 bytes. (Std
+/// gained `str::floor_char_boundary` in 1.80; this workspace targets 1.75.)
+fn floor_char_boundary(s: &str, cap: usize) -> usize {
+    let cap = cap.min(s.len());
+    let mut i = cap;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -526,6 +539,32 @@ mod tests {
         std::fs::write(dir.path().join("big.txt"), &big).unwrap();
         let out = expand_mentions("@big.txt", dir.path());
         assert!(out.contains("more bytes truncated"));
+    }
+
+    #[test]
+    fn expand_mentions_truncates_large_multibyte_files_to_byte_cap() {
+        // The INLINE_FILE_CAP is in bytes; multibyte content must not slip
+        // `cap` chars (≈2×cap bytes) through the fence.
+        let dir = tempdir().unwrap();
+        let big = "é".repeat(INLINE_FILE_CAP + 500);
+        std::fs::write(dir.path().join("big.txt"), &big).unwrap();
+        let out = expand_mentions("@big.txt", dir.path());
+        assert!(out.contains("more bytes truncated"));
+        // Extract the inlined file head (between the opening fence's lang line
+        // and the "\n…" truncation sentinel) and assert it's within the byte cap.
+        let fence = out.find("```").unwrap();
+        let after_open = &out[fence + 3..]; // skip "```"
+        let lang_nl = after_open.find('\n').unwrap();
+        let head_start = fence + 3 + lang_nl + 1;
+        let sentinel = out[head_start..].find("\n…").unwrap();
+        let head = &out[head_start..head_start + sentinel];
+        assert!(
+            head.len() <= INLINE_FILE_CAP,
+            "byte cap violated: head {} > cap {}",
+            head.len(),
+            INLINE_FILE_CAP
+        );
+        assert!(head.is_char_boundary(head.len()), "head ends on a char boundary");
     }
 
     #[test]
