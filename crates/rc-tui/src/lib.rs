@@ -11,11 +11,13 @@
 //! M4b/M4c.
 
 mod app;
+mod complete;
 mod diff;
 mod markdown;
 mod view;
 
 use std::io::Stdout;
+use std::path::PathBuf;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -31,14 +33,17 @@ pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 /// Launch the TUI against `runtime`. Blocks the calling thread — run it on a
 /// `tokio::task::spawn_blocking` thread so the rc-rt driver/pump keep running.
 /// Returns when the user quits (Ctrl+C, or Esc while idle).
-pub fn run(runtime: Runtime, model_name: String) -> anyhow::Result<()> {
+///
+/// `cwd` is the session's working directory, used by the M4c composer
+/// autocomplete to resolve `@file` mentions.
+pub fn run(runtime: Runtime, model_name: String, cwd: PathBuf) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = app::run(&mut terminal, runtime, model_name);
+    let result = app::run(&mut terminal, runtime, model_name, cwd);
 
     // Restore the terminal whatever happened above.
     let _ = disable_raw_mode();

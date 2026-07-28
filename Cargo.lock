@@ -1453,6 +1453,7 @@ dependencies = [
  "rc-rt",
  "serde_json",
  "similar 0.5.0",
+ "tempfile",
 ]
 
 [[package]]

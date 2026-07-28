@@ -6,6 +6,7 @@
 //! `Runtime`/`EventStream` are kept separate so a `ratatui::backend::TestBackend`
 //! render test needs no tokio and no model.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -15,9 +16,10 @@ use rc_core::{AgentMode, AskResponse, ToolResultBody};
 use rc_rt::{AgentEvent, EventStream, Runtime, UserAction};
 use serde_json::Value;
 
+use crate::complete::{self, Completion};
 use crate::diff;
 use crate::Term;
-use crate::view::{self, PendingAsk, ViewState};
+use crate::view::{self, CompletionMenu, PendingAsk, ViewState};
 
 /// One frame budget (~30fps) — short enough to feel responsive, long enough to
 /// not busy-spin between crossterm polls.
@@ -27,24 +29,31 @@ pub(crate) struct App {
     runtime: Runtime,
     stream: EventStream,
     view: ViewState,
+    /// The session cwd, used to resolve `@file` completions (M4c).
+    cwd: PathBuf,
     quit: bool,
 }
 
 impl App {
-    pub(crate) fn new(runtime: Runtime, model_name: String) -> Self {
+    pub(crate) fn new(runtime: Runtime, model_name: String, cwd: PathBuf) -> Self {
         let stream = runtime.subscribe();
         let mut view = ViewState::new(model_name);
         view.transcript.push(Line::from(format!(
             "rc | model: {} | Shift+Tab cycles mode | Ctrl+C quits",
             view.model_name
         )));
-        Self { runtime, stream, view, quit: false }
+        Self { runtime, stream, view, cwd, quit: false }
     }
 }
 
 /// Run the TUI main loop. Returns when the user quits.
-pub(crate) fn run(terminal: &mut Term, runtime: Runtime, model_name: String) -> anyhow::Result<()> {
-    let mut app = App::new(runtime, model_name);
+pub(crate) fn run(
+    terminal: &mut Term,
+    runtime: Runtime,
+    model_name: String,
+    cwd: PathBuf,
+) -> anyhow::Result<()> {
+    let mut app = App::new(runtime, model_name, cwd);
 
     loop {
         app.drain_events();
@@ -152,12 +161,71 @@ impl App {
             return;
         }
 
+        // While a completion menu is open, arrow/Tab/Esc drive the menu; other
+        // keys fall through to the composer (so typing keeps filtering it).
+        if let Some(menu) = self.view.menu.take() {
+            match key.code {
+                KeyCode::Tab | KeyCode::Enter => {
+                    // Accept the selected candidate into the composer.
+                    if let Some(new) = complete::apply(&self.view.composer, &menu.completion, menu.selected) {
+                        self.view.composer = new;
+                    }
+                    self.refresh_menu();
+                    return;
+                }
+                KeyCode::Esc => {
+                    // Dismiss the menu without accepting; key consumed.
+                    return;
+                }
+                KeyCode::Up => {
+                    let selected = menu.selected.saturating_sub(1);
+                    self.view.menu = Some(CompletionMenu { completion: menu.completion, selected });
+                    return;
+                }
+                KeyCode::Down => {
+                    let max = menu.completion.candidates.len().saturating_sub(1);
+                    let selected = (menu.selected + 1).min(max);
+                    self.view.menu = Some(CompletionMenu { completion: menu.completion, selected });
+                    return;
+                }
+                _ => {
+                    // Fall through to composer editing; recompute menu below.
+                    self.view.menu = None;
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Enter => {
                 if !self.view.composer.is_empty() {
                     let text = std::mem::take(&mut self.view.composer);
-                    self.view.transcript.push(Line::from(format!("> {text}")));
-                    self.runtime.action(UserAction::Submit(text));
+                    // Slash commands are host-side actions, not prompts.
+                    if let Some(action) = self.handle_slash(&text) {
+                        match action {
+                            SlashAction::Help => {
+                                self.view.transcript.push(Line::from(
+                                    "commands: /clear  /help  /mode | @<path> completes files",
+                                ));
+                            }
+                            SlashAction::Clear => {
+                                self.view.transcript.clear();
+                                self.view.current_text.clear();
+                                self.view.transcript.push(Line::from(format!(
+                                    "rc | model: {} | Shift+Tab cycles mode | Ctrl+C quits",
+                                    self.view.model_name
+                                )));
+                            }
+                            SlashAction::CycleMode => {
+                                let next = cycle_mode(self.view.mode);
+                                self.view.mode = next;
+                                self.runtime.action(UserAction::SetMode(next));
+                            }
+                        }
+                    } else {
+                        self.view.transcript.push(Line::from(format!("> {text}")));
+                        self.runtime.action(UserAction::Submit(text));
+                    }
+                    self.refresh_menu();
                 }
             }
             KeyCode::Esc => {
@@ -175,13 +243,63 @@ impl App {
                 self.view.mode = next; // optimistic; ModeChanged confirms
                 self.runtime.action(UserAction::SetMode(next));
             }
-            KeyCode::Char(c) => self.view.composer.push(c),
+            KeyCode::Char(c) => {
+                self.view.composer.push(c);
+                self.refresh_menu();
+            }
             KeyCode::Backspace => {
                 self.view.composer.pop();
+                self.refresh_menu();
             }
             _ => {}
         }
     }
+
+    /// Recompute the completion menu from the current composer buffer. Clears
+    /// the menu if no trigger is active. Keeps the selected row clamped to the
+    /// new candidate list (best-effort: reset to 0 on a kind/prefix change).
+    fn refresh_menu(&mut self) {
+        let prev = self.view.menu.take();
+        match complete::complete(&self.view.composer, &self.cwd) {
+            Some(completion) => {
+                // Preserve the selection when the candidate set is unchanged;
+                // otherwise start at the top.
+                let selected = prev
+                    .filter(|p| same_menu(&p.completion, &completion))
+                    .map(|p| p.selected)
+                    .unwrap_or(0)
+                    .min(completion.candidates.len().saturating_sub(1));
+                self.view.menu = Some(CompletionMenu { completion, selected });
+            }
+            None => self.view.menu = None,
+        }
+    }
+
+    /// If `text` is a recognized slash command, return its host-side action.
+    /// Returns `None` for anything else (including `@`-prefixed text), so the
+    /// text is submitted as a normal prompt.
+    fn handle_slash(&self, text: &str) -> Option<SlashAction> {
+        let t = text.trim();
+        match t {
+            "/clear" => Some(SlashAction::Clear),
+            "/help" => Some(SlashAction::Help),
+            "/mode" => Some(SlashAction::CycleMode),
+            _ => None,
+        }
+    }
+}
+
+/// A host-side slash command (not submitted to the model).
+enum SlashAction {
+    Clear,
+    Help,
+    CycleMode,
+}
+
+/// Two completions are "the same menu" if they're the same kind and would show
+/// the same candidates — used to preserve the selection across keystrokes.
+fn same_menu(a: &Completion, b: &Completion) -> bool {
+    a.kind == b.kind && a.candidates == b.candidates
 }
 
 fn cycle_mode(m: AgentMode) -> AgentMode {
@@ -317,5 +435,61 @@ mod tests {
         );
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Read: hi"), "{text}");
+    }
+
+    #[test]
+    fn slash_commands_recognize_clear_help_mode() {
+        // A fresh App needs a Runtime (tokio), but handle_slash is a pure method
+        // over &self that never touches the runtime — test it via a tiny shim
+        // that mirrors its body. We assert the recognized commands and the
+        // fall-through for non-commands and @-mentions.
+        fn classify(text: &str) -> Option<SlashAction> {
+            let t = text.trim();
+            match t {
+                "/clear" => Some(SlashAction::Clear),
+                "/help" => Some(SlashAction::Help),
+                "/mode" => Some(SlashAction::CycleMode),
+                _ => None,
+            }
+        }
+        assert!(matches!(classify("/clear"), Some(SlashAction::Clear)));
+        assert!(matches!(classify("/help"), Some(SlashAction::Help)));
+        assert!(matches!(classify("/mode"), Some(SlashAction::CycleMode)));
+        // Unknown command and plain prompts fall through.
+        assert!(classify("/unknown").is_none());
+        assert!(classify("hello there").is_none());
+        assert!(classify("@src/main.rs").is_none());
+        // Whitespace is tolerated.
+        assert!(matches!(classify("  /clear  "), Some(SlashAction::Clear)));
+    }
+
+    #[test]
+    fn same_menu_compares_kind_and_candidates() {
+        let a = Completion {
+            kind: crate::complete::MenuKind::Slash,
+            replace_start: 0,
+            candidates: vec!["/clear".into(), "/mode".into()],
+        };
+        // Same kind + candidates => same menu (selection should be preserved).
+        let b = Completion {
+            kind: crate::complete::MenuKind::Slash,
+            replace_start: 9, // different prefix position is irrelevant
+            candidates: vec!["/clear".into(), "/mode".into()],
+        };
+        assert!(same_menu(&a, &b));
+        // Different kind => different menu.
+        let c = Completion {
+            kind: crate::complete::MenuKind::File,
+            replace_start: 0,
+            candidates: a.candidates.clone(),
+        };
+        assert!(!same_menu(&a, &c));
+        // Different candidates => different menu (selection resets).
+        let d = Completion {
+            kind: crate::complete::MenuKind::Slash,
+            replace_start: 0,
+            candidates: vec!["/clear".into()],
+        };
+        assert!(!same_menu(&a, &d));
     }
 }

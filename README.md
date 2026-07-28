@@ -18,6 +18,13 @@ never calls into core synchronously, and `rc-core` stays a plain library with no
 channel deps. Permission asks flow through an async `Prompter` whose `ask` emits an
 event and awaits a keypress; at most one ask is ever pending.
 
+Assistant output is rendered as incremental markdown (headings, fenced code,
+lists, inline `` `code` `` / `**bold**` / `*ital*` / `[links]()`), and `Edit` calls
+preview as an inline word-level diff. The composer autocompletes `@file` mentions
+against the session cwd (bounded filesystem walk) and `/slash` commands (`/clear`,
+`/help`, `/mode`): type the trigger, move with `Up`/`Down`, accept with `Tab`, and
+dismiss with `Esc`.
+
 ```sh
 export RC_API_KEY=...
 cargo run -q --bin rc              # interactive TUI
@@ -43,7 +50,7 @@ cargo clippy --workspace -- -D warnings
 ```
 
 The implementation plan (§14 milestones) lays out the road to feature parity:
-streaming + tool loop (M1), core tools (M2), permissions (M3), TUI (M4 — this slice
-covers the event transport, the `rc-rt` driver/pump runtime, and a minimal TUI;
-incremental markdown, word-level diff, and composer autocomplete land in M4b/M4c),
-and on through MCP, checkpoints, and polish.
+streaming + tool loop (M1), core tools (M2), permissions (M3), TUI (M4 — the event
+transport, the `rc-rt` driver/pump runtime, a minimal TUI, incremental markdown,
+word-level `Edit` diff, and `@file`/`/slash` composer autocomplete), and on through
+MCP, checkpoints, and polish.

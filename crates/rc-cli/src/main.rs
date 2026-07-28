@@ -177,8 +177,9 @@ async fn run_tui(
     model_name: String,
 ) -> Result<()> {
     let agent = Arc::new(AgentLoop::new(model, tools, permission));
+    let cwd = session.cwd.clone();
     let runtime = rc_rt::Runtime::new(agent, session);
-    match tokio::task::spawn_blocking(move || rc_tui::run(runtime, model_name)).await {
+    match tokio::task::spawn_blocking(move || rc_tui::run(runtime, model_name, cwd)).await {
         Ok(inner) => inner,
         Err(join_err) => Err(anyhow::anyhow!("TUI task failed: {join_err}")),
     }

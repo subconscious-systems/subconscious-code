@@ -7,10 +7,12 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use rc_core::{AgentMode, Usage};
 use serde_json::Value;
+
+use crate::complete::Completion;
 
 /// A pending permission ask the user must answer before the turn proceeds.
 #[derive(Clone)]
@@ -19,6 +21,14 @@ pub(crate) struct PendingAsk {
     pub tool: String,
     pub input: Value,
     pub reason: String,
+}
+
+/// The open completion menu: the computed candidates + the selected row.
+/// Kept in `ViewState` so a `TestBackend` render test can build it directly.
+#[derive(Clone)]
+pub(crate) struct CompletionMenu {
+    pub completion: Completion,
+    pub selected: usize,
 }
 
 /// The renderable subset of app state. Kept separate from the runtime handles so
@@ -35,6 +45,9 @@ pub(crate) struct ViewState {
     pub busy: bool,
     pub pending_ask: Option<PendingAsk>,
     pub composer: String,
+    /// The open autocomplete menu, if any (M4c). `None` when the composer has
+    /// no `@`/`/` trigger at the caret or the user dismissed it.
+    pub menu: Option<CompletionMenu>,
     pub model_name: String,
 }
 
@@ -48,6 +61,7 @@ impl ViewState {
             busy: false,
             pending_ask: None,
             composer: String::new(),
+            menu: None,
             model_name,
         }
     }
@@ -74,6 +88,10 @@ pub(crate) fn draw(frame: &mut Frame, state: &ViewState) {
         draw_ask(frame, ask, chunks[2]);
     } else {
         draw_composer(frame, state, chunks[2]);
+        // The completion menu floats above the composer, as a popup.
+        if let Some(menu) = &state.menu {
+            draw_menu(frame, menu, chunks[2]);
+        }
     }
 }
 
@@ -107,6 +125,51 @@ fn draw_composer(frame: &mut Frame, state: &ViewState, area: Rect) {
     let prompt = format!("> {}█", state.composer);
     frame.render_widget(
         Paragraph::new(prompt).block(Block::default().borders(Borders::ALL).title("compose")),
+        area,
+    );
+}
+
+/// Max rows shown in the completion popup. The candidate list in
+/// [`CompletionMenu`] may be longer; the menu window-clips to this many.
+const MENU_ROWS: usize = 8;
+
+/// Render the completion popup as an overlay growing upward from the top of
+/// the composer `area`. The selected row is highlighted; the menu is at most
+/// `MENU_ROWS` tall and never overflows the screen.
+fn draw_menu(frame: &mut Frame, menu: &CompletionMenu, composer_area: Rect) {
+    let candidates = &menu.completion.candidates;
+    if candidates.is_empty() {
+        return;
+    }
+    let count = candidates.len().min(MENU_ROWS);
+    // The menu sits just above the composer's top border. Height = content rows
+    // + 2 border rows (top + bottom). Clamp to the available space above.
+    let max_h = composer_area.y as usize;
+    let h = (count + 2).min(max_h.max(1)) as u16;
+    let y = composer_area.y.saturating_sub(h);
+    let width = composer_area.width.min(40);
+    let x = composer_area.x;
+    let area = Rect { x, y, width, height: h };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(count);
+    let title = match menu.completion.kind {
+        crate::complete::MenuKind::File => "files",
+        crate::complete::MenuKind::Slash => "commands",
+    };
+    let start = menu.selected.min(candidates.len().saturating_sub(1));
+    for (i, cand) in candidates.iter().take(count).enumerate() {
+        let marker = if i == start { "▶ " } else { "  " };
+        let line = Line::from(format!("{marker}{cand}"));
+        if i == start {
+            lines.push(line.style(Style::new().fg(Color::Black).bg(Color::Cyan)));
+        } else {
+            lines.push(line.style(Style::new().fg(Color::Yellow)));
+        }
+    }
+    // Render the popup with a clear background so it doesn't bleed the transcript.
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -206,5 +269,45 @@ mod tests {
         // ("new") tokens, then the shared " word" -> "oldnew word".
         assert!(screen.contains("oldnew"), "diff interleaves old+new: {screen}");
         assert!(screen.contains("word"), "diff keeps shared word: {screen}");
+    }
+
+    #[test]
+    fn completion_menu_renders_candidates_and_selection() {
+        // A slash menu with two candidates; the first is selected (▶, highlighted).
+        let mut state = ViewState::new("m".into());
+        state.composer = "/c".into();
+        state.menu = Some(CompletionMenu {
+            completion: Completion {
+                kind: crate::complete::MenuKind::Slash,
+                replace_start: 0,
+                candidates: vec!["/clear".into(), "/mode".into()],
+            },
+            selected: 0,
+        });
+        let screen = rendered(&state);
+        assert!(screen.contains("commands"), "menu title: {screen}");
+        assert!(screen.contains("/clear"), "first candidate: {screen}");
+        assert!(screen.contains("/mode"), "second candidate: {screen}");
+        assert!(screen.contains("▶"), "selection marker: {screen}");
+    }
+
+    #[test]
+    fn completion_menu_empty_candidates_renders_nothing() {
+        // An empty candidate list draws no popup (defensive; complete() returns
+        // None in that case, but the view must not panic if state is stale).
+        let mut state = ViewState::new("m".into());
+        state.composer = "@zzz".into();
+        state.menu = Some(CompletionMenu {
+            completion: Completion {
+                kind: crate::complete::MenuKind::File,
+                replace_start: 0,
+                candidates: Vec::new(),
+            },
+            selected: 0,
+        });
+        let screen = rendered(&state);
+        // No "files"/"commands" title block should appear.
+        assert!(!screen.contains("files"), "no menu for empty candidates: {screen}");
+        assert!(!screen.contains("commands"), "no menu title: {screen}");
     }
 }
