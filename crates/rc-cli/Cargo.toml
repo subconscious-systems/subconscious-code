@@ -16,6 +16,7 @@ rc-core = { path = "../rc-core" }
 rc-tools = { path = "../rc-tools" }
 rc-rt = { path = "../rc-rt" }
 rc-tui = { path = "../rc-tui" }
+rc-session = { path = "../rc-session" }
 clap.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true }

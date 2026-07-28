@@ -6,6 +6,7 @@
 //! driver and pump. A non-async caller panics at `spawn`.
 
 use rc_core::{AgentLoop, EventSink, Session};
+use rc_session::SessionStore;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -31,7 +32,15 @@ pub struct Runtime {
 impl Runtime {
     /// Build the runtime and spawn its driver + pump on the current tokio
     /// runtime. Panics outside a runtime context.
-    pub fn new(agent: std::sync::Arc<AgentLoop>, session: Session) -> Self {
+    ///
+    /// `store` is an optional session-persistence handle; when `Some`, the
+    /// driver appends each completed turn to it (crash recovery, §9). `None`
+    /// for headless/ephemeral runs.
+    pub fn new(
+        agent: std::sync::Arc<AgentLoop>,
+        session: Session,
+        store: Option<SessionStore>,
+    ) -> Self {
         let (events_tx, _) = broadcast::channel::<AgentEvent>(EVENT_CAPACITY);
         let (actions_tx, actions_rx) = mpsc::unbounded_channel::<UserAction>();
         let (driver_tx, driver_rx) = mpsc::unbounded_channel::<DriverCmd>();
@@ -49,6 +58,7 @@ impl Runtime {
             sink,
             prompter,
             events_tx.clone(),
+            store,
         ));
         let pump = tokio::spawn(pump_task(
             actions_rx,

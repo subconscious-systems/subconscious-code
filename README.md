@@ -4,7 +4,7 @@ A terminal agent harness (a Claude Code–style agent) written in first-party
 Rust, speaking the OpenAI-compatible `/v1/chat/completions` backend. Single
 static binary; no Python, no Node.
 
-## Status — M4 (TUI)
+## Status — M5 (session persistence)
 
 A headless one-shot (`rc -p "..."`) or an interactive ratatui TUI (just `rc`),
 speaking any OpenAI-compatible `/v1/chat/completions` endpoint. The agent loop
@@ -25,10 +25,16 @@ against the session cwd (bounded filesystem walk) and `/slash` commands (`/clear
 `/help`, `/mode`): type the trigger, move with `Up`/`Down`, accept with `Tab`, and
 dismiss with `Esc`.
 
+Interactive sessions persist to `~/.rc/sessions/<id>.jsonl` (one JSON header line +
+one JSON `Turn` per line, flushed after each turn). Resume with `--continue` (the
+newest file) or `--resume <path>`; the loaded turns replay into the conversation
+and new turns append to the same file. The headless `-p` path stays ephemeral.
+
 ```sh
 export RC_API_KEY=...
-cargo run -q --bin rc              # interactive TUI
-cargo run -q --bin rc -p "say hi"  # headless one-shot
+cargo run -q --bin rc              # interactive TUI (persists to ~/.rc/sessions)
+cargo run -q --bin rc --continue   # resume the most recent session
+cargo run -q --bin rc -p "say hi"  # headless one-shot (no persistence)
 ```
 
 Override the endpoint or model via `RC_BASE_URL` / `RC_MODEL`, or write
@@ -52,5 +58,5 @@ cargo clippy --workspace -- -D warnings
 The implementation plan (§14 milestones) lays out the road to feature parity:
 streaming + tool loop (M1), core tools (M2), permissions (M3), TUI (M4 — the event
 transport, the `rc-rt` driver/pump runtime, a minimal TUI, incremental markdown,
-word-level `Edit` diff, and `@file`/`/slash` composer autocomplete), and on through
-MCP, checkpoints, and polish.
+word-level `Edit` diff, and `@file`/`/slash` composer autocomplete), session
+persistence + resume (M5 — this slice), and on through MCP, checkpoints, and polish.

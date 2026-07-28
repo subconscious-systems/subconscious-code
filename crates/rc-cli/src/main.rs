@@ -55,6 +55,15 @@ struct Cli {
     /// Refused in CI without RC_DANGEROUS=1.
     #[arg(long = "dangerously-skip-permissions")]
     dangerously_skip_permissions: bool,
+
+    /// Resume the most recent session (the newest `~/.rc/sessions/*.jsonl`).
+    /// Replays its turns into the conversation and continues it.
+    #[arg(long, conflicts_with = "resume")]
+    continue_last: bool,
+
+    /// Resume a specific session file (an absolute path to a `*.jsonl`).
+    #[arg(long, value_name = "PATH")]
+    resume: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -128,7 +137,35 @@ async fn run(cli: Cli) -> Result<()> {
         .iter()
         .filter_map(|d| std::fs::canonicalize(d).ok())
         .collect();
-    let mut session = Session::new("session".into(), std::env::current_dir()?, settings.model.clone());
+
+    // Resume an existing session (--continue picks the newest; --resume takes a
+    // path). Only the TUI path persists; a headless `-p` run is ephemeral.
+    let sessions_dir = sessions_dir()?;
+    let resumed = if let Some(path) = cli.resume.clone() {
+        Some(rc_session::load(&path).context("--resume: could not load session")?)
+    } else if cli.continue_last {
+        match rc_session::latest(&sessions_dir) {
+            Some(path) => Some(
+                rc_session::load(&path)
+                    .context("--continue: could not load the latest session")?,
+            ),
+            None => {
+                anyhow::bail!("--continue: no prior session found in {}", sessions_dir.display());
+            }
+        }
+    } else {
+        None
+    };
+    let mut session = match resumed {
+        Some(s) => s,
+        None => {
+            // A fresh id (timestamp + pid) so each run gets its own session file
+            // and `--continue` can find the newest one unambiguously.
+            let id = format!("session-{}-{}", chrono_like_ts(), std::process::id());
+            let cwd = std::env::current_dir()?;
+            Session::new(id, cwd, settings.model.clone())
+        }
+    };
     session.extra_dirs = extra_dirs;
 
     match cli.print {
@@ -136,9 +173,46 @@ async fn run(cli: Cli) -> Result<()> {
         Some(prompt) if !prompt.is_empty() => {
             run_headless(model, tools, permission, session, prompt).await
         }
-        // Otherwise: launch the interactive TUI (M4).
-        _ => run_tui(model, tools, permission, session, settings.model).await,
+        // Otherwise: launch the interactive TUI (M4) with persistence (M5).
+        _ => run_tui(model, tools, permission, session, settings.model, sessions_dir).await,
     }
+}
+
+/// `~/.rc/sessions/` — where session JSONL files live. Created on first use.
+fn sessions_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.rc/sessions")?;
+    Ok(PathBuf::from(home).join(".rc").join("sessions"))
+}
+
+/// A compact, sortable UTC timestamp (`YYYYmmddTHHMMSS`) for fresh session ids,
+/// without pulling in chrono — `--continue` picks the newest file by mtime, so
+/// monotonicity is what matters, not the format.
+fn chrono_like_ts() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let secs = now % 60;
+    let mins = (now / 60) % 60;
+    let hours = (now / 3600) % 24;
+    let days = now / 86400;
+    // Days since 1970-01-01 -> a proleptic Gregorian Y-M-D (no leap-second fuss).
+    let (y, m, d) = civil_from_days(days as i64);
+    format!("{y:04}{m:02}{d:02}T{hours:02}{mins:02}{secs:02}")
+}
+
+/// Howard Hinnant's days-from-civil inverse: days since 1970-01-01 → (y, m, d).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + if m <= 2 { 1 } else { 0 }, m as u32, d as u32)
 }
 
 /// Headless `-p`: one turn, then print the final assistant text. An interactive
@@ -169,16 +243,34 @@ async fn run_headless(
 /// Interactive TUI: wire the agent loop into the rc-rt runtime and hand it to
 /// rc-tui. The TUI is a blocking poll loop, so it runs on a `spawn_blocking`
 /// thread — the rc-rt driver/pump keep running on this runtime's worker pool.
+///
+/// A `SessionStore` is created (or, for a resumed session, re-opened) under
+/// `sessions_dir` so the conversation persists across restarts (§9, M5).
 async fn run_tui(
     model: Arc<dyn Model>,
     tools: Arc<ToolRegistry>,
     permission: Arc<dyn PermissionChecker>,
     session: Session,
     model_name: String,
+    sessions_dir: PathBuf,
 ) -> Result<()> {
     let agent = Arc::new(AgentLoop::new(model, tools, permission));
     let cwd = session.cwd.clone();
-    let runtime = rc_rt::Runtime::new(agent, session);
+
+    // Persistence: a fresh session gets a new timestamped file; a resumed
+    // session re-opens its existing file in append mode (the header and old
+    // turns are already on disk — no rewrite, no risk of losing history).
+    let session_id = session.id.clone();
+    let path = sessions_dir.join(format!("{session_id}.jsonl"));
+    let store = if session.messages.is_empty() {
+        Some(rc_session::SessionStore::create(path, &session)?)
+    } else {
+        // Resumed: the file already holds the header + prior turns. Open it for
+        // append so the driver's new turns land after the old ones.
+        Some(rc_session::SessionStore::open_append(path)?)
+    };
+
+    let runtime = rc_rt::Runtime::new(agent, session, store);
     match tokio::task::spawn_blocking(move || rc_tui::run(runtime, model_name, cwd)).await {
         Ok(inner) => inner,
         Err(join_err) => Err(anyhow::anyhow!("TUI task failed: {join_err}")),

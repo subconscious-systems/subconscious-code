@@ -176,7 +176,7 @@ pub struct ResponseMessage {
 /// Token usage. `cached_tokens` (§3.6, O6) is the cache-hit feedback loop —
 /// surface it in the status line; it's the only signal on whether the harness
 /// is preserving its prefix.
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -185,7 +185,7 @@ pub struct Usage {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: u64,

@@ -1322,6 +1322,7 @@ dependencies = [
  "rc-core",
  "rc-proto",
  "rc-rt",
+ "rc-session",
  "rc-tools",
  "rc-tui",
  "serde_json",
@@ -1398,9 +1399,12 @@ dependencies = [
 name = "rc-rt"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "rc-core",
+ "rc-session",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1413,6 +1417,14 @@ version = "0.1.0"
 [[package]]
 name = "rc-session"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rc-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "rc-skills"

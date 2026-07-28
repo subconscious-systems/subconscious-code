@@ -11,7 +11,7 @@ use rc_core::{
     AgentLoop, AgentMode, AllowAllChecker, AskResponse, Concurrency, EventSink, FinalizedToolCall,
     FinishReason, LoopOutcome, Mode, Model, ModelError, ModelRequest, ModelResponse,
     PermissionChecker, PermissionEngine, Session, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome,
-    ToolRegistry,
+    ToolRegistry, Turn,
 };
 use rc_rt::{AgentEvent, EventStream, Runtime, UserAction};
 use serde_json::{json, Value};
@@ -143,6 +143,7 @@ async fn turn_emits_tool_and_outcome_events() {
     let rt = Runtime::new(
         agent(model, tools, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>),
         session(),
+        None,
     );
     let mut rx = rt.subscribe();
     rt.action(UserAction::Submit("hi".into()));
@@ -169,7 +170,7 @@ async fn permission_ask_is_resolved_by_user_action() {
         resp_with_call("c1", "Edit", json!({})),
         resp_stop("ok"),
     ])) as Arc<dyn Model>;
-    let rt = Runtime::new(agent(model, tools, perm), session());
+    let rt = Runtime::new(agent(model, tools, perm), session(), None);
     let mut rx = rt.subscribe();
     rt.action(UserAction::Submit("edit it".into()));
 
@@ -200,7 +201,7 @@ async fn cancel_during_ask_denies_and_ends_turn() {
         resp_with_call("c1", "Edit", json!({})),
         resp_stop("ok"),
     ])) as Arc<dyn Model>;
-    let rt = Runtime::new(agent(model, tools, perm), session());
+    let rt = Runtime::new(agent(model, tools, perm), session(), None);
     let mut rx = rt.subscribe();
     rt.action(UserAction::Submit("edit it".into()));
 
@@ -233,7 +234,7 @@ async fn set_mode_bypasses_ask_for_a_mutating_call() {
         resp_with_call("c1", "Edit", json!({})),
         resp_stop("ok"),
     ])) as Arc<dyn Model>;
-    let rt = Runtime::new(agent(model, tools, perm), session());
+    let rt = Runtime::new(agent(model, tools, perm), session(), None);
     let mut rx = rt.subscribe();
 
     rt.action(UserAction::SetMode(AgentMode::BypassPermissions));
@@ -246,4 +247,46 @@ async fn set_mode_bypasses_ask_for_a_mutating_call() {
     assert!(got.iter().any(|e| matches!(e, AgentEvent::ToolEnd { tool, .. } if tool == "Edit")), "ToolEnd Edit");
     assert!(got.iter().any(|e| matches!(e, AgentEvent::Outcome(LoopOutcome::Stop))), "Outcome Stop");
     rt.shutdown();
+}
+
+#[tokio::test]
+async fn session_store_persists_turns_after_each_run() {
+    // A turn that calls Echo then stops should append User+Assistant+ToolResult
+    // turns to the SessionStore, and re-loading the file must reproduce them.
+    use rc_rt::SessionStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.jsonl");
+
+    let tools = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let model = Arc::new(MockModel::new(vec![
+        resp_with_call("c1", "Echo", json!({"msg":"hi"})),
+        resp_stop("done"),
+    ])) as Arc<dyn Model>;
+    let perm = Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>;
+    let agent = agent(model, tools, perm);
+    let session = session();
+
+    let store = SessionStore::create(path.clone(), &session).unwrap();
+    let rt = Runtime::new(agent, session, Some(store));
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Submit("hello".into()));
+
+    // Drain to idle so the driver has flushed the turn to the store.
+    let _ = drain_until(&mut rx, |e| matches!(e, AgentEvent::Idle)).await;
+    rt.shutdown();
+
+    // The file exists and re-loads the conversation we just ran.
+    assert!(path.exists(), "session file was created");
+    let loaded = rc_session::load(&path).unwrap();
+    // User("hello") + Assistant(tool-call) + ToolResult + Assistant("done") = 4.
+    assert_eq!(
+        loaded.messages.len(),
+        4,
+        "expected 4 persisted turns: {:?}",
+        loaded.messages
+    );
+    assert!(matches!(&loaded.messages[0], Turn::User { content, .. } if content == "hello"));
+    // The final assistant turn carries the "done" text.
+    assert!(matches!(&loaded.messages[3], Turn::Assistant { text, .. } if text == "done"));
 }

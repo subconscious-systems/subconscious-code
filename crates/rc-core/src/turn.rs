@@ -5,6 +5,7 @@
 
 use crate::state::{ReadRegistry, SharedReadRegistry};
 use rc_proto::Usage;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -12,29 +13,38 @@ use std::time::{Duration, SystemTime};
 /// A tool call in the domain model. `arguments` is the model's (or repaired)
 /// JSON argument *string*, preserved verbatim so the assistant message re-sent
 /// next turn is byte-identical (§4.6).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Debug, Clone)]
+/// A conversation turn (§4.1). `Turn` is the source of truth; the wire form is
+/// a fresh [`crate::project::project`] projection per request, never stored.
+/// Serialized to JSONL for session persistence (M5) via the `type` tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Turn {
     User {
         content: String,
+        #[serde(with = "epoch_millis", default = "epoch_millis::zero")]
         ts: SystemTime,
     },
     Assistant {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
     },
     ToolResult {
         call_id: String,
         tool: String,
         result: ToolResultBody,
+        #[serde(with = "duration_millis", default)]
         duration: Duration,
     },
     /// Compaction markers, mode changes, notices — never injected into the
@@ -45,7 +55,8 @@ pub enum Turn {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolResultBody {
     Ok { content: String, truncated: bool },
     Error { message: String, retryable: bool },
@@ -83,14 +94,16 @@ impl From<crate::tool::ToolOutcome> for ToolResultBody {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NoteKind {
     Compaction,
     ModeChange,
     Notice,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentMode {
     Default,
     AcceptEdits,
@@ -158,6 +171,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::Mode;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn agent_mode_round_trips_to_perm_mode() {
@@ -173,5 +187,75 @@ mod tests {
             let back: AgentMode = perm.into();
             assert_eq!(back, m, "{m:?} should round-trip through Mode");
         }
+    }
+
+    #[test]
+    fn turn_serde_round_trips() {
+        // A representative turn of each kind must survive a serialize→deserialize
+        // cycle (the JSONL persistence path, M5).
+        let turns = vec![
+            Turn::User { content: "hello".into(), ts: UNIX_EPOCH + Duration::from_secs(1000) },
+            Turn::Assistant {
+                text: "hi".into(),
+                reasoning: Some("thinking".into()),
+                calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "Read".into(),
+                    arguments: r#"{"file_path":"/a"}"#.into(),
+                }],
+                usage: Some(Usage::default()),
+            },
+            Turn::ToolResult {
+                call_id: "c1".into(),
+                tool: "Read".into(),
+                result: ToolResultBody::Ok { content: "body".into(), truncated: true },
+                duration: Duration::from_millis(250),
+            },
+            Turn::SystemNote { kind: NoteKind::Notice, text: "mode changed".into() },
+        ];
+        for t in &turns {
+            let j = serde_json::to_string(t).unwrap();
+            let back: Turn = serde_json::from_str(&j).unwrap();
+            let j2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(j, j2, "round-trip not stable for {t:?}");
+        }
+    }
+}
+
+// ---- serde helpers for SystemTime / Duration -------------------------------
+//
+// Store as unsigned millisecond offsets from `UNIX_EPOCH` so JSONL is stable
+// and portable (not the platform-specific `SystemTime` serde format). `None`
+// from an epoch (pre-1970) degrades to zero — sessions don't predate 1970.
+
+mod epoch_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S: Serializer>(t: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
+        let ms = t.duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        (ms as u64).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
+        let ms = u64::deserialize(d)?;
+        Ok(UNIX_EPOCH + Duration::from_millis(ms))
+    }
+
+    pub fn zero() -> SystemTime {
+        UNIX_EPOCH
+    }
+}
+
+mod duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        d.as_millis().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        Ok(Duration::from_millis(u64::deserialize(d)?))
     }
 }

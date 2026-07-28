@@ -4,6 +4,7 @@
 //! owns the per-turn cancel token.
 
 use rc_core::{AgentLoop, AgentMode, EventSink, Session};
+use rc_session::SessionStore;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -27,7 +28,11 @@ pub(crate) async fn driver_task(
     sink: std::sync::Arc<dyn EventSink>,
     prompter: RuntimePrompter,
     events: broadcast::Sender<AgentEvent>,
+    mut store: Option<SessionStore>,
 ) {
+    // How many turns are already persisted — append only the new ones after
+    // each `Run` (crash recovery: the file is a valid prefix up to here).
+    let mut persisted = session.messages.len();
     while let Some(cmd) = cmds.recv().await {
         match cmd {
             DriverCmd::Run { prompt, cancel } => {
@@ -42,6 +47,18 @@ pub(crate) async fn driver_task(
                     Err(e) => {
                         let _ = events.send(AgentEvent::Error(e.to_string()));
                     }
+                }
+                // Persist any turns added by this run (User + Assistant + any
+                // ToolResults). A failure to write is logged, not fatal — the
+                // in-memory session is still correct for the rest of the run.
+                if let Some(store) = store.as_mut() {
+                    for turn in &session.messages[persisted..] {
+                        if let Err(e) = store.append_turn(turn) {
+                            tracing::warn!("session persist failed: {e}");
+                            break;
+                        }
+                    }
+                    persisted = session.messages.len();
                 }
                 let _ = events.send(AgentEvent::Idle);
             }

@@ -31,4 +31,5 @@ mod sink;
 
 pub use action::UserAction;
 pub use event::AgentEvent;
+pub use rc_session::SessionStore;
 pub use runtime::{EventStream, Runtime};
