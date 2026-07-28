@@ -2,6 +2,7 @@
 //! (§4.3), the iteration budget, the tool-answer invariant, and per-call
 //! permission checks (§7) — Allow→run, Deny→a denied tool result, Ask→prompter.
 
+use crate::context::ContextAssembler;
 use crate::model::{EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse};
 use crate::prompt::{AskResponse, Prompter};
 use crate::project::{project, verify_invariant};
@@ -38,12 +39,16 @@ const PARALLEL_BOUND: usize = 8;
 /// The agent loop. Headless; the TUI (M4) and cancellation-via-Esc plug in
 /// through the [`EventSink`] and a per-turn [`CancellationToken`]. Permission
 /// decisions come from [`Self::permission`] (an `rc_perm::PermissionChecker`);
-/// Ask escalations go to [`Self::run`]'s `prompter`.
+/// Ask escalations go to [`Self::run`]'s `prompter`. Context assembly (§4.6
+/// system prompt, `@file` expansion, tool-output truncation) comes from
+/// [`Self::assembler`] — `None` uses the legacy [`crate::project::project`]
+/// path (M1–M5 behavior).
 pub struct AgentLoop {
     pub model: Arc<dyn Model>,
     pub tools: Arc<ToolRegistry>,
     pub permission: Arc<dyn PermissionChecker>,
     pub max_iters: u32,
+    pub assembler: Option<Arc<dyn ContextAssembler>>,
 }
 
 impl AgentLoop {
@@ -52,7 +57,16 @@ impl AgentLoop {
         tools: Arc<ToolRegistry>,
         permission: Arc<dyn PermissionChecker>,
     ) -> Self {
-        Self { model, tools, permission, max_iters: MAX_ITERS }
+        Self { model, tools, permission, max_iters: MAX_ITERS, assembler: None }
+    }
+
+    /// Supply a §4.6 context assembler (from `rc-ctx`). When set, the loop
+    /// builds the model request from `assembler.assemble(...)` instead of the
+    /// legacy [`project`] call. Builder-style; returns `self` for chaining.
+    #[must_use]
+    pub fn with_assembler(mut self, assembler: Arc<dyn ContextAssembler>) -> Self {
+        self.assembler = Some(assembler);
+        self
     }
 
     /// Run a full turn for `user_input`. Mutates `session` (pushes turns).
@@ -81,7 +95,10 @@ impl AgentLoop {
             }
             sink.on_iter(iters, self.max_iters);
 
-            let messages = project(&session.messages);
+            let messages = match &self.assembler {
+                Some(a) => a.assemble(&session.messages),
+                None => project(&session.messages),
+            };
             let inv = verify_invariant(&messages);
             debug_assert!(inv.is_ok(), "tool-answer invariant: {:?}", inv);
             if let Err(e) = inv {

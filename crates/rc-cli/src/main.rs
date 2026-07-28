@@ -14,8 +14,10 @@ use rc_core::registry::ToolRegistry;
 use rc_core::tool::Tool;
 use rc_core::turn::{Session, Turn};
 use rc_core::{
-    AskResponse, BypassChecker, Mode, NullPrompter, PermissionChecker, PermissionEngine, Prompter,
+    AskResponse, BypassChecker, ContextAssembler, Mode, NullPrompter, PermissionChecker,
+    PermissionEngine, Prompter,
 };
+use rc_ctx::{ContextAssembler as CtxAssembler, Environment};
 use rc_proto::ChatClient;
 use rc_tools::{Bash, Edit, Glob, Grep, Read, Write};
 use std::io::{IsTerminal, Write as IoWrite};
@@ -178,6 +180,16 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// Build the §4.6 context assembler for a session: the environment block (cwd,
+/// platform, date, git branch) plus the hierarchical memory files rooted at the
+/// session cwd. Wired into the `AgentLoop` so the model gets a real system
+/// prompt and `@file` mention expansion (M6).
+fn build_assembler(session: &Session) -> Arc<dyn ContextAssembler> {
+    let env = Environment::from_cwd(&session.cwd);
+    let assembler = CtxAssembler::new(env);
+    Arc::new(assembler) as Arc<dyn ContextAssembler>
+}
+
 /// `~/.rc/sessions/` — where session JSONL files live. Created on first use.
 fn sessions_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.rc/sessions")?;
@@ -231,7 +243,7 @@ async fn run_headless(
     } else {
         Box::new(NullPrompter)
     };
-    let agent = AgentLoop::new(model, tools, permission);
+    let agent = AgentLoop::new(model, tools, permission).with_assembler(build_assembler(&session));
     let outcome = agent
         .run(&mut session, prompt, &NullSink, &*prompter, CancellationToken::new())
         .await
@@ -254,7 +266,9 @@ async fn run_tui(
     model_name: String,
     sessions_dir: PathBuf,
 ) -> Result<()> {
-    let agent = Arc::new(AgentLoop::new(model, tools, permission));
+    let agent = Arc::new(
+        AgentLoop::new(model, tools, permission).with_assembler(build_assembler(&session)),
+    );
     let cwd = session.cwd.clone();
 
     // Persistence: a fresh session gets a new timestamped file; a resumed

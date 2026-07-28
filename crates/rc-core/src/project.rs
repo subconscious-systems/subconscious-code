@@ -9,16 +9,30 @@ use rc_proto::{FunctionCall, WireMessage};
 use rc_proto::ToolCall as WireToolCall;
 use std::collections::HashSet;
 
-/// Minimal system prompt for M1. The full §4.6 system prompt (identity,
-/// environment block, memory chain, skill index) lands in M6.
+/// Minimal system prompt for M1–M5. The full §4.6 system prompt (identity,
+/// environment block, memory chain, skill index) lands in M6 — see
+/// [`rc_ctx::ContextAssembler`], which builds the real system prompt and
+/// calls [`project_with`] with it.
 const SYSTEM_PROMPT: &str = "You are `rc`, an agent that helps with software engineering tasks in \
 the user's repository. Use the provided tools to inspect and edit files. Be concise and direct. \
 When you have enough information, answer in plain text.";
 
-/// Project the session's turns to wire messages (§4.1). A leading system
-/// message is always first; the conversation order is rigid (§3.1 trap 3).
+/// Project the session's turns to wire messages (§4.1) with the default system
+/// prompt. The full §4.6 prompt (with an environment block and memory chain)
+/// is assembled by `rc-ctx` and passed to [`project_with`].
 pub fn project(messages: &[Turn]) -> Vec<WireMessage> {
-    let mut out = vec![WireMessage::System { content: SYSTEM_PROMPT.to_string() }];
+    project_with(messages, SYSTEM_PROMPT)
+}
+
+/// Project the session's turns to wire messages (§4.1) with a caller-supplied
+/// system prompt. A leading system message is always first; the conversation
+/// order is rigid (§3.1 trap 3).
+///
+/// This is the seam the M6 context layer uses: it assembles the real §4.6
+/// system prompt (identity + environment + memory chain + skill index) and
+/// hands it here, then the turn projection stays identical to the legacy path.
+pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> {
+    let mut out = vec![WireMessage::System { content: system_prompt.to_string() }];
     for turn in messages {
         match turn {
             Turn::User { content, .. } => {
@@ -106,6 +120,7 @@ pub fn verify_invariant(msgs: &[WireMessage]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::turn::{ToolCall, ToolResultBody};
+    use rc_proto::wire::UserContent;
     use std::time::SystemTime;
 
     fn call(id: &str) -> ToolCall {
@@ -159,5 +174,28 @@ mod tests {
             toolresult("c1"),
         ];
         assert!(verify_invariant(&project(&turns)).is_err());
+    }
+
+    #[test]
+    fn project_with_uses_the_supplied_system_prompt() {
+        // A custom §4.6 system prompt must land as the leading message, and the
+        // turn projection must be identical to the default path below it.
+        let turns = vec![Turn::User { content: "hi".into(), ts: SystemTime::now() }];
+        let wire = project_with(&turns, "CUSTOM SYSTEM PROMPT");
+        assert!(matches!(
+            wire.first(),
+            Some(WireMessage::System { content }) if content == "CUSTOM SYSTEM PROMPT"
+        ));
+        // The rest mirrors the default path's tail (same length, same user msg).
+        let default = project(&turns);
+        assert_eq!(wire.len(), default.len());
+        assert!(matches!(
+            &wire[1],
+            WireMessage::User { content: UserContent::Text(t) } if t == "hi"
+        ));
+        assert!(matches!(
+            &default[1],
+            WireMessage::User { content: UserContent::Text(t) } if t == "hi"
+        ));
     }
 }

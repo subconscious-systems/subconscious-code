@@ -331,3 +331,100 @@ async fn async_prompter_session_adds_a_grant() {
         .unwrap();
     assert_eq!(session.perm_grants, vec!["Edit".to_string()]);
 }
+
+// ---- context assembler (M6) -------------------------------------------------
+
+/// A model that captures the first request's messages so the test can inspect
+/// the system prompt the loop actually sent.
+struct CapturingModel {
+    captured: Arc<Mutex<Option<ModelRequest>>>,
+    response: ModelResponse,
+}
+#[async_trait]
+impl Model for CapturingModel {
+    async fn complete(&self, req: ModelRequest, _sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
+        *self.captured.lock().unwrap() = Some(req);
+        Ok(self.response.clone())
+    }
+}
+
+/// A minimal context assembler that emits a fixed system prompt and otherwise
+/// forwards to the legacy `project` path — enough to prove the loop uses it.
+struct FixedAssembler {
+    prompt: String,
+}
+impl rc_core::ContextAssembler for FixedAssembler {
+    fn assemble(&self, turns: &[Turn]) -> Vec<rc_proto::WireMessage> {
+        rc_core::project_with(turns, &self.prompt)
+    }
+    fn system_prompt(&self) -> Option<&str> {
+        Some(&self.prompt)
+    }
+}
+
+#[tokio::test]
+async fn loop_uses_the_wired_context_assembler() {
+    // With an assembler set, the loop must send its system prompt, not the
+    // legacy default. We capture the request and inspect message[0].
+    let captured = Arc::new(Mutex::new(None));
+    let response = ModelResponse {
+        text: "done".into(),
+        reasoning: None,
+        tool_calls: vec![],
+        finish_reason: rc_proto::FinishReason::Stop,
+        usage: None,
+    };
+    let model = Arc::new(CapturingModel { captured: captured.clone(), response }) as Arc<dyn Model>;
+    let registry = Arc::new(ToolRegistry::new(vec![]));
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>)
+        .with_assembler(Arc::new(FixedAssembler { prompt: "SENTINEL SYSTEM PROMPT".into() })
+            as Arc<dyn rc_core::ContextAssembler>);
+
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    agent
+        .run(&mut session, "hi".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let req = captured.lock().unwrap().clone().expect("a request was captured");
+    use rc_proto::WireMessage;
+    match req.messages.first() {
+        Some(WireMessage::System { content }) => {
+            assert_eq!(content, "SENTINEL SYSTEM PROMPT", "loop must use the wired assembler");
+        }
+        other => panic!("expected a system message, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn loop_without_assembler_uses_legacy_default_prompt() {
+    // With no assembler set, the loop falls back to the legacy `project` path
+    // (M1–M5 behavior) — the system message is the default identity prompt.
+    let captured = Arc::new(Mutex::new(None));
+    let response = ModelResponse {
+        text: "done".into(),
+        reasoning: None,
+        tool_calls: vec![],
+        finish_reason: rc_proto::FinishReason::Stop,
+        usage: None,
+    };
+    let model = Arc::new(CapturingModel { captured: captured.clone(), response }) as Arc<dyn Model>;
+    let registry = Arc::new(ToolRegistry::new(vec![]));
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    agent
+        .run(&mut session, "hi".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let req = captured.lock().unwrap().clone().expect("a request was captured");
+    use rc_proto::WireMessage;
+    match req.messages.first() {
+        Some(WireMessage::System { content }) => {
+            assert!(content.contains("You are `rc`"), "default prompt: {content}");
+            assert!(!content.contains("SENTINEL"), "no custom prompt without an assembler");
+        }
+        other => panic!("expected a system message, got {other:?}"),
+    }
+}

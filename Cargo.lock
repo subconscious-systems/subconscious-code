@@ -1320,9 +1320,11 @@ dependencies = [
  "clap",
  "rc-config",
  "rc-core",
+ "rc-ctx",
  "rc-proto",
  "rc-rt",
  "rc-session",
+ "rc-tokenize",
  "rc-tools",
  "rc-tui",
  "serde_json",
@@ -1360,6 +1362,13 @@ dependencies = [
 [[package]]
 name = "rc-ctx"
 version = "0.1.0"
+dependencies = [
+ "rc-core",
+ "rc-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "rc-hooks"

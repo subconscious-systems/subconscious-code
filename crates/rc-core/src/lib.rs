@@ -14,6 +14,7 @@
 //! (rc-cli) wires concrete tools into a [`registry::ToolRegistry`].
 
 pub mod agent;
+pub mod context;
 pub mod model;
 pub mod project;
 pub mod prompt;
@@ -23,13 +24,14 @@ pub mod tool;
 pub mod turn;
 
 pub use agent::{AgentLoop, LoopError, LoopOutcome};
+pub use context::{ContextAssembler, LegacyAssembler};
 pub use model::{
     ChatModel, EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse, NullSink,
 };
 pub use rc_proto::FinishReason;
 pub use rc_proto::Usage;
 pub use prompt::{AskResponse, NullPrompter, Prompter};
-pub use project::{project, verify_invariant};
+pub use project::{project, project_with, verify_invariant};
 pub use rc_perm::{
     AllowAllChecker, BypassChecker, Decision, Mode, PermissionChecker, PermissionEngine,
     resolve_within, resolve_within_loose,

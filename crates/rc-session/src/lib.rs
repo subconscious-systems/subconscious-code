@@ -169,7 +169,7 @@ mod tests {
     use rc_core::NoteKind;
     use rc_core::ToolCall;
     use rc_core::ToolResultBody;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
     use tempfile::tempdir;
 
     fn sample_session(dir: &Path) -> Session {

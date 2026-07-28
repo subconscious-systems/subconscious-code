@@ -78,6 +78,27 @@ impl ToolResultBody {
             ToolResultBody::Interrupted => "[interrupted by user]".to_string(),
         }
     }
+
+    /// Return a copy with an oversized `Ok` body head-truncated to `cap` bytes
+    /// (§8.5 microcompaction seam). A tail sentinel records the elision count
+    /// and the `truncated` flag is set. Non-`Ok` variants are returned unchanged.
+    /// This is a bounded per-result cap, not full summary-turn compaction.
+    pub fn truncate_body(&self, cap: usize) -> ToolResultBody {
+        match self {
+            ToolResultBody::Ok { content, truncated: _ } => {
+                if content.len() <= cap {
+                    return self.clone();
+                }
+                let head: String = content.chars().take(cap).collect();
+                let elided = content.len() - head.len();
+                ToolResultBody::Ok {
+                    content: format!("{head}\n[… {elided} bytes truncated]"),
+                    truncated: true,
+                }
+            }
+            other => other.clone(),
+        }
+    }
 }
 
 impl From<crate::tool::ToolOutcome> for ToolResultBody {
