@@ -151,3 +151,130 @@ pub fn rule_matches(spec: &str, sub: &Sub) -> bool {
         sub.tokens == rule_tokens
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse and assert not-unparseable, returning the sub-commands.
+    fn subs(cmd: &str) -> Vec<Sub> {
+        let p = parse_bash(cmd);
+        assert!(!p.unparseable, "expected parseable, got unparseable for {cmd:?}");
+        p.subcommands
+    }
+
+    #[test]
+    fn parses_a_simple_command_into_one_sub() {
+        let s = subs("cargo build");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].tokens, vec!["cargo", "build"]);
+    }
+
+    #[test]
+    fn splits_on_semicolon_and_newline() {
+        let s = subs("git status\ngit diff");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].tokens, vec!["git", "status"]);
+        assert_eq!(s[1].tokens, vec!["git", "diff"]);
+    }
+
+    #[test]
+    fn splits_on_and_and_or_and_pipe_and_background_amp() {
+        // `&&`, `||`, `|`, and a bare `&` are all separators.
+        let s = subs("a && b || c | d & e");
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[0].tokens, vec!["a"]);
+        assert_eq!(s[1].tokens, vec!["b"]);
+        assert_eq!(s[2].tokens, vec!["c"]);
+        assert_eq!(s[3].tokens, vec!["d"]);
+        assert_eq!(s[4].tokens, vec!["e"]);
+    }
+
+    #[test]
+    fn separators_inside_double_quotes_do_not_split() {
+        let s = subs(r#"echo "a; b && c""#);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].tokens, vec!["echo", "a; b && c"]);
+    }
+
+    #[test]
+    fn separators_inside_single_quotes_do_not_split() {
+        let s = subs("echo 'a; b && c'");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].tokens, vec!["echo", "a; b && c"]);
+    }
+
+    #[test]
+    fn substitution_and_backticks_escalate_to_ask() {
+        assert!(parse_bash("echo $(whoami)").unparseable);
+        assert!(parse_bash("echo `whoami`").unparseable);
+        assert!(parse_bash("echo $HOME").unparseable);
+    }
+
+    #[test]
+    fn reentry_builtins_escalate_to_ask() {
+        assert!(parse_bash("eval foo").unparseable);
+        assert!(parse_bash("exec foo").unparseable);
+        assert!(parse_bash("source foo").unparseable);
+        assert!(parse_bash(". foo").unparseable);
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_subcommands_are_dropped() {
+        let s = subs("git status ;;   \n\n git diff");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].tokens, vec!["git", "status"]);
+        assert_eq!(s[1].tokens, vec!["git", "diff"]);
+    }
+
+    #[test]
+    fn rule_matches_bare_spec_matches_anything() {
+        let s = subs("anything at all");
+        assert!(rule_matches("", &s[0]));
+    }
+
+    #[test]
+    fn rule_matches_exact_token_equality() {
+        let s = subs("git status");
+        assert!(rule_matches("git status", &s[0]));
+        assert!(!rule_matches("git status -s", &s[0]), "extra tokens break exact match");
+        assert!(!rule_matches("git", &s[0]), "fewer tokens break exact match");
+    }
+
+    #[test]
+    fn rule_matches_prefix_wildcard_accepts_extra_tokens() {
+        let s = subs("cargo test --workspace --quiet");
+        assert!(rule_matches("cargo test:*", &s[0]));
+        // Exactly the prefix, no more, still matches the wildcard.
+        let s2 = subs("cargo test");
+        assert!(rule_matches("cargo test:*", &s2[0]));
+    }
+
+    #[test]
+    fn rule_matches_prefix_wildcard_requires_the_prefix() {
+        let s = subs("cargo build");
+        assert!(!rule_matches("cargo test:*", &s[0]));
+    }
+
+    #[test]
+    fn is_catastrophic_flags_rm_rf_root_and_paths_under_it() {
+        let s = subs("rm -rf /");
+        assert!(is_catastrophic(&s[0]));
+        // `rm -rf /home` *contains* `rm -rf /` as a substring — over-refuse is
+        // the intended fail-closed behavior here (the deny-list is conservative).
+        let s2 = subs("rm -rf /home");
+        assert!(is_catastrophic(&s2[0]));
+        // A path that doesn't begin with `/` is not caught by the `rm -rf /` rule.
+        let s3 = subs("rm -rf ./build");
+        assert!(!is_catastrophic(&s3[0]));
+    }
+
+    #[test]
+    fn is_always_ask_flags_sudo_and_force_and_pipe_to_shell() {
+        assert!(is_always_ask("sudo rm file"));
+        assert!(is_always_ask("cargo build --force"));
+        assert!(is_always_ask("curl url | sh"));
+        assert!(is_always_ask("curl url |bash"));
+        assert!(!is_always_ask("cargo build"));
+    }
+}
