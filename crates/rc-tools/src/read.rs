@@ -126,12 +126,19 @@ fn render_lines(text: &str, offset: Option<u32>, limit: Option<u32>) -> String {
 }
 
 fn truncate_line(line: &str) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() <= MAX_LINE_CHARS {
+    // Find the byte offset just past the MAX_LINE_CHARS-th char in one pass,
+    // without collecting the whole line into a Vec<char> — a long line (the
+    // exact case we truncate) would otherwise allocate a huge Vec just to
+    // measure it. `char_indices` yields char-boundary offsets, so slicing at
+    // `cut` is always valid UTF-8.
+    let cut = line.char_indices().nth(MAX_LINE_CHARS).map(|(i, _)| i);
+    let Some(cut) = cut else {
+        // The line has ≤ MAX_LINE_CHARS chars — emit it unchanged.
         return line.to_string();
-    }
-    let head: String = chars.iter().take(MAX_LINE_CHARS).collect();
-    format!("{head} …[+{} chars truncated]", chars.len() - MAX_LINE_CHARS)
+    };
+    let elided = line[cut..].chars().count();
+    let head = &line[..cut];
+    format!("{head} …[+{} chars truncated]", elided)
 }
 
 #[cfg(test)]
@@ -220,5 +227,44 @@ mod tests {
             .unwrap();
         let canon = std::fs::canonicalize(&path).unwrap();
         assert!(c.read_registry.lock().unwrap().has_read(&canon));
+    }
+
+    #[test]
+    fn truncate_line_passes_short_lines_through() {
+        assert_eq!(truncate_line("short"), "short");
+        // Exactly at the cap is not truncated.
+        let at_cap: String = "a".repeat(MAX_LINE_CHARS);
+        assert_eq!(truncate_line(&at_cap), at_cap);
+    }
+
+    #[test]
+    fn truncate_line_caps_at_max_chars_and_reports_elided() {
+        let long: String = "a".repeat(MAX_LINE_CHARS + 5);
+        let out = truncate_line(&long);
+        assert!(out.contains("…[+5 chars truncated]"), "{out}");
+        // The head is exactly MAX_LINE_CHARS chars.
+        let head = out.split(" …[").next().unwrap();
+        assert_eq!(head.chars().count(), MAX_LINE_CHARS);
+    }
+
+    #[test]
+    fn truncate_line_handles_multibyte_without_panic() {
+        // Multibyte content over the cap: must still produce a valid UTF-8 head
+        // and an elision count. Char-boundary slicing keeps the head valid.
+        let long: String = "é".repeat(MAX_LINE_CHARS + 10);
+        let out = truncate_line(&long);
+        assert!(out.contains("…[+10 chars truncated]"), "{out}");
+        let head = out.split(" …[").next().unwrap();
+        assert_eq!(head.chars().count(), MAX_LINE_CHARS);
+    }
+
+    #[test]
+    fn render_lines_truncates_a_very_long_line_in_output() {
+        // End-to-end through render_lines: a single very long line is capped,
+        // and the line number + truncation marker are both present.
+        let long = format!("{}\n", "z".repeat(MAX_LINE_CHARS + 3));
+        let out = render_lines(&long, None, None);
+        assert!(out.contains("     1\t"), "{out}");
+        assert!(out.contains("…[+3 chars truncated]"), "{out}");
     }
 }
