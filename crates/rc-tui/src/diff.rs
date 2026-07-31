@@ -5,12 +5,15 @@
 //! added words green + bold, unchanged words plain. Rendered inline so the user
 //! sees exactly what changed at a glance.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier};
 use ratatui::text::{Line, Span};
 use similar::text::{ChangeTag, TextDiff};
 
+use crate::theme;
+
 /// One styled line summarizing the word-level change from `old` to `new`.
 pub fn word_diff_line(old: &str, new: &str) -> Line<'static> {
+    let p = theme::palette();
     let diff = TextDiff::from_unicode_words(old, new);
     let mut spans: Vec<Span<'static>> = Vec::new();
     for op in diff.ops() {
@@ -19,11 +22,11 @@ pub fn word_diff_line(old: &str, new: &str) -> Line<'static> {
             let span = match change.tag() {
                 ChangeTag::Delete => Span::styled(
                     value.to_string(),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT),
+                    p.semantic(Color::Red).add_modifier(Modifier::CROSSED_OUT),
                 ),
                 ChangeTag::Insert => Span::styled(
                     value.to_string(),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    p.semantic(Color::Green).add_modifier(Modifier::BOLD),
                 ),
                 ChangeTag::Equal => Span::raw(value.to_string()),
             };

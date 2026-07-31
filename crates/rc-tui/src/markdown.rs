@@ -13,35 +13,36 @@
 //! re-parsed per frame. [`parse_blocks`](crate::markdown::parse_blocks) is
 //! pure and cheap to call on the small growing buffer.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use crate::theme;
 use ratatui::text::{Line, Span};
 
 fn heading_style(level: usize) -> Style {
-    // Dim the color as the heading level deepens; all are bold.
-    let color = match level {
-        1 | 2 => theme::ACCENT,
-        3 => theme::ACCENT_DIM,
-        _ => Color::DarkGray,
+    // Headings are the one place the accent lives. Level deepens toward chrome.
+    let p = theme::palette();
+    let base = match level {
+        1 | 2 => p.accent(),
+        3 => p.accent_dim(),
+        _ => p.chrome(),
     };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+    base.add_modifier(Modifier::BOLD)
 }
 
 fn code_span_style() -> Style {
-    Style::default().fg(theme::ACCENT_BRIGHT)
+    theme::palette().code()
 }
 
 fn code_block_style() -> Style {
-    Style::default().fg(theme::ACCENT_DIM)
+    theme::palette().code()
 }
 
 fn quote_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    theme::palette().chrome()
 }
 
 fn link_style() -> Style {
-    Style::default().fg(theme::ACCENT_BRIGHT).add_modifier(Modifier::UNDERLINED)
+    theme::palette().link()
 }
 
 /// Parse a block of markdown into styled lines (one logical line per source
@@ -92,14 +93,14 @@ pub fn parse_blocks(text: &str) -> Vec<Line<'static>> {
         }
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
             let rest = &trimmed[2..];
-            let mut spans = vec![Span::styled("• ", Style::default().fg(theme::ACCENT))];
+            let mut spans = vec![Span::styled("• ", theme::palette().chrome())];
             spans.extend(parse_inline(rest));
             out.push(Line::from(spans));
             continue;
         }
         if let Some(rest) = strip_ordered(line) {
             let num: String = line.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
-            let mut spans = vec![Span::styled(format!("{num}. "), Style::default().fg(theme::ACCENT))];
+            let mut spans = vec![Span::styled(format!("{num}. "), theme::palette().chrome())];
             spans.extend(parse_inline(rest));
             out.push(Line::from(spans));
             continue;
