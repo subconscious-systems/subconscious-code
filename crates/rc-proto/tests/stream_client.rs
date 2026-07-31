@@ -2,8 +2,9 @@
 //! emitting SSE. Proves the streaming path end-to-end — text deltas, tool-call
 //! argument reassembly across fragments, finish, and the trailing usage chunk.
 
+use std::time::Duration;
 use rc_proto::stream::AgentStreamEvent;
-use rc_proto::{ChatClient, CompleteOpts, WireMessage};
+use rc_proto::{ChatClient, CompleteOpts, RetryOpts, WireMessage};
 use tokio_stream::StreamExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -31,7 +32,7 @@ async fn streams_text_finish_and_usage() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into()).unwrap();
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600)).unwrap();
     let mut stream = client
         .stream(
             &[WireMessage::User { content: "hi".into() }],
@@ -88,7 +89,7 @@ async fn stream_assembles_tool_call_args_across_fragments() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into()).unwrap();
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600)).unwrap();
     let mut stream = client
         .stream(
             &[WireMessage::User { content: "read it".into() }],
@@ -115,4 +116,47 @@ async fn stream_assembles_tool_call_args_across_fragments() {
     let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap();
     assert_eq!(parsed, serde_json::json!({"file":"x"}));
     assert!(finish.contains("ToolCalls"));
+}
+
+#[tokio::test]
+async fn stream_retries_on_429_then_streams() {
+    // A streaming request is retried only before the body starts flowing: the
+    // first attempt gets 429, the retry gets the SSE body.
+    let body = sse_body(&[
+        r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ]);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600))
+        .unwrap()
+        .with_retry(RetryOpts { max_retries: 2, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(5) });
+    let mut stream = client
+        .stream(&[WireMessage::User { content: "hi".into() }], &CompleteOpts::default(), &[])
+        .await
+        .unwrap();
+    let mut text = String::new();
+    while let Some(ev) = stream.next().await {
+        if let AgentStreamEvent::Text(t) = ev.unwrap() {
+            text.push_str(&t);
+        }
+    }
+    assert_eq!(text, "hi");
+    assert_eq!(
+        server.received_requests().await.expect("requests recorded").len(),
+        2,
+        "1 initial 429 + 1 retry 200"
+    );
 }

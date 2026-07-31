@@ -14,6 +14,7 @@ use rc_core::{AskResponse, FinishReason, Prompter, ToolResultBody, Usage};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 /// A model that replays a scripted queue of responses.
@@ -332,6 +333,173 @@ async fn async_prompter_session_adds_a_grant() {
     assert_eq!(session.perm_grants, vec!["Edit".to_string()]);
 }
 
+// ---- T3: turn wall-clock budget -------------------------------------------
+
+#[tokio::test]
+async fn turn_timeout_ends_a_long_loop() {
+    // A model that always requests a tool call (so the loop would otherwise run
+    // to the iteration budget) but sleeps 20 ms per call. A 50 ms turn budget
+    // stops it after a few iterations — well before MAX_ITERS.
+    struct Slow {
+        delay: Duration,
+        n: Arc<Mutex<u32>>,
+    }
+    #[async_trait]
+    impl Model for Slow {
+        async fn complete(&self, _req: ModelRequest, _sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
+            let n = { let mut c = self.n.lock().unwrap(); *c += 1; *c };
+            tokio::time::sleep(self.delay).await;
+            Ok(ModelResponse {
+                text: String::new(),
+                reasoning: None,
+                tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                    id: format!("c{n}"),
+                    name: "Echo".into(),
+                    arguments: r#"{"msg":"x"}"#.into(),
+                })],
+                finish_reason: rc_proto::FinishReason::ToolCalls,
+                usage: None,
+            })
+        }
+    }
+
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let calls = Arc::new(Mutex::new(0u32));
+    let model = Arc::new(Slow { delay: Duration::from_millis(20), n: calls.clone() }) as Arc<dyn Model>;
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>)
+        .with_turn_timeout(Some(Duration::from_millis(50)));
+
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    let start = SystemTime::now();
+    let outcome = agent
+        .run(&mut session, "loop".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+    let elapsed = start.elapsed().unwrap_or_default();
+    let n = *calls.lock().unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::TimeUp);
+    assert!(elapsed < Duration::from_secs(2), "should stop near 50 ms, took {elapsed:?}");
+    assert!((2..50).contains(&n), "should run a few iters ({n}), not to the limit");
+}
+
+// ---- M3: cross-turn usage accumulation ------------------------------------
+
+#[tokio::test]
+async fn accumulates_usage_across_iterations() {
+    fn usage(p: u64, c: u64) -> Usage {
+        Usage { prompt_tokens: p, completion_tokens: c, total_tokens: p + c, prompt_tokens_details: None }
+    }
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let responses = vec![
+        ModelResponse {
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "c1".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"x"}"#.into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: Some(usage(10, 2)),
+        },
+        ModelResponse {
+            text: "done".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: Some(usage(20, 3)),
+        },
+    ];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    agent
+        .run(&mut session, "go".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+    let t = &session.total_usage;
+    assert_eq!(t.prompt_tokens, 30, "prompt summed across iterations");
+    assert_eq!(t.completion_tokens, 5, "completion summed across iterations");
+    assert_eq!(t.total_tokens, 35, "total summed across iterations");
+}
+
+// ---- early-return invariant (§4.2 / project.rs:69) --------------------------
+//
+// A finish_reason that isn't `ToolCalls` but the assistant DID emit a tool call
+// (provider anomaly, or a stream cut mid-tool-call). The loop must NOT execute
+// the tool, and must synthesize an `Interrupted` result so the tool-answer
+// invariant holds — otherwise the next turn's projection has an unanswered
+// assistant tool_call (debug_assert panic / malformed request to the provider).
+
+#[tokio::test]
+async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let responses = vec![ModelResponse {
+        text: String::new(),
+        reasoning: None,
+        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+            id: "c1".into(),
+            name: "Echo".into(),
+            arguments: r#"{"msg":"hi"}"#.to_string(),
+        })],
+        finish_reason: rc_proto::FinishReason::Stop,
+        usage: None,
+    }];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    let outcome = agent
+        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
+
+    // User, Assistant(calls), ToolResult(Interrupted) — the tool was NOT executed.
+    assert_eq!(session.messages.len(), 3);
+    match &session.messages[2] {
+        Turn::ToolResult { result, .. } => {
+            assert!(matches!(result, ToolResultBody::Interrupted), "expected Interrupted, got {result:?}");
+        }
+        other => panic!("expected a synthesized tool result, got {other:?}"),
+    }
+    assert!(verify_invariant(&project(&session.messages)).is_ok(), "invariant must hold");
+}
+
+#[tokio::test]
+async fn length_with_outstanding_call_synthesizes_an_interrupted_result() {
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let responses = vec![ModelResponse {
+        text: "partial".into(),
+        reasoning: None,
+        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+            id: "c1".into(),
+            name: "Echo".into(),
+            arguments: r#"{"msg":"hi"}"#.to_string(),
+        })],
+        finish_reason: rc_proto::FinishReason::Length,
+        usage: None,
+    }];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    let outcome = agent
+        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Length);
+    assert!(
+        verify_invariant(&project(&session.messages)).is_ok(),
+        "length exit with outstanding calls must still satisfy the invariant"
+    );
+    assert!(session.messages.iter().any(|t| matches!(
+        t,
+        Turn::ToolResult { result: ToolResultBody::Interrupted, .. }
+    )));
+}
+
 // ---- context assembler (M6) -------------------------------------------------
 
 /// A model that captures the first request's messages so the test can inspect
@@ -427,4 +595,73 @@ async fn loop_without_assembler_uses_legacy_default_prompt() {
         }
         other => panic!("expected a system message, got {other:?}"),
     }
+}
+
+// ---- F9: a panicking parallel tool is isolated, not propagated --------------
+
+/// A parallel tool that panics inside `call` — a stand-in for a tool-impl bug.
+struct PanicTool;
+#[async_trait]
+impl Tool for PanicTool {
+    fn name(&self) -> &str { "PanicTool" }
+    fn description(&self) -> &str { "Panics on purpose." }
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+    fn concurrency(&self) -> Concurrency { Concurrency::Parallel }
+    async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+        panic!("PanicTool: simulated tool-impl bug");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
+    // A tool whose `call` panics must not take down the agent loop. The loop
+    // surfaces a non-retryable error result for that call and continues to a
+    // normal Stop — the invariant holds and no panic escapes `run`.
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(PanicTool) as Arc<dyn Tool>]));
+    let responses = vec![
+        ModelResponse {
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "c1".into(),
+                name: "PanicTool".into(),
+                arguments: "{}".into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            text: "recovered".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    // The run must NOT panic (the tool's panic is isolated by tokio).
+    let outcome = agent
+        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
+
+    // The panicked call becomes a non-retryable error result (not a propagated
+    // panic), and the invariant still holds.
+    match &session.messages[2] {
+        Turn::ToolResult { result, .. } => match result {
+            ToolResultBody::Error { message, retryable } => {
+                assert!(message.contains("panic"), "expected a panic error, got {message}");
+                assert!(!*retryable, "a panic is not retryable");
+            }
+            other => panic!("expected an Error result, got {other:?}"),
+        },
+        other => panic!("expected a tool result, got {other:?}"),
+    }
+    assert!(verify_invariant(&project(&session.messages)).is_ok(), "invariant must hold");
 }

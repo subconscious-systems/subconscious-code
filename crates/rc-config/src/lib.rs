@@ -23,7 +23,27 @@ pub struct Settings {
     pub model: String,
     pub small_model: String,
     pub timeout_ms: u64,
+    /// T2: max gap between stream chunks before the turn aborts (0 = off). Env
+    /// `RC_IDLE_TIMEOUT_MS`.
+    pub idle_timeout_ms: u64,
+    /// Retry: max retries on transient HTTP errors 429/5xx (0 = off). Env
+    /// `RC_MAX_RETRIES`. Recommended production value: 2–3.
+    pub max_retries: u32,
+    /// Retry: base backoff (ms) for the first retry; doubles each attempt. Env
+    /// `RC_RETRY_BASE_MS`.
+    pub retry_base_ms: u64,
+    /// Retry: cap (ms) on the backoff between retries. Env `RC_RETRY_MAX_MS`.
+    pub retry_max_ms: u64,
+    /// T3: wall-clock budget for a turn in ms (0 = off). Env `RC_TURN_TIMEOUT_MS`.
+    pub turn_timeout_ms: u64,
+    /// M4: per-response completion-token cap (0 = provider default). Env
+    /// `RC_MAX_TOKENS`. Bounds each reply's length.
+    pub max_tokens: u32,
+    /// Sampling temperature (None = provider default). Env `RC_TEMPERATURE`.
+    pub temperature: Option<f32>,
     pub permissions: PermissionsConfig,
+    /// M7: opt-in kernel sandbox for `Bash` (§7.6). Off by default.
+    pub sandbox: SandboxConfig,
 }
 
 /// The `permissions` block (§7.1/§10.2). Rule strings are parsed by rc-perm.
@@ -39,6 +59,19 @@ pub struct PermissionsConfig {
     pub additional_directories: Vec<String>,
 }
 
+/// The `sandbox` block (§7.6). Opt-in kernel confinement for `Bash`: deny
+/// writes outside the workspace roots (+ allow `/tmp`) and, unless
+/// `allow_net`, deny network syscalls. Linux applies Landlock+seccomp; other
+/// platforms no-op. Off by default so `cargo`/`npm`/`git` keep working.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Enable confinement for every approved `Bash` command. Env `RC_SANDBOX`.
+    pub enabled: bool,
+    /// Allow network syscalls under confinement. Env `RC_SANDBOX_NET`.
+    pub allow_net: bool,
+}
+
 /// On-disk shape of a settings file. Unknown keys are ignored (forward-compat).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
@@ -47,6 +80,7 @@ struct SettingsFile {
     model: Option<String>,
     small_model: Option<String>,
     permissions: Option<PermissionsConfig>,
+    sandbox: Option<SandboxConfig>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -69,9 +103,17 @@ impl Settings {
         let mut base_url = DEFAULT_BASE_URL.to_string();
         let mut api_key_env = "RC_API_KEY".to_string();
         let mut timeout_ms = DEFAULT_TIMEOUT_MS;
+        let mut idle_timeout_ms: u64 = 0;
+        let mut max_retries: u32 = 0;
+        let mut retry_base_ms: u64 = 200;
+        let mut retry_max_ms: u64 = 10_000;
+        let mut turn_timeout_ms: u64 = 0;
+        let mut max_tokens: u32 = 0;
+        let mut temperature: Option<f32> = None;
         let mut model = DEFAULT_MODEL.to_string();
         let mut small_model = DEFAULT_SMALL_MODEL.to_string();
         let mut permissions = PermissionsConfig::default();
+        let mut sandbox = SandboxConfig::default();
 
         // Later layers override earlier ones. User before project so a
         // committed project file beats a user global — matches §10.1 (project
@@ -88,6 +130,7 @@ impl Settings {
                 if let Some(m) = file.model { model = m; }
                 if let Some(s) = file.small_model { small_model = s; }
                 if let Some(p) = file.permissions { permissions = p; }
+                if let Some(s) = file.sandbox { sandbox = s; }
             }
         }
 
@@ -96,13 +139,32 @@ impl Settings {
         if let Ok(v) = std::env::var("RC_MODEL") { if !v.is_empty() { model = v; } }
         if let Ok(v) = std::env::var("RC_SMALL_MODEL") { if !v.is_empty() { small_model = v; } }
         if let Ok(v) = std::env::var("RC_TIMEOUT_MS") { if let Ok(t) = v.parse() { timeout_ms = t; } }
+        if let Ok(v) = std::env::var("RC_IDLE_TIMEOUT_MS") { if let Ok(t) = v.parse::<u64>() { idle_timeout_ms = t; } }
+        if let Ok(v) = std::env::var("RC_MAX_RETRIES") { if let Ok(t) = v.parse::<u32>() { max_retries = t; } }
+        if let Ok(v) = std::env::var("RC_RETRY_BASE_MS") { if let Ok(t) = v.parse::<u64>() { retry_base_ms = t; } }
+        if let Ok(v) = std::env::var("RC_RETRY_MAX_MS") { if let Ok(t) = v.parse::<u64>() { retry_max_ms = t; } }
+        if let Ok(v) = std::env::var("RC_TURN_TIMEOUT_MS") { if let Ok(t) = v.parse::<u64>() { turn_timeout_ms = t; } }
+        if let Ok(v) = std::env::var("RC_MAX_TOKENS") { if let Ok(t) = v.parse::<u32>() { max_tokens = t; } }
+        if let Ok(v) = std::env::var("RC_TEMPERATURE") { if let Ok(t) = v.parse::<f32>() { temperature = Some(t); } }
         if let Ok(v) = std::env::var("RC_DEFAULT_MODE") { if !v.is_empty() { permissions.default_mode = v; } }
+        if let Some(b) = env_bool("RC_SANDBOX") { sandbox.enabled = b; }
+        if let Some(b) = env_bool("RC_SANDBOX_NET") { sandbox.allow_net = b; }
 
         let api_key = std::env::var(&api_key_env)
             .ok()
             .filter(|s| !s.is_empty());
 
-        Settings { base_url, api_key, model, small_model, timeout_ms, permissions }
+        Settings { base_url, api_key, model, small_model, timeout_ms, idle_timeout_ms, max_retries, retry_base_ms, retry_max_ms, turn_timeout_ms, max_tokens, temperature, permissions, sandbox }
+    }
+}
+
+/// Parse a bool env var: `1`/`true`/`yes`/on (case-insensitive) → true, `0`/`false`/`no`/off → false.
+fn env_bool(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 

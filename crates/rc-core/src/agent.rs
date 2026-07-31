@@ -7,16 +7,15 @@ use crate::model::{EventSink, FinalizedToolCall, Model, ModelError, ModelRequest
 use crate::prompt::{AskResponse, Prompter};
 use crate::project::{project, verify_invariant};
 use crate::registry::ToolRegistry;
-use crate::tool::{Concurrency, Tool, ToolCtx, ToolOutcome};
+use crate::tool::{Concurrency, SandboxPolicy, Tool, ToolCtx, ToolOutcome};
 use crate::turn::{Session, ToolCall, ToolResultBody, Turn};
 use rc_perm::{Decision, PermissionChecker};
-use rc_proto::{FinishReason, ToolChoiceValue};
+use rc_proto::{CompleteOpts, FinishReason, ToolChoiceValue};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 #[derive(thiserror::Error, Debug)]
@@ -31,6 +30,8 @@ pub enum LoopOutcome {
     Stop,
     Length,
     ItersExceeded,
+    /// T3: the turn exceeded its wall-clock budget (`turn_timeout`).
+    TimeUp,
 }
 
 const MAX_ITERS: u32 = 100;
@@ -49,6 +50,21 @@ pub struct AgentLoop {
     pub permission: Arc<dyn PermissionChecker>,
     pub max_iters: u32,
     pub assembler: Option<Arc<dyn ContextAssembler>>,
+    /// T2: max gap between stream chunks before the model stream aborts with
+    /// `ProtoError::Idle`. `None` (default) disables the idle bound.
+    pub idle_timeout: Option<Duration>,
+    /// T3: wall-clock budget for a turn. `None` (default) disables it; the turn
+    /// is then bounded only by `max_iters` (count) + per-request timeouts.
+    pub turn_timeout: Option<Duration>,
+    /// M4: per-response completion-token cap (`max_tokens` on the request). `None`
+    /// (default) uses the provider's default. Bounds the length of each reply.
+    pub max_tokens: Option<u32>,
+    /// Sampling temperature. `None` (default) uses the provider's default; `0`
+    /// for reproducible runs.
+    pub temperature: Option<f32>,
+    /// M7: opt-in kernel sandbox policy for `Bash` (§7.6). `None` (default) =
+    /// no confinement.
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 impl AgentLoop {
@@ -57,7 +73,7 @@ impl AgentLoop {
         tools: Arc<ToolRegistry>,
         permission: Arc<dyn PermissionChecker>,
     ) -> Self {
-        Self { model, tools, permission, max_iters: MAX_ITERS, assembler: None }
+        Self { model, tools, permission, max_iters: MAX_ITERS, assembler: None, idle_timeout: None, turn_timeout: None, max_tokens: None, temperature: None, sandbox: None }
     }
 
     /// Supply a §4.6 context assembler (from `rc-ctx`). When set, the loop
@@ -66,6 +82,49 @@ impl AgentLoop {
     #[must_use]
     pub fn with_assembler(mut self, assembler: Arc<dyn ContextAssembler>) -> Self {
         self.assembler = Some(assembler);
+        self
+    }
+
+    /// T2: max gap between stream chunks before the model stream aborts with
+    /// `ProtoError::Idle` (a stall). `None` (default) disables the idle bound;
+    /// the stream is then bounded only by the total request timeout. Builder.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle: Option<Duration>) -> Self {
+        self.idle_timeout = idle;
+        self
+    }
+
+    /// T3: wall-clock budget for a turn. Checked at the top of each loop
+    /// iteration; on expiry the turn ends with `LoopOutcome::TimeUp`. `None`
+    /// (default) disables it. Builder.
+    #[must_use]
+    pub fn with_turn_timeout(mut self, turn: Option<Duration>) -> Self {
+        self.turn_timeout = turn;
+        self
+    }
+
+    /// M4: per-response completion-token cap. `None` uses the provider default.
+    /// Builder.
+    #[must_use]
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Sampling temperature (`None` = provider default). Builder.
+    #[must_use]
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    /// M7: opt-in kernel sandbox policy for `Bash` (§7.6). `None` (default)
+    /// disables confinement. When `Some`, every approved Bash command runs
+    /// under `rc-sandbox` (Landlock + seccomp on Linux; no-op elsewhere).
+    /// Builder.
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: Option<SandboxPolicy>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -79,12 +138,26 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> Result<LoopOutcome, LoopError> {
         session.messages.push(Turn::User { content: user_input, ts: SystemTime::now() });
+        let turn_start = SystemTime::now();
+
+        // M7: sync the session cwd from the live shell state (a `cd` from the
+        // previous turn persists here), and stamp the change journal with a new
+        // turn number so `/rewind` can attribute this turn's file changes.
+        if let Ok(shell) = session.shell_state.lock() {
+            session.cwd = shell.cwd.clone();
+        }
+        if let Ok(mut journal) = session.change_journal.lock() {
+            journal.advance_turn();
+        }
 
         let ctx = ToolCtx {
             cwd: session.cwd.clone(),
             allowed_roots: allowed_roots(session),
             cancel,
             read_registry: session.read_registry.clone(),
+            shell_state: session.shell_state.clone(),
+            change_journal: session.change_journal.clone(),
+            sandbox: self.sandbox,
         };
 
         let mut iters = 0;
@@ -92,6 +165,13 @@ impl AgentLoop {
             iters += 1;
             if iters > self.max_iters {
                 return Ok(LoopOutcome::ItersExceeded);
+            }
+            // T3: wall-clock turn budget. The check runs at the top, after the
+            // prior iteration's tool results were pushed, so the invariant holds.
+            if let Some(d) = self.turn_timeout {
+                if turn_start.elapsed().unwrap_or(Duration::ZERO) >= d {
+                    return Ok(LoopOutcome::TimeUp);
+                }
             }
             sink.on_iter(iters, self.max_iters);
 
@@ -109,12 +189,17 @@ impl AgentLoop {
                 messages,
                 tools: self.tools.definitions().to_vec(),
                 tool_choice: ToolChoiceValue::Auto,
-                opts: Default::default(),
+                opts: CompleteOpts {
+                    max_tokens: self.max_tokens,
+                    temperature: self.temperature,
+                    idle_timeout: self.idle_timeout,
+                },
             };
             let ModelResponse { text, reasoning, tool_calls, finish_reason, usage } =
                 self.model.complete(req, sink).await?;
             if let Some(u) = &usage {
                 sink.on_usage(u);
+                session.total_usage.add(u);
             }
 
             let mut assistant_calls = Vec::new();
@@ -139,16 +224,30 @@ impl AgentLoop {
                 }
             }
 
-            session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls, usage });
-
+            // §4.2 / project.rs:69: any early exit must still synthesize tool results
+            // for outstanding calls so the tool-answer invariant holds. On a non-
+            // `ToolCalls` finish (Stop / Length / ContentFilter / Other — e.g. a
+            // stream cut mid-tool-call) the tools are NOT executed; each outstanding
+            // call gets an `Interrupted` result. (The hot `ToolCalls` path moves
+            // `assistant_calls` into the turn; only the uncommon early paths clone.)
             match finish_reason {
-                FinishReason::Stop => return Ok(LoopOutcome::Stop),
+                FinishReason::ToolCalls => {
+                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls, usage });
+                }
+                FinishReason::Stop => {
+                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls.clone(), usage });
+                    synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
+                    return Ok(LoopOutcome::Stop);
+                }
                 FinishReason::Length => {
                     tracing::warn!("finish_reason=length; stopping (auto-continue is A13)");
+                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls.clone(), usage });
+                    synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Length);
                 }
-                FinishReason::ToolCalls => {}
                 FinishReason::ContentFilter | FinishReason::Other(_) => {
+                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls.clone(), usage });
+                    synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Stop);
                 }
             }
@@ -178,10 +277,43 @@ fn allowed_roots(session: &Session) -> Vec<std::path::PathBuf> {
     roots
 }
 
+/// §4.2 / `project.rs:69`: any early exit from a turn must still synthesize tool
+/// results for outstanding calls so the tool-answer invariant holds. Called on
+/// the non-`ToolCalls` finish paths (Stop / Length / ContentFilter / Other) —
+/// e.g. a stream cut mid-tool-call leaves an assistant `tool_calls` message with
+/// no answers, which `verify_invariant` would flag next turn (debug_assert panic
+/// / a malformed request to the provider). The tools are NOT executed; each
+/// outstanding call gets an `Interrupted` result and a terminal `on_tool_end`.
+fn synthesize_interrupted(
+    messages: &mut Vec<Turn>,
+    calls: &[ToolCall],
+    sink: &dyn EventSink,
+) {
+    for c in calls {
+        sink.on_tool_end(&c.id, &c.name, &ToolResultBody::Interrupted);
+        messages.push(Turn::ToolResult {
+            call_id: c.id.clone(),
+            tool: c.name.clone(),
+            result: ToolResultBody::Interrupted,
+            duration: Duration::ZERO,
+        });
+    }
+}
+
 enum ExecItem {
     Call(ToolCall),
     ParseError { call_id: String, tool_name: String, error: String },
 }
+
+/// A pending parallel tool task: its batch index, call id/name, and the
+/// `tokio::spawn` handle. Kept outside the task so a panicking tool can still
+/// be mapped back to a well-formed error result (see `execute_batch`).
+type ParallelTask = (
+    usize,
+    String,
+    String,
+    tokio::task::JoinHandle<(String, String, ToolResultBody, Duration)>,
+);
 
 /// Execute a batch of tool calls per the concurrency policy (§4.3), after a
 /// per-call permission check (§7). Denied/Ask-denied calls become denied tool
@@ -195,6 +327,16 @@ async fn execute_batch(
     prompter: &dyn Prompter,
     grants: &mut Vec<String>,
 ) -> Vec<(String, String, ToolResultBody, Duration)> {
+    // M7: refresh cwd from the live shell state so tools (and the permission
+    // check) see any `cd` from a prior Bash call this turn. Bash is Exclusive
+    // (serialized), so there's no concurrent-cd race; the lock is uncontended.
+    let ctx = {
+        let mut c = ctx.clone();
+        if let Ok(shell) = c.shell_state.lock() {
+            c.cwd = shell.cwd.clone();
+        }
+        c
+    };
     let mut results: HashMap<usize, (String, String, ToolResultBody, Duration)> = HashMap::new();
     let mut order: Vec<usize> = Vec::new();
     let mut parallel: Vec<(usize, Arc<dyn Tool>, ToolCall)> = Vec::new();
@@ -288,20 +430,45 @@ async fn execute_batch(
         }
     }
 
-    // Parallel: bounded by a semaphore (§4.3).
+    // Parallel: bounded by a semaphore (§4.3). Each call runs on its own
+    // `tokio::spawn`'d task so a panicking tool (a tool-implementation bug) is
+    // isolated by the runtime: `handle.await` yields `Err(JoinError)` instead of
+    // propagating the panic and crashing the agent loop. The call id/name are
+    // kept alongside the handle (outside the task) so the panicked call still
+    // gets a well-formed error result — keeping the tool-answer invariant true
+    // and the `expect("a result for every batch item")` below sound. (JoinSet
+    // was used before, but its `join_next` yields a bare `JoinError` with no
+    // index, so a panic couldn't be mapped back to its batch slot.)
     let sem = Arc::new(Semaphore::new(PARALLEL_BOUND));
-    let mut set: JoinSet<(usize, (String, String, ToolResultBody, Duration))> = JoinSet::new();
+    let mut handles: Vec<ParallelTask> = Vec::new();
     for (i, tool, call) in parallel {
         let permit = sem.clone().acquire_owned().await.unwrap();
         let ctx = ctx.clone();
-        set.spawn(async move {
+        let call_id = call.id.clone();
+        let tool_name = call.name.clone();
+        let handle = tokio::spawn(async move {
             let r = run_one(tool, call, ctx).await;
             drop(permit);
-            (i, r)
+            r
         });
+        handles.push((i, call_id, tool_name, handle));
     }
-    while let Some(res) = set.join_next().await {
-        let (i, r) = res.unwrap();
+    for (i, call_id, tool_name, handle) in handles {
+        let r = match handle.await {
+            Ok(r) => r,
+            Err(join_err) => {
+                tracing::error!("parallel tool `{tool_name}` panicked: {join_err}");
+                (
+                    call_id,
+                    tool_name,
+                    ToolResultBody::Error {
+                        message: format!("tool panicked: {join_err}"),
+                        retryable: false,
+                    },
+                    Duration::ZERO,
+                )
+            }
+        };
         results.insert(i, r);
     }
     for (i, tool, call) in serial {

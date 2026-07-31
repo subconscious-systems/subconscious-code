@@ -164,6 +164,7 @@ pub fn dangerous_command(cmd: &str) -> Option<&'static str> {
 #[cfg(test)]
 pub(crate) fn test_ctx(dir: &Path) -> ToolCtx {
     use rc_core::state::ReadRegistry;
+    use rc_core::{ShellState, ChangeJournal};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
     ToolCtx {
@@ -171,5 +172,8 @@ pub(crate) fn test_ctx(dir: &Path) -> ToolCtx {
         allowed_roots: vec![dir.to_path_buf()],
         cancel: CancellationToken::new(),
         read_registry: Arc::new(Mutex::new(ReadRegistry::new())),
+        shell_state: Arc::new(Mutex::new(ShellState::new(dir.to_path_buf()))),
+        change_journal: Arc::new(Mutex::new(ChangeJournal::new())),
+        sandbox: None,
     }
 }

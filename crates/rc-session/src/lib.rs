@@ -21,6 +21,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+pub mod rewind;
+
 use anyhow::{Context, Result};
 use rc_core::{AgentMode, Session, Turn};
 use serde::{Deserialize, Serialize};

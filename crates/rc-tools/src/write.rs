@@ -73,10 +73,16 @@ use `Write` only for new files or complete rewrites."
         let old = std::fs::read_to_string(&canon).ok();
         let content = preserve_line_endings(old.as_deref(), &inp.content);
 
+        // M7: snapshot the prior contents for `/rewind` before mutating.
+        let prior = std::fs::read(&canon).ok();
+
         match atomic_write(&canon, &content) {
             Ok(()) => {
                 // A write counts as having "read" the file for a follow-up Edit.
                 record_read(ctx, &canon);
+                if let Ok(mut journal) = ctx.change_journal.lock() {
+                    journal.record(canon.clone(), prior);
+                }
                 Ok(ToolOutcome::ok(format!(
                     "wrote {} ({} bytes)",
                     canon.display(),

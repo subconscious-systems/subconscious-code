@@ -50,6 +50,7 @@ fn slash_palette() -> &'static [(&'static str, &'static str)] {
         ("/clear", "Clear the transcript and start a fresh turn"),
         ("/help", "Show composer keybindings and slash commands"),
         ("/mode", "Show or cycle the permission mode"),
+        ("/rewind", "Restore files changed in the last turn (Write/Edit only)"),
     ]
 }
 

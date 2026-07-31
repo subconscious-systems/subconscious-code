@@ -122,6 +122,10 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
         };
         let new_content = preserve_line_endings(Some(&old_content), &new_content);
 
+        // M7: snapshot the prior contents for `/rewind` before mutating. Edit
+        // always targets an existing file, so prior is `Some`.
+        let prior = Some(old_content.clone().into_bytes());
+
         if let Err(e) = atomic_write(&canon, &new_content) {
             return Ok(ToolOutcome::Error {
                 message: format!("write failed: {e}"),
@@ -129,6 +133,9 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
             });
         }
         record_read(ctx, &canon);
+        if let Ok(mut journal) = ctx.change_journal.lock() {
+            journal.record(canon.clone(), prior);
+        }
 
         Ok(ToolOutcome::ok(snippet_around(&new_content, &inp.new_string, 5)))
     }

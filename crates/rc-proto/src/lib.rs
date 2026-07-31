@@ -18,7 +18,7 @@ pub mod error;
 pub mod stream;
 pub mod wire;
 
-pub use client::{ChatClient, CompleteOpts};
+pub use client::{ChatClient, CompleteOpts, RetryOpts};
 pub use error::ProtoError;
 pub use stream::{
     repair_json, AgentStreamEvent, FinalizedToolCall, FinishReason, SseDecoder, StreamFuser,

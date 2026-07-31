@@ -43,4 +43,7 @@ pub enum AgentEvent {
     Ready,
     /// A turn finished (driver) — the runtime is ready for the next submit.
     Idle,
+    /// A host-side notice from the driver (e.g. `/rewind` outcome). Rendered as
+    /// a system line, never injected into the model's prompt.
+    Notice(String),
 }

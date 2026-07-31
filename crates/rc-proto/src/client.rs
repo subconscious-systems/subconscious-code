@@ -25,6 +25,30 @@ use tokio_stream::Stream;
 pub struct CompleteOpts {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// T2: abort the stream if no chunk arrives within this duration (a stall),
+    /// failing fast instead of waiting for the total request timeout. `None`
+    /// (default) disables the idle bound. Consumed by `rc_core::ChatModel`; not a
+    /// wire field.
+    pub idle_timeout: Option<std::time::Duration>,
+}
+
+/// Retry policy for transient HTTP errors (429 / 5xx). `max_retries = 0` (the
+/// default) disables retry — a request fails on the first transient error.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryOpts {
+    pub max_retries: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for RetryOpts {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            base_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(10),
+        }
+    }
 }
 
 /// An OpenAI-compatible `/v1/chat/completions` client.
@@ -37,24 +61,115 @@ pub struct ChatClient {
     base_url: String,
     api_key: String,
     model: String,
+    retry: RetryOpts,
 }
 
 impl ChatClient {
     /// `api_key` empty → `NoApiKey` immediately, so the caller surfaces a clear
-    /// error before any network attempt.
-    pub fn new(base_url: String, api_key: String, model: String) -> Result<Self, ProtoError> {
+    /// error before any network attempt. `timeout` bounds the *total* request
+    /// (connect → end of body); on the streaming path it caps the whole stream,
+    /// so a small value can cut a stream mid-tool-call (the loop synthesizes
+    /// `Interrupted` results for any outstanding call — see `rc_core::agent`).
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        model: String,
+        timeout: Duration,
+    ) -> Result<Self, ProtoError> {
         if api_key.is_empty() {
             return Err(ProtoError::NoApiKey);
         }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let http = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            retry: RetryOpts::default(),
         })
+    }
+
+    /// Set the retry policy for transient HTTP errors (429/5xx). Default is no
+    /// retry. The body is canonical and stable, so retrying is safe; a streaming
+    /// request is retried only before the body starts flowing — a mid-stream
+    /// error is not retried (no resume). Builder.
+    #[must_use]
+    pub fn with_retry(mut self, retry: RetryOpts) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// POST `body` to `url`, retrying on a transient error up to
+    /// `retry.max_retries` times with exponential backoff. A transient error is
+    /// a status of 429/5xx, or a *connection* error (DNS/TCP-refused/TLS) that
+    /// isn't a timeout. Timeouts are NOT retried — a retry would multiply
+    /// worst-case latency (`max_retries × total timeout`) for a merely-slow
+    /// server. Returns the 2xx `Response`; a non-transient error (or an
+    /// exhausted retry budget) returns the final error.
+    async fn send_with_retry(&self, url: &str, body: &str) -> Result<reqwest::Response, ProtoError> {
+        let mut attempt = 0u32;
+        loop {
+            let resp = match self
+                .http
+                .post(url)
+                .bearer_auth(self.api_key.clone())
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if Self::is_transient_transport(&e) && attempt < self.retry.max_retries {
+                        let d = self.backoff(attempt);
+                        tracing::warn!(error = %e, attempt, "transient transport error; retrying in {d:?}");
+                        tokio::time::sleep(d).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(ProtoError::Http(e));
+                }
+            };
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp);
+            }
+            let transient = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
+            if transient && attempt < self.retry.max_retries {
+                // Honor `Retry-After` (seconds) if the server sent one, capped at
+                // max_delay; else exponential backoff.
+                let d = self.retry_after(&resp).unwrap_or_else(|| self.backoff(attempt));
+                tracing::warn!(status = status.as_u16(), attempt, "transient HTTP error; retrying in {d:?}");
+                tokio::time::sleep(d).await;
+                attempt += 1;
+                continue;
+            }
+            let text = resp.text().await.unwrap_or_default();
+            tracing::debug!("← {status}\n{text}");
+            return Err(ProtoError::Status { status: status.as_u16(), body: text });
+        }
+    }
+
+    /// Exponential backoff: `base * 2^attempt`, capped at `max_delay`. No jitter
+    /// (a refinement); deterministic backoff is enough to spread load.
+    fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 1u64 << attempt.min(20);
+        self.retry.base_delay.saturating_mul(factor as u32).min(self.retry.max_delay)
+    }
+
+    /// A transport error worth retrying: a *connection* failure (DNS, TCP
+    /// refused, TLS handshake) that isn't a timeout. Timeouts are excluded so a
+    /// slow server can't multiply latency across retries.
+    fn is_transient_transport(e: &reqwest::Error) -> bool {
+        e.is_connect() && !e.is_timeout()
+    }
+
+    /// Parse the `Retry-After` header (integer seconds) if present, capped at
+    /// `max_delay` so a misconfigured/hostile value can't stall the turn. The
+    /// HTTP-date form and unparseable values return `None` (fall back to backoff).
+    fn retry_after(&self, resp: &reqwest::Response) -> Option<Duration> {
+        let secs: u64 = resp.headers().get("retry-after")?.to_str().ok()?.parse().ok()?;
+        Some(Duration::from_secs(secs).min(self.retry.max_delay))
     }
 
     /// One non-streaming round trip. Returns the parsed response.
@@ -76,20 +191,14 @@ impl ChatClient {
         };
         let body = canonical::to_string(&req)?;
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(self.api_key.clone())
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await?;
+        // The body is canonical JSON (no key — the key is in the Authorization
+        // header, which we never log). --debug output contains full conversation
+        // content; share with care.
+        tracing::debug!("→ POST {url}\n{body}");
+        let resp = self.send_with_retry(&url, &body).await?;
         let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProtoError::Status { status: status.as_u16(), body: text });
-        }
         let parsed: ChatCompletionResponse = resp.json().await?;
+        tracing::debug!("← {status} choices={} usage={:?}", parsed.choices.len(), parsed.usage);
         if parsed.choices.is_empty() {
             return Err(ProtoError::EmptyChoices);
         }
@@ -121,19 +230,10 @@ impl ChatClient {
         };
         let body = canonical::to_string(&req)?;
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(self.api_key.clone())
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await?;
+        tracing::debug!("→ POST {url} (stream)\n{body}");
+        let resp = self.send_with_retry(&url, &body).await?;
         let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProtoError::Status { status: status.as_u16(), body: text });
-        }
+        tracing::debug!("← {status} streaming");
         let body: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
             Box::pin(resp.bytes_stream());
         Ok(Box::pin(EventStream::new(body)))
@@ -220,5 +320,80 @@ impl Stream for EventStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A closed port (bind + drop the listener) → connection refused → a
+    /// retryable transport error (is_connect, not a timeout).
+    async fn closed_port_err() -> reqwest::Error {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        reqwest::Client::new()
+            .post(format!("http://{addr}"))
+            .send()
+            .await
+            .expect_err("port is closed")
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_transient_transport() {
+        let err = closed_port_err().await;
+        assert!(err.is_connect(), "connection refused is a connect error: {err}");
+        assert!(!err.is_timeout(), "connection refused is not a timeout: {err}");
+        assert!(ChatClient::is_transient_transport(&err), "should retry: {err}");
+    }
+
+    #[tokio::test]
+    async fn timeout_is_not_transient_transport() {
+        // A server that never responds within the 80 ms client timeout → a
+        // timeout error → NOT retried (would multiply latency for a slow server).
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().timeout(Duration::from_millis(80)).build().unwrap();
+        let err = client
+            .post(format!("{}/chat/completions", server.uri()))
+            .send()
+            .await
+            .expect_err("should time out");
+        assert!(err.is_timeout(), "should be a timeout: {err}");
+        assert!(!ChatClient::is_transient_transport(&err), "timeout must not retry: {err}");
+    }
+
+    #[tokio::test]
+    async fn retries_on_connection_refused_then_gives_up() {
+        // A closed port with max_retries=2 → 3 attempts (all connection refused),
+        // backing off between them. Connection refused is instant, so the backoff
+        // is the only time spent — elapsed ≈ sum of backoffs, proving the
+        // transport path actually retried (no-retry would be ~0 ms).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = ChatClient::new(format!("http://{addr}"), "k".into(), "m".into(), Duration::from_secs(60))
+            .unwrap()
+            .with_retry(RetryOpts {
+                max_retries: 2,
+                base_delay: Duration::from_millis(40),
+                max_delay: Duration::from_millis(200),
+            });
+        let start = std::time::Instant::now();
+        let err = client
+            .complete(&[WireMessage::User { content: "hi".into() }], &CompleteOpts::default())
+            .await
+            .expect_err("closed port should fail");
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("transport"), "expected an Http error: {err}");
+        // 2 backoffs: 40 ms + 80 ms = 120 ms. No-retry would be ~0 ms.
+        assert!(elapsed >= Duration::from_millis(80), "should have backed off (retried), took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "should give up fast, took {elapsed:?}");
     }
 }

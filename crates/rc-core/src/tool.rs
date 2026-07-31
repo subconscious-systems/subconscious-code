@@ -1,6 +1,6 @@
 //! The `Tool` trait, concurrency classes, outcomes, and per-call context (§6).
 
-use crate::state::SharedReadRegistry;
+use crate::state::{SharedChangeJournal, SharedReadRegistry, SharedShellState};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -61,6 +61,19 @@ pub enum ToolError {
     Other(String),
 }
 
+/// M7: opt-in kernel confinement for the `Bash` tool (§7.6). When `Some`,
+/// `Bash` runs each approved command under the `rc-sandbox` policy built from
+/// `ToolCtx::allowed_roots` + `allow_net`. `None` (default) = no confinement;
+/// `cargo`/`npm`/`git` keep working. Linux applies Landlock+seccomp; other
+/// platforms no-op (see `rc-sandbox`). The policy is a plain struct here so
+/// `rc-core` need not depend on `rc-sandbox` — the Bash tool builds the real
+/// `rc_sandbox::Sandbox` from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    /// Allow network syscalls. `false` (default) denies them.
+    pub allow_net: bool,
+}
+
 /// Per-call context. Cheap to clone (the registry + cancel token are `Arc`s);
 /// the loop clones it into each concurrently-spawned tool (§4.3).
 #[derive(Debug, Clone)]
@@ -69,6 +82,14 @@ pub struct ToolCtx {
     pub allowed_roots: Vec<PathBuf>,
     pub cancel: CancellationToken,
     pub read_registry: SharedReadRegistry,
+    /// M7: the live shell state (persisted `cd`, background shells). Bash reads
+    /// and updates `cwd` here; the agent loop syncs `Session::cwd` from it.
+    pub shell_state: SharedShellState,
+    /// M7: the `/rewind` change journal. `Write`/`Edit` snapshot prior contents
+    /// here before mutating; `/rewind n` restores the last n turns.
+    pub change_journal: SharedChangeJournal,
+    /// M7: opt-in kernel sandbox policy for `Bash`. `None` = no confinement.
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 /// The tool trait (§6). Schemas are generated once and the registry caches the

@@ -49,6 +49,9 @@ pub(crate) async fn pump_task(
             UserAction::PermissionAnswer { id, response } => {
                 pending.resolve(id, response);
             }
+            UserAction::Rewind { steps } => {
+                let _ = driver_tx.send(DriverCmd::Rewind { steps });
+            }
             UserAction::Quit => {
                 if let Some(token) = current_cancel.take() {
                     token.cancel();

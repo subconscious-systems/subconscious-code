@@ -109,13 +109,17 @@ fn draw_transcript(frame: &mut Frame, state: &ViewState, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect) {
-    let tokens = state.last_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+    let usage = state.last_usage.as_ref();
+    let tokens = usage.map(|u| u.total_tokens).unwrap_or(0);
+    let cached = usage.and_then(|u| u.cached_tokens()).unwrap_or(0);
+    let cached_str = if cached > 0 { format!(" ({} cached)", cached) } else { String::new() };
     let activity = if state.busy { "working" } else { "idle" };
     let line = format!(
-        " {} | {} | tokens: {} | {}",
+        " {} | {} | tokens: {}{} | {}",
         state.model_name,
         mode_name(state.mode),
         tokens,
+        cached_str,
         activity,
     );
     frame.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), area);

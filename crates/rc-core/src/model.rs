@@ -8,9 +8,13 @@
 use crate::turn::{ToolCall, ToolResultBody};
 use async_trait::async_trait;
 use rc_proto::stream::AgentStreamEvent;
-use rc_proto::{ChatClient, CompleteOpts, FinishReason, ToolChoiceValue, ToolDefinition, Usage, WireMessage};
-use tokio_stream::StreamExt;
-
+use rc_proto::{
+    ChatClient, CompleteOpts, FinishReason, ProtoError, ToolChoiceValue, ToolDefinition, Usage,
+    WireMessage,
+};
+use std::pin::Pin;
+use std::time::Duration;
+use tokio_stream::{Stream, StreamExt};
 
 /// What the loop sends to a model.
 #[derive(Debug, Clone)]
@@ -99,57 +103,92 @@ impl ChatModel {
 #[async_trait]
 impl Model for ChatModel {
     async fn complete(&self, req: ModelRequest, sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
-        let mut stream = self.client.stream(&req.messages, &req.opts, &req.tools).await?;
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls = Vec::new();
-        let mut finish_reason = FinishReason::Stop;
-        let mut usage = None;
-
-        while let Some(ev) = stream.next().await {
-            match ev? {
-                AgentStreamEvent::Text(t) => {
-                    sink.on_text(&t);
-                    text.push_str(&t);
-                }
-                AgentStreamEvent::Reasoning(r) => {
-                    sink.on_reasoning(&r);
-                    reasoning.push_str(&r);
-                }
-                AgentStreamEvent::ToolCallReady { id, name, arguments } => {
-                    let call = ToolCall { id, name, arguments };
-                    sink.on_tool_start(&call);
-                    tool_calls.push(FinalizedToolCall::Call(call));
-                }
-                AgentStreamEvent::ToolCallFailed { id, name, raw_arguments, error, .. } => {
-                    tool_calls.push(FinalizedToolCall::ParseError {
-                        id,
-                        name,
-                        raw: raw_arguments,
-                        error,
-                    });
-                }
-                AgentStreamEvent::Finish { reason } => {
-                    sink.on_finish(&reason);
-                    finish_reason = reason;
-                }
-                AgentStreamEvent::Usage(u) => usage = Some(u),
-            }
-        }
-
-        // Tag-mode reasoning (§3.4): split `<think>…</think>` out of text. No-op
-        // when absent, so it's safe to always run.
-        let field_reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
-        let (text, tag_reasoning) = strip_reasoning_tag(&text, self.reasoning_tag.as_deref());
-        let reasoning = match (field_reasoning, tag_reasoning) {
-            (Some(r), Some(t)) => Some(format!("{r}\n{t}")),
-            (Some(r), None) => Some(r),
-            (None, Some(t)) => Some(t),
-            (None, None) => None,
-        };
-
-        Ok(ModelResponse { text, reasoning, tool_calls, finish_reason, usage })
+        let stream = self.client.stream(&req.messages, &req.opts, &req.tools).await?;
+        consume_stream(stream, req.opts.idle_timeout, self.reasoning_tag.as_deref(), sink).await
     }
+}
+
+/// Drive an [`AgentStreamEvent`] stream to completion: forward deltas to `sink`,
+/// accumulate the assistant turn, split tag-mode reasoning, and bound the gap
+/// between chunks by `idle` (T2). A stall — no chunk for `idle` — aborts with
+/// [`ProtoError::Idle`] so the loop fails fast instead of hanging until the
+/// total request timeout. Extracted from [`ChatModel::complete`] so the idle
+/// logic is unit-testable with synthetic streams (no network).
+async fn consume_stream(
+    mut stream: Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>>,
+    idle: Option<Duration>,
+    reasoning_tag: Option<&str>,
+    sink: &dyn EventSink,
+) -> Result<ModelResponse, ModelError> {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut finish_reason = FinishReason::Stop;
+    let mut usage = None;
+
+    loop {
+        // T2: bound the gap between chunks. `None` preserves the legacy
+        // behavior (wait on the stream indefinitely, bounded only by the total
+        // request timeout).
+        let next = match idle {
+            Some(d) => match tokio::time::timeout(d, stream.next()).await {
+                Ok(inner) => inner,
+                Err(_) => return Err(ModelError::Proto(ProtoError::Idle(d))),
+            },
+            None => stream.next().await,
+        };
+        let Some(ev) = next else { break; };
+        match ev? {
+            AgentStreamEvent::Text(t) => {
+                sink.on_text(&t);
+                text.push_str(&t);
+            }
+            AgentStreamEvent::Reasoning(r) => {
+                sink.on_reasoning(&r);
+                reasoning.push_str(&r);
+            }
+            AgentStreamEvent::ToolCallReady { id, name, arguments } => {
+                let call = ToolCall { id, name, arguments };
+                sink.on_tool_start(&call);
+                tool_calls.push(FinalizedToolCall::Call(call));
+            }
+            AgentStreamEvent::ToolCallFailed { id, name, raw_arguments, error, .. } => {
+                tool_calls.push(FinalizedToolCall::ParseError {
+                    id,
+                    name,
+                    raw: raw_arguments,
+                    error,
+                });
+            }
+            AgentStreamEvent::Finish { reason } => {
+                sink.on_finish(&reason);
+                finish_reason = reason;
+            }
+            AgentStreamEvent::Usage(u) => usage = Some(u),
+        }
+    }
+
+    // Tag-mode reasoning (§3.4): split `<think>…</think>` out of text. No-op
+    // when absent, so it's safe to always run.
+    let field_reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
+    let (text, tag_reasoning) = strip_reasoning_tag(&text, reasoning_tag);
+    let reasoning = match (field_reasoning, tag_reasoning) {
+        (Some(r), Some(t)) => Some(format!("{r}\n{t}")),
+        (Some(r), None) => Some(r),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    };
+
+    tracing::debug!(
+        "← model finish={:?} text_bytes={} reasoning_bytes={} tool_calls={} usage={:?}",
+        finish_reason,
+        text.len(),
+        reasoning.as_ref().map_or(0, String::len),
+        tool_calls.len(),
+        usage,
+    );
+
+    Ok(ModelResponse { text, reasoning, tool_calls, finish_reason, usage })
 }
 
 /// Split `<tag>…</tag>` out of `text`, returning (clean_text, reasoning).
@@ -197,5 +236,56 @@ mod tests {
         let (clean, r) = strip_reasoning_tag("plain answer", Some("think"));
         assert_eq!(clean, "plain answer");
         assert!(r.is_none());
+    }
+
+    // ---- T2: idle timeout (consume_stream) -----------------------------------
+
+    use rc_proto::{FinishReason, ProtoError};
+    use std::time::{Duration, SystemTime};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    fn boxed(
+        evs: Vec<Result<AgentStreamEvent, ProtoError>>,
+    ) -> Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>> {
+        Box::pin(tokio_stream::iter(evs))
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_aborts_a_stalled_stream() {
+        // One chunk, then the channel stays open but empty → the second
+        // `stream.next()` never resolves, so the 50ms idle bound fires.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentStreamEvent, ProtoError>>(8);
+        let stream: Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>> =
+            Box::pin(ReceiverStream::new(rx));
+        tx.send(Ok(AgentStreamEvent::Text("first".into()))).await.unwrap();
+
+        let start = SystemTime::now();
+        let res = consume_stream(stream, Some(Duration::from_millis(50)), None, &NullSink).await;
+        let elapsed = start.elapsed().unwrap_or_default();
+        drop(tx); // held open through the await above
+        assert!(
+            matches!(res, Err(ModelError::Proto(ProtoError::Idle(_)))),
+            "stalled stream should hit Idle, got {res:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "should fail fast, took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_allows_a_normal_stream() {
+        let stream = boxed(vec![
+            Ok(AgentStreamEvent::Text("hi".into())),
+            Ok(AgentStreamEvent::Finish { reason: FinishReason::Stop }),
+        ]);
+        let res = consume_stream(stream, Some(Duration::from_millis(50)), None, &NullSink).await;
+        let resp = res.expect("normal stream completes");
+        assert_eq!(resp.text, "hi");
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn no_idle_bound_completes_a_normal_stream() {
+        let stream = boxed(vec![Ok(AgentStreamEvent::Text("ok".into()))]);
+        let res = consume_stream(stream, None, None, &NullSink).await;
+        assert_eq!(res.unwrap().text, "ok");
     }
 }

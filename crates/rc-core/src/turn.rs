@@ -3,7 +3,7 @@
 //! `Turn` is the internal representation; the wire form is a fresh projection
 //! per request ([`crate::project`]), never stored as state.
 
-use crate::state::{ReadRegistry, SharedReadRegistry};
+use crate::state::{ChangeJournal, ReadRegistry, SharedChangeJournal, SharedReadRegistry, SharedShellState, ShellState};
 use rc_proto::Usage;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -176,10 +176,21 @@ pub struct Session {
     /// Session-scoped permission grants ("Yes, and don't ask again for this"),
     /// added by the loop from [`crate::prompt::AskResponse::Session`].
     pub perm_grants: Vec<String>,
+    /// M7: live shell state — persisted `cd` across Bash calls + background shells.
+    /// `Session::cwd` is synced from `shell_state.cwd` at the top of each turn.
+    pub shell_state: SharedShellState,
+    /// M7: the `/rewind` change journal of pre-mutation file contents.
+    pub change_journal: SharedChangeJournal,
+    /// Cumulative token usage across all turns (metering, M3). Each turn's
+    /// prompt re-sends the prefix, so `total_tokens` is an upper bound;
+    /// `completion_tokens` is the true cumulative output.
+    pub total_usage: Usage,
 }
 
 impl Session {
     pub fn new(id: String, cwd: PathBuf, model: String) -> Self {
+        let shell_state = std::sync::Arc::new(std::sync::Mutex::new(ShellState::new(cwd.clone())));
+        let change_journal = std::sync::Arc::new(std::sync::Mutex::new(ChangeJournal::new()));
         Self {
             id,
             cwd,
@@ -189,6 +200,9 @@ impl Session {
             mode: AgentMode::Default,
             read_registry: Arc::new(std::sync::Mutex::new(ReadRegistry::new())),
             perm_grants: Vec::new(),
+            shell_state,
+            change_journal,
+            total_usage: Usage::default(),
         }
     }
 }

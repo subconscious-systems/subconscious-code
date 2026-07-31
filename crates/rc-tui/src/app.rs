@@ -121,6 +121,10 @@ impl App {
                 v.busy = false;
             }
             AgentEvent::ModeChanged(m) => v.mode = m,
+            AgentEvent::Notice(n) => {
+                v.flush_text();
+                v.transcript.push(Line::styled(format!("· {n}"), dim_style()));
+            }
             AgentEvent::Ready => v.busy = true,
             AgentEvent::Idle => {
                 v.busy = false;
@@ -204,7 +208,7 @@ impl App {
                         match action {
                             SlashAction::Help => {
                                 self.view.transcript.push(Line::from(
-                                    "commands: /clear  /help  /mode | @<path> completes files",
+                                    "commands: /clear  /help  /mode  /rewind | @<path> completes files",
                                 ));
                             }
                             SlashAction::Clear => {
@@ -219,6 +223,9 @@ impl App {
                                 let next = cycle_mode(self.view.mode);
                                 self.view.mode = next;
                                 self.runtime.action(UserAction::SetMode(next));
+                            }
+                            SlashAction::Rewind { steps } => {
+                                self.runtime.action(UserAction::Rewind { steps });
                             }
                         }
                     } else {
@@ -284,6 +291,15 @@ impl App {
             "/clear" => Some(SlashAction::Clear),
             "/help" => Some(SlashAction::Help),
             "/mode" => Some(SlashAction::CycleMode),
+            "/rewind" => Some(SlashAction::Rewind { steps: 1 }),
+            other if other.starts_with("/rewind ") => {
+                let n = other["/rewind ".len()..].trim().parse::<usize>().ok()?;
+                if n == 0 {
+                    None
+                } else {
+                    Some(SlashAction::Rewind { steps: n })
+                }
+            }
             _ => None,
         }
     }
@@ -294,6 +310,8 @@ enum SlashAction {
     Clear,
     Help,
     CycleMode,
+    /// `/rewind [n]` — restore the last `steps` turns of file changes.
+    Rewind { steps: usize },
 }
 
 /// Two completions are "the same menu" if they're the same kind and would show

@@ -38,5 +38,6 @@ pub use rc_perm::{
 };
 pub use registry::ToolRegistry;
 pub use state::ReadRegistry;
+pub use state::{BgShell, ChangeJournal, ChangeRecord, SharedChangeJournal, SharedShellState, ShellState};
 pub use tool::{Artifact, Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 pub use turn::{AgentMode, NoteKind, Session, ToolCall, ToolResultBody, Turn};

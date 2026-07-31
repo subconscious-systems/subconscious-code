@@ -199,4 +199,61 @@ impl Usage {
             .map(|d| d.cached_tokens)
             .filter(|c| *c > 0)
     }
+
+    /// Accumulate `other` into `self` (saturating). For a session running total:
+    /// each turn's prompt re-sends the prefix, so the summed `total_tokens` is an
+    /// upper bound, not the marginal cost; `completion_tokens` is the true
+    /// cumulative output, and `cached_tokens` sums cache-hit counts.
+    pub fn add(&mut self, other: &Usage) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(other.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        let cached = self
+            .cached_tokens()
+            .unwrap_or(0)
+            .saturating_add(other.cached_tokens().unwrap_or(0));
+        if cached > 0 {
+            self.prompt_tokens_details = Some(PromptTokensDetails { cached_tokens: cached });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_sums_fields_and_cached() {
+        let mut a = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 4 }),
+        };
+        let b = Usage {
+            prompt_tokens: 20,
+            completion_tokens: 3,
+            total_tokens: 23,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 6 }),
+        };
+        a.add(&b);
+        assert_eq!(a.prompt_tokens, 30);
+        assert_eq!(a.completion_tokens, 5);
+        assert_eq!(a.total_tokens, 35);
+        assert_eq!(a.cached_tokens(), Some(10), "cached summed");
+    }
+
+    #[test]
+    fn add_with_no_cached_leaves_details_none() {
+        let mut a = Usage::default();
+        let b = Usage {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            prompt_tokens_details: None,
+        };
+        a.add(&b);
+        assert_eq!(a.total_tokens, 6);
+        assert!(a.prompt_tokens_details.is_none(), "no cached -> details stay None");
+    }
 }

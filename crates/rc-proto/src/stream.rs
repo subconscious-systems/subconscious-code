@@ -197,27 +197,53 @@ impl ToolCallAccumulator {
     /// preserved byte-for-byte (cache, §4.6); malformed JSON is repaired, and
     /// on unrecoverable failure reported as a `ParseError` for the loop to feed
     /// back to the model (§3.3).
-    pub fn finish(self) -> Vec<FinalizedToolCall> {
+    ///
+    /// `confirmed` is whether the model signalled completion (`finish_reason ==
+    /// "tool_calls"`). When unconfirmed (a cut stream — no finish, `length`,
+    /// `content_filter`, …) repair-fabricated args are not trusted: the call is
+    /// reported as a `ParseError` carrying the *raw* bytes rather than `Ok` with
+    /// a repair-completed (possibly wrong) value (§3.3 / F1). Already-valid JSON
+    /// is kept either way — a dropped finish_reason chunk after a complete call
+    /// must not be a false negative.
+    pub fn finish_confirmed(self, confirmed: bool) -> Vec<FinalizedToolCall> {
         let mut out = Vec::with_capacity(self.slots.len());
         for (i, s) in self.slots.into_iter().enumerate() {
             let id = s.id.unwrap_or_else(|| format!("call_{}", i));
             let name = s.name.unwrap_or_default();
             let raw = if s.args.is_empty() { "{}".to_string() } else { s.args };
-            out.push(finalize_one(i, id, name, raw));
+            out.push(finalize_one(i, id, name, raw, confirmed));
         }
         out
     }
+
+    /// Finalize assuming the model completed the calls (the historical default).
+    /// Direct callers (tests) keep this; the [`StreamFuser`] knows the real
+    /// `finish_reason` and calls [`finish_confirmed`](Self::finish_confirmed).
+    pub fn finish(self) -> Vec<FinalizedToolCall> {
+        self.finish_confirmed(true)
+    }
 }
 
-fn finalize_one(index: usize, id: String, name: String, raw: String) -> FinalizedToolCall {
-    // Fast path: already valid → preserve the model's exact bytes.
+fn finalize_one(index: usize, id: String, name: String, raw: String, confirmed: bool) -> FinalizedToolCall {
+    // Fast path: already valid → preserve the model's exact bytes. Holds even
+    // when unconfirmed: a dropped finish_reason chunk after a complete call must
+    // not be a false negative.
     if serde_json::from_str::<serde_json::Value>(&raw).is_ok() {
         return FinalizedToolCall::Ok { id, name, arguments: raw };
     }
-    // Repair and retry.
+    // Repair and retry. Only trust the repaired bytes when the model signalled
+    // completion (`tool_calls`); otherwise the args were likely truncated by a
+    // cut stream — refuse to run on repair-fabricated values (§3.3 / F1).
     let repaired = repair(&raw);
     match serde_json::from_str::<serde_json::Value>(&repaired) {
-        Ok(_) => FinalizedToolCall::Ok { id, name, arguments: repaired },
+        Ok(_) if confirmed => FinalizedToolCall::Ok { id, name, arguments: repaired },
+        Ok(_) => FinalizedToolCall::ParseError {
+            index,
+            id: Some(id),
+            name: Some(name),
+            raw_arguments: raw,
+            error: "arguments incomplete (stream ended before tool_calls finish_reason)".to_string(),
+        },
         Err(e) => FinalizedToolCall::ParseError {
             index,
             id: Some(id),
@@ -377,6 +403,8 @@ impl SseDecoder {
             self.done = true;
             return vec![];
         }
+        // Deep-debug only (RUST_LOG=rc_proto=trace): the raw SSE data payload.
+        tracing::trace!("data: {rest_str}");
         vec![serde_json::from_str::<ChatCompletionChunk>(rest_str).map_err(ProtoError::Json)]
     }
 }
@@ -440,7 +468,11 @@ impl StreamFuser {
         self.finished = true;
         // Move the accumulator out without re-borrowing it across the iterator.
         let acc = std::mem::take(&mut self.acc);
-        for fc in acc.finish() {
+        // Only `tool_calls` means the model deliberately completed the calls;
+        // anything else (None / length / content_filter / unknown) may be a cut
+        // stream — don't trust repair-fabricated args (§3.3 / F1).
+        let confirmed = reason == Some("tool_calls");
+        for fc in acc.finish_confirmed(confirmed) {
             match fc {
                 FinalizedToolCall::Ok { id, name, arguments } => {
                     out.push(AgentStreamEvent::ToolCallReady { id, name, arguments })
@@ -654,5 +686,122 @@ mod tests {
             }
         }
         assert_eq!(text, "hello");
+    }
+
+    // ---- completion-gated finalize (§3.3 / F1) ---------------------------------
+
+    /// Helper: build a one-call chunk with the given (possibly malformed) args.
+    /// Constructed directly (not via JSON interpolation) so `args` may contain
+    /// raw quotes / braces without breaking the envelope.
+    fn call_chunk(id: &str, name: &str, args: &str) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: String::new(),
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some(id.to_string()),
+                        function: Some(FunctionDelta {
+                            name: Some(name.to_string()),
+                            arguments: Some(args.to_string()),
+                        }),
+                    }],
+                    ..Delta::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+    fn finish_chunk(reason: &str) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: String::new(),
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: Some(reason.to_string()),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn truncated_args_without_finish_reason_become_parse_error() {
+        // A cut stream: args truncated (unterminated string), NO finish_reason.
+        // repair() would fabricate `{"file":"/tmp/fo"}` (valid, wrong) — refuse it.
+        let mut f = StreamFuser::new();
+        for _ in f.apply(call_chunk("c1", "Read", r#"{"file":"/tmp/fo"#)) {}
+        let evs = f.finish(); // no finish_reason → Other("stream-ended")
+        assert!(
+            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallFailed { id, .. } if id.as_deref() == Some("c1"))),
+            "truncated + no finish → ToolCallFailed, got {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { .. })),
+            "must not surface repair-fabricated args as ready, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn valid_args_survive_stream_end_without_finish_reason() {
+        // Complete, valid args + no finish_reason → fast path → ToolCallReady.
+        // A dropped finish_reason chunk after a complete call is not a false neg.
+        let mut f = StreamFuser::new();
+        for _ in f.apply(call_chunk("c1", "Read", r#"{"file":"/tmp/foo"}"#)) {}
+        let evs = f.finish();
+        assert!(
+            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
+            "valid args + no finish → ToolCallReady, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn length_finish_with_invalid_args_becomes_parse_error() {
+        let mut f = StreamFuser::new();
+        let mut evs = Vec::new();
+        evs.extend(f.apply(call_chunk("c1", "Read", r#"{"file":"/tmp/fo"#)));
+        evs.extend(f.apply(finish_chunk("length"))); // flush fires here
+        evs.extend(f.finish()); // no-op (already flushed)
+        assert!(
+            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallFailed { id, .. } if id.as_deref() == Some("c1"))),
+            "length + truncated → ToolCallFailed, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn tool_calls_finish_with_malformed_args_still_repaired() {
+        // `tool_calls` means the model completed the call; malformed-but-complete
+        // args (trailing comma) are repaired. Current behavior preserved.
+        let mut f = StreamFuser::new();
+        let mut evs = Vec::new();
+        evs.extend(f.apply(call_chunk("c1", "Read", r#"{"file":"x",}"#)));
+        evs.extend(f.apply(finish_chunk("tool_calls")));
+        evs.extend(f.finish());
+        assert!(
+            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
+            "tool_calls + malformed-but-complete → ToolCallReady (repaired), got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn structurally_valid_truncation_on_tool_calls_is_not_caught() {
+        // KNOWN RESIDUAL (pinned, not fixed): a cut landing at a JSON boundary
+        // yields parseable JSON — a truncated form of the intended args. The
+        // fast path passes regardless of `confirmed`, so on the `tool_calls` path
+        // (where tools execute) this is NOT caught. Distrusting all fast-path
+        // output would break the §3.3 repair use-case, so it is left as a known
+        // limit for a future length/max_tokens-aware fix.
+        let mut f = StreamFuser::new();
+        let mut evs = Vec::new();
+        evs.extend(f.apply(call_chunk("c1", "Bash", r#"{"command":"rm -rf /tmp/old"}"#)));
+        evs.extend(f.apply(finish_chunk("tool_calls")));
+        evs.extend(f.finish());
+        assert!(
+            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
+            "structurally-valid truncation is NOT caught (residual): {evs:?}"
+        );
     }
 }

@@ -3,7 +3,7 @@
 //! `UserAction`s directly — the pump translates those into `DriverCmd`s and
 //! owns the per-turn cancel token.
 
-use rc_core::{AgentLoop, AgentMode, EventSink, Session};
+use rc_core::{AgentLoop, AgentMode, EventSink, NoteKind, Session, Turn};
 use rc_session::SessionStore;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -19,6 +19,8 @@ pub(crate) enum DriverCmd {
     /// Update `session.mode` for rendering/persistence (enforcement already
     /// changed via `permission.set_mode` in the pump).
     SetMode(AgentMode),
+    /// `/rewind` — restore the last `steps` turns of agent file changes.
+    Rewind { steps: usize },
 }
 
 pub(crate) async fn driver_task(
@@ -65,6 +67,44 @@ pub(crate) async fn driver_task(
             DriverCmd::SetMode(mode) => {
                 session.mode = mode;
             }
+            DriverCmd::Rewind { steps } => {
+                match rc_session::rewind::rewind_session(&mut session, steps) {
+                    Ok(report) => {
+                        let text = format!(
+                            "Rewound {} turn(s) of file changes; restored {} file(s).",
+                            report.turns,
+                            report.restored.len()
+                        );
+                        let _ = events.send(AgentEvent::Notice(text.clone()));
+                        // Mark the rewind in the transcript so a resumed session
+                        // and the model see it. The transcript is append-only,
+                        // so the rewound turns stay in history; files are restored.
+                        session.messages.push(Turn::SystemNote {
+                            kind: NoteKind::Notice,
+                            text,
+                        });
+                        if let Some(store) = store.as_mut() {
+                            if let Some(turn) = session.messages.last() {
+                                if let Err(e) = store.append_turn(turn) {
+                                    tracing::warn!("session persist (rewind note) failed: {e}");
+                                }
+                            }
+                            persisted = session.messages.len();
+                        }
+                    }
+                    Err(e) => {
+                        let _ = events.send(AgentEvent::Error(format!("rewind failed: {e}")));
+                    }
+                }
+                let _ = events.send(AgentEvent::Idle);
+            }
         }
+    }
+
+    // The driver loop has exited (the runtime is shutting down). Kill any
+    // background shells so they don't outlive `rc` — std `Child` won't kill on
+    // drop, so this must be explicit.
+    if let Ok(mut s) = session.shell_state.lock() {
+        s.shutdown();
     }
 }

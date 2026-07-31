@@ -18,12 +18,13 @@ use rc_core::{
     PermissionEngine, Prompter,
 };
 use rc_ctx::{ContextAssembler as CtxAssembler, Environment};
-use rc_proto::ChatClient;
+use rc_proto::{ChatClient, RetryOpts};
 use rc_tools::{Bash, Edit, Glob, Grep, Read, Write};
 use std::io::{IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +67,25 @@ struct Cli {
     /// Resume a specific session file (an absolute path to a `*.jsonl`).
     #[arg(long, value_name = "PATH")]
     resume: Option<PathBuf>,
+
+    /// Per-response completion-token cap (overrides RC_MAX_TOKENS; 0 = provider default).
+    #[arg(long, value_name = "N")]
+    max_tokens: Option<u32>,
+
+    /// Sampling temperature (overrides RC_TEMPERATURE; e.g. 0 for reproducible runs).
+    #[arg(long, value_name = "T")]
+    temperature: Option<f32>,
+
+    /// M7: confine every approved `Bash` command at the kernel level (Linux:
+    /// Landlock + seccomp). Denies writes outside the workspace roots and
+    /// network. Off by default; also settable via RC_SANDBOX=1.
+    #[arg(long)]
+    sandbox: bool,
+
+    /// M7: allow network under `--sandbox` (otherwise denied). Also via
+    /// RC_SANDBOX_NET=1. Implies --sandbox.
+    #[arg(long = "sandbox-net")]
+    sandbox_net: bool,
 }
 
 #[tokio::main]
@@ -101,11 +121,57 @@ async fn run(cli: Cli) -> Result<()> {
         .clone()
         .context("no API key: set $RC_API_KEY (or the var named by provider.api_key_env)")?;
 
-    let client = Arc::new(ChatClient::new(
-        settings.base_url.clone(),
-        api_key,
-        settings.model.clone(),
-    )?);
+    // T1: request timeout is configurable (was hardcoded 600s). Clamp 0 → default
+    // to avoid a Duration::ZERO footgun. This is a *total* timeout; on the
+    // streaming path it caps the whole stream, so a small value can cut a stream
+    // mid-tool-call (the loop synthesizes Interrupted results — §4.2).
+    let timeout = Duration::from_millis(if settings.timeout_ms == 0 {
+        600_000
+    } else {
+        settings.timeout_ms
+    });
+    // T2: idle bound on the model stream (0 = off). A stall (no chunk for this
+    // long) aborts with ProtoError::Idle instead of waiting out the total timeout.
+    let idle = if settings.idle_timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(settings.idle_timeout_ms))
+    };
+    let retry = RetryOpts {
+        max_retries: settings.max_retries,
+        base_delay: Duration::from_millis(settings.retry_base_ms),
+        max_delay: Duration::from_millis(settings.retry_max_ms),
+    };
+    // T3: wall-clock budget for a turn (0 = off). Checked at the top of each
+    // loop iteration; on expiry the turn ends with LoopOutcome::TimeUp.
+    let turn_timeout = if settings.turn_timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(settings.turn_timeout_ms))
+    };
+    let max_tokens = cli
+        .max_tokens
+        .or_else(|| (settings.max_tokens > 0).then_some(settings.max_tokens))
+        .filter(|&n| n > 0);
+    let temperature = cli.temperature.or(settings.temperature);
+    // M7: opt-in kernel sandbox for Bash (§7.6). CLI flags force-on; env
+    // (RC_SANDBOX / RC_SANDBOX_NET) and the settings file are the base layer.
+    let mut sandbox_enabled = settings.sandbox.enabled;
+    let mut sandbox_allow_net = settings.sandbox.allow_net;
+    if cli.sandbox_net {
+        sandbox_enabled = true;
+        sandbox_allow_net = true;
+    }
+    if cli.sandbox {
+        sandbox_enabled = true;
+    }
+    let sandbox = sandbox_enabled.then_some(rc_core::tool::SandboxPolicy {
+        allow_net: sandbox_allow_net,
+    });
+    let client = Arc::new(
+        ChatClient::new(settings.base_url.clone(), api_key, settings.model.clone(), timeout)?
+            .with_retry(retry),
+    );
     let model = Arc::new(ChatModel::new(client)) as Arc<dyn Model>;
     let tools = Arc::new(ToolRegistry::new(vec![
         Arc::new(Read::new()) as Arc<dyn Tool>,
@@ -170,13 +236,30 @@ async fn run(cli: Cli) -> Result<()> {
     };
     session.extra_dirs = extra_dirs;
 
+    // M7: a per-session directory for background-shell logs (`run_in_background`
+    // Bash), so `Read <log>` can find them. Background children are killed on
+    // shutdown via `ShellState::shutdown` when the driver exits.
+    {
+        let bg_dir = sessions_dir.join("..").join("bg").join(&session.id);
+        if let Ok(mut s) = session.shell_state.lock() {
+            s.bg_dir = Some(bg_dir);
+        }
+    }
+
+    let agent = AgentLoop::new(model, tools, permission)
+        .with_assembler(build_assembler(&session))
+        .with_idle_timeout(idle)
+        .with_turn_timeout(turn_timeout)
+        .with_max_tokens(max_tokens)
+        .with_temperature(temperature)
+        .with_sandbox(sandbox);
     match cli.print {
         // Headless one-shot: run one turn and print the answer (§5.8 U14).
         Some(prompt) if !prompt.is_empty() => {
-            run_headless(model, tools, permission, session, prompt).await
+            run_headless(agent, session, prompt).await
         }
         // Otherwise: launch the interactive TUI (M4) with persistence (M5).
-        _ => run_tui(model, tools, permission, session, settings.model, sessions_dir).await,
+        _ => run_tui(Arc::new(agent), session, settings.model, sessions_dir).await,
     }
 }
 
@@ -232,9 +315,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// closed). `--dangerously-skip-permissions` uses `BypassChecker`, which never
 /// asks, so the prompter is moot in bypass mode.
 async fn run_headless(
-    model: Arc<dyn Model>,
-    tools: Arc<ToolRegistry>,
-    permission: Arc<dyn PermissionChecker>,
+    agent: AgentLoop,
     mut session: Session,
     prompt: String,
 ) -> Result<()> {
@@ -243,7 +324,6 @@ async fn run_headless(
     } else {
         Box::new(NullPrompter)
     };
-    let agent = AgentLoop::new(model, tools, permission).with_assembler(build_assembler(&session));
     let outcome = agent
         .run(&mut session, prompt, &NullSink, &*prompter, CancellationToken::new())
         .await
@@ -259,16 +339,11 @@ async fn run_headless(
 /// A `SessionStore` is created (or, for a resumed session, re-opened) under
 /// `sessions_dir` so the conversation persists across restarts (§9, M5).
 async fn run_tui(
-    model: Arc<dyn Model>,
-    tools: Arc<ToolRegistry>,
-    permission: Arc<dyn PermissionChecker>,
+    agent: Arc<AgentLoop>,
     session: Session,
     model_name: String,
     sessions_dir: PathBuf,
 ) -> Result<()> {
-    let agent = Arc::new(
-        AgentLoop::new(model, tools, permission).with_assembler(build_assembler(&session)),
-    );
     let cwd = session.cwd.clone();
 
     // Persistence: a fresh session gets a new timestamped file; a resumed
@@ -300,21 +375,42 @@ fn print_result(session: &Session, outcome: LoopOutcome) {
     });
     match text {
         Some(text) => println!("{text}"),
-        None if outcome == LoopOutcome::ItersExceeded => {
-            eprintln!("warning: iteration budget reached before the model finished")
-        }
-        None => eprintln!("(the model produced no answer text)"),
+        None => match outcome {
+            LoopOutcome::ItersExceeded => {
+                eprintln!("warning: iteration budget reached before the model finished")
+            }
+            LoopOutcome::TimeUp => {
+                eprintln!("warning: turn timed out before the model finished")
+            }
+            _ => eprintln!("(the model produced no answer text)"),
+        },
+    }
+    // Metering (M3): cumulative session usage to stderr (stdout holds the answer
+    // for piping). total_tokens is an upper bound (each turn re-sends the
+    // prefix); completion_tokens is the true cumulative output.
+    let u = &session.total_usage;
+    if u.total_tokens > 0 {
+        eprintln!(
+            "tokens: {} total · {} completion · {} cached",
+            u.total_tokens,
+            u.completion_tokens,
+            u.cached_tokens().unwrap_or(0),
+        );
     }
 }
 
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
+    // `rc=debug` covers the `rc` bin and `rc::…`; the `rc_*` crates are separate
+    // top-level targets and need their own directives, so the --debug request/
+    // response logs (rc_proto::client, rc_core::model) AND the previously-silent
+    // rc_core::agent error/warn logs become visible. `RUST_LOG` still wins.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("rc=debug,rc_cli=debug,rc_proto=debug,rc_core=debug,rc_rt=debug")
+    });
     let _ = fmt::Subscriber::builder()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("rc=debug".parse().expect("valid directive")),
-        )
+        .with_env_filter(filter)
         .try_init();
 }
 

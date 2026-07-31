@@ -16,6 +16,10 @@ pub enum UserAction {
     SetMode(AgentMode),
     /// Answer a pending `AgentEvent::PermissionAsk`.
     PermissionAnswer { id: u64, response: AskResponse },
+    /// `/rewind [steps]` — restore the last `steps` turns of agent file changes
+    /// from the change journal (Write/Edit snapshots). Bash side-effects are
+    /// not rolled back. `steps` defaults to 1.
+    Rewind { steps: usize },
     /// Stop the runtime (also cancels any in-flight turn).
     Quit,
 }
