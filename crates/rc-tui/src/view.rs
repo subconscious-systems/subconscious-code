@@ -127,6 +127,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
 
 fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect) {
     let h = area.height as usize;
+    let w = area.width;
     state.area_height = h;
 
     // The in-progress text is re-parsed each frame (small/growing) — that's the
@@ -164,7 +165,23 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect) {
     // isn't overwritten and stays put: "portions of some words scrolling, the
     // rest stuck." Clearing gives each frame a clean slate.
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    // Wrapping can make the slice taller than the area: a long line spans
+    // several visual rows, so `h` logical lines can occupy more than `h` visual
+    // rows. `Paragraph` renders top-down and clips the bottom, so without help
+    // the *newest* line — the last in the slice, right above the composer — is
+    // the one that gets cut off. When following, scroll the excess rows off the
+    // top so the content's bottom pins to the area's bottom. `line_count` runs
+    // ratatui's own `WordWrapper`, so the count matches the render exactly.
+    // When held (scrolled up), leave the slice top-aligned — the user put
+    // `scroll_top` at the top on purpose.
+    let wrapped_rows = paragraph.line_count(w);
+    let scroll_y = if state.follow {
+        wrapped_rows.saturating_sub(h).min(u16::MAX as usize) as u16
+    } else {
+        0
+    };
+    frame.render_widget(paragraph.scroll((scroll_y, 0)), area);
 }
 
 fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect) {
@@ -468,5 +485,23 @@ mod tests {
         // No "files"/"commands" title block should appear.
         assert!(!screen.contains("files"), "no menu for empty candidates: {screen}");
         assert!(!screen.contains("commands"), "no menu title: {screen}");
+    }
+
+    /// When a transcript line wraps to more rows than the area is tall, the
+    /// naive slice (`h` logical lines, no scroll) overflows and `Paragraph` clips
+    /// the bottom — cutting off the newest line, right above the composer. The
+    /// follow path must scroll the excess off the top so the newest line pins
+    /// to the bottom and stays visible. (60x10 -> ~6 transcript rows; the long
+    /// line below wraps to 8.)
+    #[test]
+    fn follow_keeps_newest_line_visible_when_wrapping_overflows() {
+        let mut state = ViewState::new("m".into());
+        state.transcript.push(Line::from("x".repeat(60 * 8)));
+        state.transcript.push(Line::from("NEWEST"));
+        let screen = rendered(&mut state);
+        assert!(
+            screen.contains("NEWEST"),
+            "newest line must be visible (not clipped) when wrapping overflows: {screen}"
+        );
     }
 }
