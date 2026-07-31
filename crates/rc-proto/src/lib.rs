@@ -25,6 +25,6 @@ pub use stream::{
     ToolCallAccumulator,
 };
 pub use wire::{
-    ChatCompletionResponse, FunctionCall, FunctionDefinition, StreamOptions, ToolCall,
-    ToolChoiceValue, ToolDefinition, Usage, WireMessage,
+    ChatCompletionResponse, FunctionCall, FunctionDefinition, StreamOptions,
+    ToolCall, ToolChoiceValue, ToolDefinition, Usage, UserContent, WireMessage,
 };
