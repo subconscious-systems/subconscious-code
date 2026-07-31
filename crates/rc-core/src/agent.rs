@@ -10,7 +10,8 @@ use crate::registry::ToolRegistry;
 use crate::tool::{Concurrency, SandboxPolicy, Tool, ToolCtx, ToolOutcome};
 use crate::turn::{Session, ToolCall, ToolResultBody, Turn};
 use rc_perm::{Decision, PermissionChecker};
-use rc_proto::{CompleteOpts, FinishReason, ToolChoiceValue};
+use rc_proto::{CompleteOpts, FinishReason, ToolChoiceValue, WireMessage};
+use rc_tokenize::Estimator;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,8 +35,31 @@ pub enum LoopOutcome {
     TimeUp,
 }
 
+/// Default tool-loop iterations per turn. Not a context limit — a runaway
+/// backstop. `AgentLoop::with_max_iters` raises it (the CLI defaults to 1000,
+/// which is far above any legitimate task and still terminates).
 const MAX_ITERS: u32 = 100;
 const PARALLEL_BOUND: usize = 8;
+
+/// Char length of a wire message's payload, for the pre-flight context estimate.
+/// Counts the text that dominates the body; the structural JSON around it is
+/// noise at any interesting size.
+fn message_len(m: &WireMessage) -> usize {
+    match m {
+        WireMessage::System { content } => content.chars().count(),
+        WireMessage::User { content } => match content {
+            rc_proto::wire::UserContent::Text(t) => t.chars().count(),
+        },
+        WireMessage::Assistant { content, tool_calls } => {
+            content.as_deref().map_or(0, |c| c.chars().count())
+                + tool_calls
+                    .iter()
+                    .map(|c| c.function.arguments.chars().count() + c.function.name.len())
+                    .sum::<usize>()
+        }
+        WireMessage::Tool { content, .. } => content.chars().count(),
+    }
+}
 
 /// The agent loop. Headless; the TUI (M4) and cancellation-via-Esc plug in
 /// through the [`EventSink`] and a per-turn [`CancellationToken`]. Permission
@@ -65,6 +89,13 @@ pub struct AgentLoop {
     /// M7: opt-in kernel sandbox policy for `Bash` (§7.6). `None` (default) =
     /// no confinement.
     pub sandbox: Option<SandboxPolicy>,
+    /// M8: the calibrated token estimator (§4.7). **Observability only** — it
+    /// never gates, truncates, or compacts anything. Each response's
+    /// authoritative `prompt_tokens` calibrates the chars-per-token factor, and
+    /// the pre-flight estimate is reported to the sink so a UI can show how big
+    /// the context has grown. Subconscious Code deliberately has no window
+    /// threshold for this to trip.
+    pub estimator: Estimator,
 }
 
 impl AgentLoop {
@@ -73,7 +104,19 @@ impl AgentLoop {
         tools: Arc<ToolRegistry>,
         permission: Arc<dyn PermissionChecker>,
     ) -> Self {
-        Self { model, tools, permission, max_iters: MAX_ITERS, assembler: None, idle_timeout: None, turn_timeout: None, max_tokens: None, temperature: None, sandbox: None }
+        Self {
+            model,
+            tools,
+            permission,
+            max_iters: MAX_ITERS,
+            assembler: None,
+            idle_timeout: None,
+            turn_timeout: None,
+            max_tokens: None,
+            temperature: None,
+            sandbox: None,
+            estimator: Estimator::new(),
+        }
     }
 
     /// Supply a §4.6 context assembler (from `rc-ctx`). When set, the loop
@@ -82,6 +125,15 @@ impl AgentLoop {
     #[must_use]
     pub fn with_assembler(mut self, assembler: Arc<dyn ContextAssembler>) -> Self {
         self.assembler = Some(assembler);
+        self
+    }
+
+    /// Tool-loop iterations allowed in one turn (the runaway backstop, not a
+    /// context limit). `0` means unlimited — a confused model then spends
+    /// without bound, so prefer a large finite value. Builder.
+    #[must_use]
+    pub fn with_max_iters(mut self, max_iters: u32) -> Self {
+        self.max_iters = if max_iters == 0 { u32::MAX } else { max_iters };
         self
     }
 
@@ -185,6 +237,19 @@ impl AgentLoop {
                 tracing::error!("tool-answer invariant violated: {e}");
             }
 
+            // Pre-flight context size (§4.7 #2): the char length of everything
+            // we're about to send, and the calibrated token estimate for it.
+            // Reported, never enforced — there is no window to exceed.
+            let context_chars: usize = messages.iter().map(message_len).sum();
+            let context_tokens = self.estimator.estimate_chars(context_chars);
+            sink.on_context(context_chars, context_tokens);
+            tracing::debug!(
+                context_chars,
+                context_tokens,
+                factor = self.estimator.factor(),
+                "assembled context"
+            );
+
             let req = ModelRequest {
                 messages,
                 tools: self.tools.definitions().to_vec(),
@@ -200,6 +265,9 @@ impl AgentLoop {
             if let Some(u) = &usage {
                 sink.on_usage(u);
                 session.total_usage.add(u);
+                // Calibrate against the authoritative count (§4.7 #1) so the
+                // next pre-flight estimate is closer for this model.
+                self.estimator.observe(u.prompt_tokens, context_chars);
             }
 
             let mut assistant_calls = Vec::new();

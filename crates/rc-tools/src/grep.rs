@@ -17,9 +17,6 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-const CAP: usize = 30_000;
-const HEAD: usize = 10_000;
-const TAIL: usize = 20_000;
 const BINARY_SCAN: usize = 8192;
 
 #[derive(Deserialize, JsonSchema)]
@@ -53,12 +50,27 @@ enum Mode {
     Count,
 }
 
-#[derive(Default)]
-pub struct Grep;
+pub struct Grep {
+    /// Max chars of match output returned to the model. `0` = unlimited (the
+    /// default).
+    cap: usize,
+}
+
+impl Default for Grep {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Grep {
+    /// A `Grep` with unlimited output.
     pub fn new() -> Self {
-        Self
+        Self::with_cap(0)
+    }
+
+    /// A `Grep` that elides output beyond `cap` chars (`0` = unlimited).
+    pub fn with_cap(cap: usize) -> Self {
+        Self { cap }
     }
 }
 
@@ -218,12 +230,16 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
                     break;
                 }
             }
-            if out.len() > CAP + 4096 {
+            // Stop scanning once we're comfortably past the cap — there's no
+            // point building output we're about to elide. Skipped entirely when
+            // unlimited (`cap == 0`), which is the default.
+            if self.cap != 0 && out.len() > self.cap + 4096 {
                 break;
             }
         }
 
-        let (truncated, content) = cap_output(&out, CAP, HEAD, TAIL);
+        let head = self.cap / 3;
+        let (truncated, content) = cap_output(&out, self.cap, head, self.cap - head);
         Ok(ToolOutcome::Ok { content, truncated, artifacts: Vec::new() })
     }
 }

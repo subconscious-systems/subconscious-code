@@ -11,6 +11,7 @@ serde_json.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+flate2.workspace = true
 tokio = { workspace = true }
 tokio-stream.workspace = true
 tracing.workspace = true

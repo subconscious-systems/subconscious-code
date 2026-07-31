@@ -73,6 +73,10 @@ pub trait EventSink: Send + Sync {
     fn on_tool_end(&self, _call_id: &str, _tool: &str, _result: &ToolResultBody) {}
     fn on_iter(&self, _count: u32, _max: u32) {}
     fn on_usage(&self, _usage: &Usage) {}
+    /// M8: the size of the context about to be sent — its char length and the
+    /// calibrated token estimate. Purely informational (there is no window to
+    /// exceed); a UI shows it so the operator can watch the context grow.
+    fn on_context(&self, _chars: usize, _est_tokens: usize) {}
 }
 
 #[derive(Default)]

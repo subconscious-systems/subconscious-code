@@ -32,6 +32,10 @@ pub enum AgentEvent {
     Iter { count: u32, max: u32 },
     /// Token usage from the model response.
     Usage(Usage),
+    /// M8: size of the context about to be sent — char length and the
+    /// calibrated token estimate. Informational: there is no window to exceed,
+    /// but the operator wants to watch it grow.
+    Context { chars: usize, est_tokens: usize },
     /// A turn completed normally.
     Outcome(LoopOutcome),
     /// A turn failed (model error).

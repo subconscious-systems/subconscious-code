@@ -665,3 +665,110 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
     }
     assert!(verify_invariant(&project(&session.messages)).is_ok(), "invariant must hold");
 }
+
+// ---- unlimited context (M8) -------------------------------------------------
+
+/// The product claim, at the loop level: a large tool result reaches the wire
+/// whole. This is the regression guard against reintroducing a silent per-result
+/// cap anywhere between the tool and the request.
+#[tokio::test]
+async fn large_tool_results_reach_the_wire_uncapped() {
+    use rc_core::{Tool, ToolCtx, ToolError, ToolOutcome};
+    use serde_json::Value;
+
+    // Comfortably past every cap that used to exist (16 KB tool result,
+    // 30 KB Bash output).
+    const BODY: usize = 512 * 1024;
+
+    struct Fat;
+    #[async_trait]
+    impl Tool for Fat {
+        fn name(&self) -> &str {
+            "Fat"
+        }
+        fn description(&self) -> &str {
+            "Returns a large body."
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::ok("q".repeat(BODY)))
+        }
+    }
+
+    // Turn 1 calls the tool; turn 2 answers. The second request carries the
+    // tool result, which is the one we inspect.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    struct TwoTurn {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+    #[async_trait]
+    impl Model for TwoTurn {
+        async fn complete(
+            &self,
+            req: ModelRequest,
+            _sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let first = {
+                let mut r = self.requests.lock().unwrap();
+                r.push(req);
+                r.len() == 1
+            };
+            Ok(if first {
+                ModelResponse {
+                    text: String::new(),
+                    reasoning: None,
+                    tool_calls: vec![rc_core::model::FinalizedToolCall::Call(
+                        rc_core::ToolCall {
+                            id: "c1".into(),
+                            name: "Fat".into(),
+                            arguments: "{}".into(),
+                        },
+                    )],
+                    finish_reason: rc_proto::FinishReason::ToolCalls,
+                    usage: None,
+                }
+            } else {
+                ModelResponse {
+                    text: "done".into(),
+                    reasoning: None,
+                    tool_calls: vec![],
+                    finish_reason: rc_proto::FinishReason::Stop,
+                    usage: None,
+                }
+            })
+        }
+    }
+
+    let model = Arc::new(TwoTurn { requests: requests.clone() }) as Arc<dyn Model>;
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Fat) as Arc<dyn Tool>]));
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+
+    let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
+    agent
+        .run(&mut session, "go".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "expected a tool turn then an answer turn");
+    let tool_msg = reqs[1]
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            rc_proto::WireMessage::Tool { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the tool result is on the wire");
+    assert_eq!(
+        tool_msg.len(),
+        BODY,
+        "the tool body must reach the model whole — a cap crept back in"
+    );
+    assert!(!tool_msg.contains("truncated"), "no truncation sentinel: {}", &tool_msg[..80]);
+}

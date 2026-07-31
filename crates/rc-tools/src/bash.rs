@@ -33,9 +33,6 @@ use std::time::{Duration, SystemTime};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
-const CAP: usize = 30_000;
-const HEAD: usize = 10_000;
-const TAIL: usize = 20_000;
 
 #[derive(Deserialize, JsonSchema)]
 pub struct BashInput {
@@ -49,13 +46,59 @@ pub struct BashInput {
     pub run_in_background: bool,
 }
 
-#[derive(Default)]
-pub struct Bash;
+pub struct Bash {
+    /// Max chars of combined stdout+stderr returned to the model. `0` =
+    /// unlimited (the default). When set, the output is head+tail elided.
+    cap: usize,
+    /// Built at construction so the model is told the truth about `cap` —
+    /// advertising a limit that isn't enforced (or vice versa) changes how the
+    /// model uses the tool.
+    description: String,
+}
+
+impl Default for Bash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Bash {
+    /// A `Bash` with unlimited output.
     pub fn new() -> Self {
-        Self
+        Self::with_cap(0)
     }
+
+    /// A `Bash` that elides output beyond `cap` chars (`0` = unlimited).
+    pub fn with_cap(cap: usize) -> Self {
+        Self { cap, description: bash_description(cap) }
+    }
+
+    /// Head/tail split for the elision, preserving the historical 1:2 ratio.
+    fn head_tail(&self) -> (usize, usize) {
+        let head = self.cap / 3;
+        (head, self.cap - head)
+    }
+}
+
+/// The tool description, with the output-limit sentence matched to `cap`.
+fn bash_description(cap: usize) -> String {
+    let limit = if cap == 0 {
+        "stdout+stderr are captured in full (ANSI stripped) with no size limit".to_string()
+    } else {
+        format!(
+            "stdout+stderr are captured, ANSI stripped, and capped at {} chars (head {} + tail {})",
+            cap,
+            cap / 3,
+            cap - cap / 3,
+        )
+    };
+    format!(
+        "Run a shell command. `cd` persists across calls (a successful, in-workspace `cd` \
+updates the session's working directory). {limit}; the exit code is shown first. Default \
+timeout 120s, max 600s. stdin is closed — commands that read input see EOF; use \
+non-interactive flags (`-y`, `--no-pager`, `git --no-pager`). Set `run_in_background: true` \
+for long-running servers; output goes to a log file you can `Read` to check progress."
+    )
 }
 
 #[async_trait]
@@ -65,12 +108,7 @@ impl Tool for Bash {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command. `cd` persists across calls (a successful, in-workspace `cd` \
-updates the session's working directory). stdout+stderr are captured, ANSI stripped, and \
-capped at 30k chars (head 10k + tail 20k); the exit code is shown first. Default timeout 120s, \
-max 600s. stdin is closed — commands that read input see EOF; use non-interactive flags (`-y`, \
-`--no-pager`, `git --no-pager`). Set `run_in_background: true` for long-running servers; output \
-goes to a log file you can `Read` to check progress."
+        &self.description
     }
 
     fn schema(&self) -> Value {
@@ -134,7 +172,8 @@ goes to a log file you can `Read` to check progress."
             combined.push_str("\n--- stderr ---\n");
             combined.push_str(&stderr);
         }
-        let (truncated, body) = cap_output(&combined, CAP, HEAD, TAIL);
+        let (head, tail) = self.head_tail();
+        let (truncated, body) = cap_output(&combined, self.cap, head, tail);
         let exit = output
             .status
             .code()

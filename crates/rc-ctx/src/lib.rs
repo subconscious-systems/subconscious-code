@@ -3,8 +3,8 @@
 //! M6 implements the §4.6 system prompt and the §8 context window:
 //!
 //! - **System prompt**: identity + an environment block (cwd, platform, date,
-//!   git branch) + a hierarchical memory chain (`AGENTS.md`, `.rc/AGENTS.md`,
-//!   `~/.rc/AGENTS.md`), assembled in precedence order. The caller passes the
+//!   git branch) + a hierarchical memory chain (`AGENTS.md`, `.sc/AGENTS.md`,
+//!   `~/.sc/AGENTS.md`), assembled in precedence order. The caller passes the
 //!   result to [`rc_core::project_with`].
 //! - **`@file` mention expansion**: `@path` tokens in a user turn are inlined
 //!   as fenced file blocks before the turn is projected, so the model sees the
@@ -22,15 +22,45 @@ use rc_core::Turn;
 use rc_proto::WireMessage;
 use std::path::{Path, PathBuf};
 
-/// The maximum size of an inlined `@file` mention (bytes). Files larger than
-/// this are summarized as a header + truncation sentinel rather than inlined
-/// whole (§8.3 — don't let one mention eat the window).
-const INLINE_FILE_CAP: usize = 8 * 1024;
+/// Per-item context caps, in bytes. **`0` means unlimited** — and unlimited is
+/// what Subconscious Code ships ([`Caps::unlimited`], the [`Default`]).
+///
+/// The truncation paths below stay in place behind the `0` check so a caller on
+/// a small-context model can dial them back in, and so the §8.5 microcompaction
+/// seam remains available for future strategies. Nothing here shrinks what the
+/// model sees unless a cap is explicitly configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    /// Bytes of an inlined `@file` mention (§8.3). 0 = inline the whole file.
+    pub inline_file: usize,
+    /// Bytes of a tool-result body kept in the conversation (§8.5). 0 = all.
+    pub tool_result: usize,
+}
 
-/// The maximum size of a tool-result body before per-result truncation kicks
-/// in (§8.5 microcompaction seam). Bodies over this are head-truncated with a
-/// tail sentinel noting the elision count.
-const TOOL_RESULT_CAP: usize = 16 * 1024;
+impl Caps {
+    /// No truncation at all — the shipped default.
+    pub const fn unlimited() -> Self {
+        Self { inline_file: 0, tool_result: 0 }
+    }
+
+    /// The historical M6 caps (8 KB mentions, 16 KB tool results). Kept as a
+    /// named preset for small-context models and for the regression tests that
+    /// pin the truncation behaviour.
+    pub const fn bounded() -> Self {
+        Self { inline_file: 8 * 1024, tool_result: 16 * 1024 }
+    }
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self::unlimited()
+    }
+}
+
+/// Would a body of `len` bytes exceed `cap`? Always `false` for `cap == 0`.
+fn over(cap: usize, len: usize) -> bool {
+    cap != 0 && len > cap
+}
 
 /// The assembled environment block + memory chain + identity for the §4.6
 /// system prompt. Construct one per request from the session's cwd and the
@@ -138,19 +168,19 @@ pub struct Memory {
 
 impl Memory {
     /// Load the `AGENTS.md` memory chain for `cwd` in precedence order
-    /// (lowest first): `~/.rc/AGENTS.md` (user global) → `<cwd>/.rc/AGENTS.md`
+    /// (lowest first): `~/.sc/AGENTS.md` (user global) → `<cwd>/.sc/AGENTS.md`
     /// (project) → `<cwd>/AGENTS.md` (repo root). Missing files are skipped.
     /// Later (higher-precedence) files override earlier ones in the prompt.
     pub fn load_chain(cwd: &Path) -> Vec<Memory> {
         let mut chain = Vec::new();
         if let Some(home) = std::env::var_os("HOME") {
-            let p = Path::new(&home).join(".rc").join("AGENTS.md");
-            if let Some(m) = load_memory(&p, "~/.rc/AGENTS.md") {
+            let p = Path::new(&home).join(".sc").join("AGENTS.md");
+            if let Some(m) = load_memory(&p, "~/.sc/AGENTS.md") {
                 chain.push(m);
             }
         }
-        let p = cwd.join(".rc").join("AGENTS.md");
-        if let Some(m) = load_memory(&p, ".rc/AGENTS.md") {
+        let p = cwd.join(".sc").join("AGENTS.md");
+        if let Some(m) = load_memory(&p, ".sc/AGENTS.md") {
             chain.push(m);
         }
         let p = cwd.join("AGENTS.md");
@@ -206,23 +236,36 @@ pub fn build_system_prompt(env: &Environment, memories: &[Memory]) -> String {
 pub struct ContextAssembler {
     env: Environment,
     system_prompt: String,
+    caps: Caps,
 }
 
 impl ContextAssembler {
     /// Build an assembler for `env`, loading the `AGENTS.md` memory chain from
     /// `env.cwd`. The system prompt is computed once and reused across
-    /// [`Self::assemble`] calls for this environment.
+    /// [`Self::assemble`] calls for this environment. Caps default to
+    /// [`Caps::unlimited`]; use [`Self::with_caps`] to bound them.
     pub fn new(env: Environment) -> Self {
         let memories = Memory::load_chain(&env.cwd);
         let system_prompt = build_system_prompt(&env, &memories);
-        Self { env, system_prompt }
+        Self { env, system_prompt, caps: Caps::unlimited() }
     }
 
     /// Build an assembler with an explicit system prompt (e.g. for tests, or a
     /// caller that assembles its own memory chain). The environment is still
     /// carried for mention-expansion root resolution.
     pub fn with_system_prompt(env: Environment, system_prompt: String) -> Self {
-        Self { env, system_prompt }
+        Self { env, system_prompt, caps: Caps::unlimited() }
+    }
+
+    /// Set the per-item truncation caps. `0` in any field means unlimited.
+    pub fn with_caps(mut self, caps: Caps) -> Self {
+        self.caps = caps;
+        self
+    }
+
+    /// The caps in force.
+    pub fn caps(&self) -> Caps {
+        self.caps
     }
 
     /// The environment this assembler was built from.
@@ -243,7 +286,7 @@ impl ContextAssembler {
     /// last `Turn::User` only (the one driving this request) so earlier turns
     /// stay byte-stable for prefix caching (§4.6 canonicalization).
     pub fn assemble(&self, turns: &[Turn]) -> Vec<WireMessage> {
-        let prepared = prepare_turns(turns, &self.env.cwd);
+        let prepared = prepare_turns(turns, &self.env.cwd, self.caps);
         rc_core::project_with(&prepared, &self.system_prompt)
     }
 }
@@ -262,23 +305,23 @@ impl rc_core::ContextAssembler for ContextAssembler {
 /// oversized tool-result bodies truncated. Earlier turns are left untouched
 /// (prefix stability); only the suffix from the last user turn onward is
 /// re-derived. Returns a new `Vec`; the input is not mutated.
-fn prepare_turns(turns: &[Turn], root: &Path) -> Vec<Turn> {
+fn prepare_turns(turns: &[Turn], root: &Path, caps: Caps) -> Vec<Turn> {
     // Find the last user turn — everything before it is the stable prefix.
     let last_user = turns.iter().rposition(|t| matches!(t, Turn::User { .. }));
     let Some(idx) = last_user else {
-        return truncate_tool_results(turns);
+        return truncate_tool_results(turns, caps.tool_result);
     };
     let mut out: Vec<Turn> = turns[..idx].to_vec();
     for turn in &turns[idx..] {
         match turn {
             Turn::User { content, ts } => {
-                let expanded = expand_mentions(content, root);
+                let expanded = expand_mentions(content, root, caps.inline_file);
                 out.push(Turn::User { content: expanded, ts: *ts });
             }
             other => out.push(other.clone()),
         }
     }
-    truncate_tool_results(&out)
+    truncate_tool_results(&out, caps.tool_result)
 }
 
 /// Expand `@path` mentions in `text` into fenced file blocks (§8.3). A mention
@@ -288,7 +331,7 @@ fn prepare_turns(turns: &[Turn], root: &Path) -> Vec<Turn> {
 /// workspace). Files over [`INLINE_FILE_CAP`] bytes are head-truncated with a
 /// sentinel. The original `@token` is preserved in the output so the model can
 /// reference it.
-fn expand_mentions(text: &str, root: &Path) -> String {
+fn expand_mentions(text: &str, root: &Path, cap: usize) -> String {
     if !text.contains('@') {
         return text.to_string();
     }
@@ -298,14 +341,14 @@ fn expand_mentions(text: &str, root: &Path) -> String {
             Some(b) => (b, "\n"),
             None => (line, ""),
         };
-        out.push_str(&expand_line_mentions(body, root));
+        out.push_str(&expand_line_mentions(body, root, cap));
         out.push_str(newline);
     }
     out
 }
 
 /// Expand mentions in a single line (no trailing newline).
-fn expand_line_mentions(line: &str, root: &Path) -> String {
+fn expand_line_mentions(line: &str, root: &Path, cap: usize) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(at) = rest.find('@') {
@@ -326,7 +369,7 @@ fn expand_line_mentions(line: &str, root: &Path) -> String {
             rest = after;
             continue;
         }
-        let inlined = inline_file(token, root);
+        let inlined = inline_file(token, root, cap);
         out.push_str(token);
         out.push_str(&inlined);
         rest = &after[end..];
@@ -340,7 +383,7 @@ fn expand_line_mentions(line: &str, root: &Path) -> String {
 /// empty string when the path can't be resolved within `root` or read; the
 /// caller keeps the bare `@token` in that case. A fenced block is appended
 /// after the token when the file resolves and reads as UTF-8.
-fn inline_file(rel: &str, root: &Path) -> String {
+fn inline_file(rel: &str, root: &Path, cap: usize) -> String {
     let cleaned = rel.strip_prefix("./").unwrap_or(rel);
     // Refuse absolute paths and `..` escapes — never read outside the workspace.
     if cleaned.starts_with('/') || cleaned.contains("..") {
@@ -359,8 +402,8 @@ fn inline_file(rel: &str, root: &Path) -> String {
         Err(_) => return format!("\n```\n<file {rel} is not valid UTF-8 — not inlined>\n```\n"),
     };
     let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if text.len() > INLINE_FILE_CAP {
-        let head = floor_char_boundary(text, INLINE_FILE_CAP);
+    if over(cap, text.len()) {
+        let head = floor_char_boundary(text, cap);
         let head = &text[..head];
         let elided = text.len() - head.len();
         return format!(
@@ -370,17 +413,23 @@ fn inline_file(rel: &str, root: &Path) -> String {
     format!("\n```{lang}\n{}\n```\n", text.trim_end_matches('\n'))
 }
 
-/// Truncate oversized tool-result bodies in `turns` to [`TOOL_RESULT_CAP`]
-/// (§8.5 microcompaction seam). Only `ToolResult` turns with an `Ok` body over
-/// the cap are affected; the body is head-truncated and a tail sentinel records
-/// the elision. This is a bounded per-result cap, not the full summary-turn
+/// Truncate oversized tool-result bodies in `turns` to `cap` bytes (§8.5
+/// microcompaction seam). Only `ToolResult` turns with an `Ok` body over the cap
+/// are affected; the body is head-truncated and a tail sentinel records the
+/// elision. This is a bounded per-result cap, not the full summary-turn
 /// compaction that evicts superseded reads — that lands in a later milestone.
-fn truncate_tool_results(turns: &[Turn]) -> Vec<Turn> {
+///
+/// `cap == 0` (the shipped default) is a no-op clone: every tool result reaches
+/// the model whole, however large.
+fn truncate_tool_results(turns: &[Turn], cap: usize) -> Vec<Turn> {
+    if cap == 0 {
+        return turns.to_vec();
+    }
     turns
         .iter()
         .map(|t| match t {
             Turn::ToolResult { call_id, tool, result, duration } => {
-                let result = result.truncate_body(TOOL_RESULT_CAP);
+                let result = result.truncate_body(cap);
                 Turn::ToolResult {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -411,6 +460,11 @@ mod tests {
     use rc_core::ToolResultBody;
     use std::time::SystemTime;
     use tempfile::tempdir;
+
+    /// The truncation tests exercise the *bounded* preset — the shipped default
+    /// is unlimited, which the `*_unlimited_*` tests cover separately.
+    const INLINE_FILE_CAP: usize = Caps::bounded().inline_file;
+    const TOOL_RESULT_CAP: usize = Caps::bounded().tool_result;
 
     fn user(content: &str) -> Turn {
         Turn::User { content: content.into(), ts: SystemTime::now() }
@@ -451,12 +505,12 @@ mod tests {
             git_branch: None,
         };
         let mem = vec![
-            Memory { path: "~/.rc/AGENTS.md".into(), contents: "global rule".into() },
+            Memory { path: "~/.sc/AGENTS.md".into(), contents: "global rule".into() },
             Memory { path: "AGENTS.md".into(), contents: "repo rule".into() },
         ];
         let prompt = build_system_prompt(&env, &mem);
         assert!(prompt.contains("# Memory"));
-        assert!(prompt.contains("## ~/.rc/AGENTS.md"));
+        assert!(prompt.contains("## ~/.sc/AGENTS.md"));
         assert!(prompt.contains("global rule"));
         assert!(prompt.contains("## AGENTS.md"));
         assert!(prompt.contains("repo rule"));
@@ -499,7 +553,7 @@ mod tests {
     fn expand_mentions_inlines_a_file() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("note.txt"), "hello world\n").unwrap();
-        let out = expand_mentions("see @note.txt please", dir.path());
+        let out = expand_mentions("see @note.txt please", dir.path(), 0);
         assert!(out.contains("@note.txt"));
         assert!(out.contains("```"));
         assert!(out.contains("hello world"));
@@ -510,14 +564,14 @@ mod tests {
     #[test]
     fn expand_mentions_leaves_emails_alone() {
         let dir = tempdir().unwrap();
-        let out = expand_mentions("contact me@host.com", dir.path());
+        let out = expand_mentions("contact me@host.com", dir.path(), 0);
         assert_eq!(out, "contact me@host.com");
     }
 
     #[test]
     fn expand_mentions_refuses_path_escape() {
         let dir = tempdir().unwrap();
-        let out = expand_mentions("read @../secret.txt", dir.path());
+        let out = expand_mentions("read @../secret.txt", dir.path(), 0);
         // The `..` is not read; the bare token survives, no fence.
         assert!(out.contains("@../secret.txt"));
         assert!(!out.contains("```"));
@@ -526,7 +580,7 @@ mod tests {
     #[test]
     fn expand_mentions_handles_missing_file() {
         let dir = tempdir().unwrap();
-        let out = expand_mentions("see @nope.txt end", dir.path());
+        let out = expand_mentions("see @nope.txt end", dir.path(), 0);
         // Missing file: the bare token survives, no fence inlined.
         assert!(out.contains("@nope.txt"));
         assert!(!out.contains("```"));
@@ -537,7 +591,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let big = "x".repeat(INLINE_FILE_CAP + 500);
         std::fs::write(dir.path().join("big.txt"), &big).unwrap();
-        let out = expand_mentions("@big.txt", dir.path());
+        let out = expand_mentions("@big.txt", dir.path(), INLINE_FILE_CAP);
         assert!(out.contains("more bytes truncated"));
     }
 
@@ -548,7 +602,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let big = "é".repeat(INLINE_FILE_CAP + 500);
         std::fs::write(dir.path().join("big.txt"), &big).unwrap();
-        let out = expand_mentions("@big.txt", dir.path());
+        let out = expand_mentions("@big.txt", dir.path(), INLINE_FILE_CAP);
         assert!(out.contains("more bytes truncated"));
         // Extract the inlined file head (between the opening fence's lang line
         // and the "\n…" truncation sentinel) and assert it's within the byte cap.
@@ -567,16 +621,66 @@ mod tests {
         assert!(head.is_char_boundary(head.len()), "head ends on a char boundary");
     }
 
+    /// The product thesis, at the mention layer: with the shipped default an
+    /// arbitrarily large `@file` reaches the model whole.
+    #[test]
+    fn expand_mentions_unlimited_inlines_whole_file() {
+        let dir = tempdir().unwrap();
+        let big = "x".repeat(INLINE_FILE_CAP * 4);
+        std::fs::write(dir.path().join("big.txt"), &big).unwrap();
+        let out = expand_mentions("@big.txt", dir.path(), Caps::unlimited().inline_file);
+        assert!(!out.contains("more bytes truncated"), "must not truncate at cap 0");
+        assert!(out.contains(&big), "the whole file is inlined");
+    }
+
+    /// The product thesis, at the tool-result layer: a giant `Read`/`Bash` body
+    /// survives intact, and the turn list is otherwise unchanged.
+    #[test]
+    fn truncate_tool_results_unlimited_keeps_whole_body() {
+        let big = "y".repeat(TOOL_RESULT_CAP * 4);
+        let turns = vec![user("go"), tool_ok("c1", &big)];
+        let out = truncate_tool_results(&turns, Caps::unlimited().tool_result);
+        match &out[1] {
+            Turn::ToolResult { result, .. } => {
+                let ToolResultBody::Ok { content, truncated } = result else { panic!() };
+                assert!(!*truncated, "must not be flagged truncated at cap 0");
+                assert_eq!(content.len(), big.len(), "body kept whole");
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    /// The assembler's default is unlimited, so a default-constructed one never
+    /// shrinks a tool result. Guards against reintroducing a silent 16 KB cap.
+    #[test]
+    fn assembler_default_caps_are_unlimited() {
+        let dir = tempdir().unwrap();
+        let env = Environment::detect(dir.path(), "Mon Jan 1, 2027".into());
+        let asm = ContextAssembler::with_system_prompt(env, "sys".into());
+        assert_eq!(asm.caps(), Caps::unlimited());
+
+        let big = "z".repeat(TOOL_RESULT_CAP * 2);
+        let msgs = asm.assemble(&[user("go"), tool_ok("c1", &big)]);
+        let body = msgs
+            .iter()
+            .find_map(|m| match m {
+                WireMessage::Tool { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a tool message reaches the wire");
+        assert_eq!(body.len(), big.len(), "the full tool body reaches the wire");
+    }
+
     #[test]
     fn expand_mentions_with_no_at_returns_input_unchanged() {
-        assert_eq!(expand_mentions("no mentions here", Path::new("/")), "no mentions here");
+        assert_eq!(expand_mentions("no mentions here", Path::new("/"), 0), "no mentions here");
     }
 
     #[test]
     fn truncate_tool_results_caps_oversized_ok_body() {
         let big = "y".repeat(TOOL_RESULT_CAP + 100);
         let turns = vec![user("go"), tool_ok("c1", &big)];
-        let out = truncate_tool_results(&turns);
+        let out = truncate_tool_results(&turns, TOOL_RESULT_CAP);
         match &out[1] {
             Turn::ToolResult { result, .. } => {
                 let ToolResultBody::Ok { content, truncated } = result else { panic!() };
@@ -591,7 +695,7 @@ mod tests {
     #[test]
     fn truncate_tool_results_leaves_small_bodies_alone() {
         let turns = vec![user("go"), tool_ok("c1", "small")];
-        let out = truncate_tool_results(&turns);
+        let out = truncate_tool_results(&turns, TOOL_RESULT_CAP);
         match &out[1] {
             Turn::ToolResult { result, .. } => match result {
                 ToolResultBody::Ok { content, truncated } => {

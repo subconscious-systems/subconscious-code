@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "rc"
+name = "sc"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,6 +19,7 @@ rc-tui = { path = "../rc-tui" }
 rc-session = { path = "../rc-session" }
 rc-ctx = { path = "../rc-ctx" }
 rc-tokenize = { path = "../rc-tokenize" }
+tokio-stream.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true }

@@ -41,4 +41,7 @@ impl EventSink for RuntimeSink {
     fn on_usage(&self, usage: &Usage) {
         let _ = self.events.send(AgentEvent::Usage(usage.clone()));
     }
+    fn on_context(&self, chars: usize, est_tokens: usize) {
+        let _ = self.events.send(AgentEvent::Context { chars, est_tokens });
+    }
 }

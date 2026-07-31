@@ -14,6 +14,7 @@ use crate::wire::{
     WireMessage,
 };
 use bytes::Bytes;
+use std::io::Write as _;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -62,40 +63,76 @@ pub struct ChatClient {
     api_key: String,
     model: String,
     retry: RetryOpts,
+    gzip_request: bool,
 }
+
+/// Bytes of a request body written to the `--debug` log before eliding the rest.
+///
+/// The body is the entire conversation. Logging it whole was fine at chat scale
+/// and is catastrophic at ours — a 200 MB context would format and write 200 MB
+/// to stderr per request. Set `SC_DEBUG_FULL_BODY=1` to opt back into the full
+/// dump when you genuinely need it.
+const DEBUG_BODY_PREVIEW: usize = 8 * 1024;
 
 impl ChatClient {
     /// `api_key` empty → `NoApiKey` immediately, so the caller surfaces a clear
-    /// error before any network attempt. `timeout` bounds the *total* request
-    /// (connect → end of body); on the streaming path it caps the whole stream,
-    /// so a small value can cut a stream mid-tool-call (the loop synthesizes
-    /// `Interrupted` results for any outstanding call — see `rc_core::agent`).
+    /// error before any network attempt.
+    ///
+    /// `timeout` bounds the *total* request (connect → end of body).
+    /// **`None` disables it**, which is the Subconscious Code default: a total
+    /// budget also covers the upload, so on a very large body it can expire
+    /// mid-upload and trigger a retry that re-uploads from scratch. Liveness is
+    /// better served by the idle bound in [`CompleteOpts::idle_timeout`], which
+    /// fails fast on a *stalled* stream without penalizing a merely large one.
+    ///
+    /// When set, a small value can cut a stream mid-tool-call (the loop
+    /// synthesizes `Interrupted` results for any outstanding call — see
+    /// `rc_core::agent`).
     pub fn new(
         base_url: String,
         api_key: String,
         model: String,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Self, ProtoError> {
         if api_key.is_empty() {
             return Err(ProtoError::NoApiKey);
         }
-        let http = reqwest::Client::builder().timeout(timeout).build()?;
+        let mut builder = reqwest::Client::builder();
+        if let Some(t) = timeout {
+            builder = builder.timeout(t);
+        }
+        let http = builder.build()?;
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
             retry: RetryOpts::default(),
+            gzip_request: false,
         })
     }
 
     /// Set the retry policy for transient HTTP errors (429/5xx). Default is no
-    /// retry. The body is canonical and stable, so retrying is safe; a streaming
-    /// request is retried only before the body starts flowing — a mid-stream
+    /// retry. The body is stable bytes, so retrying is safe *and* cheap — the
+    /// `Bytes` handle is cloned per attempt, not the payload. A streaming
+    /// request is retried only before the body starts flowing; a mid-stream
     /// error is not retried (no resume). Builder.
     #[must_use]
     pub fn with_retry(mut self, retry: RetryOpts) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Compress the request body with gzip and set `Content-Encoding: gzip`.
+    ///
+    /// Off by default because the gateway must support it — a server that
+    /// ignores `Content-Encoding` will read the compressed bytes as JSON and
+    /// reject the request. At our body sizes wire time dominates and JSON-wrapped
+    /// source compresses roughly 5-10×, so it is worth confirming support and
+    /// turning on. Builder.
+    #[must_use]
+    pub fn with_request_gzip(mut self, on: bool) -> Self {
+        self.gzip_request = on;
         self
     }
 
@@ -106,18 +143,24 @@ impl ChatClient {
     /// worst-case latency (`max_retries × total timeout`) for a merely-slow
     /// server. Returns the 2xx `Response`; a non-transient error (or an
     /// exhausted retry budget) returns the final error.
-    async fn send_with_retry(&self, url: &str, body: &str) -> Result<reqwest::Response, ProtoError> {
+    /// `body` is a refcounted `Bytes`, so each attempt clones a handle rather
+    /// than the payload — a retry on a 200 MB request costs nothing extra.
+    async fn send_with_retry(
+        &self,
+        url: &str,
+        body: &Bytes,
+    ) -> Result<reqwest::Response, ProtoError> {
         let mut attempt = 0u32;
         loop {
-            let resp = match self
+            let mut req = self
                 .http
                 .post(url)
                 .bearer_auth(self.api_key.clone())
-                .header("content-type", "application/json")
-                .body(body.to_string())
-                .send()
-                .await
-            {
+                .header("content-type", "application/json");
+            if self.gzip_request {
+                req = req.header("content-encoding", "gzip");
+            }
+            let resp = match req.body(body.clone()).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     if Self::is_transient_transport(&e) && attempt < self.retry.max_retries {
@@ -172,6 +215,61 @@ impl ChatClient {
         Some(Duration::from_secs(secs).min(self.retry.max_delay))
     }
 
+    /// Serialize a request to the exact bytes that go on the wire — once.
+    ///
+    /// One `serde_json::to_vec` into a `Vec<u8>`, handed to `Bytes` without a
+    /// copy — where the old path built a `Value` tree, a canonicalized copy of
+    /// it, and then a `String`. Gzip, when enabled, compresses in one pass over
+    /// those bytes.
+    ///
+    /// This removes serialization as a memory multiplier; it does not make the
+    /// whole request path allocation-free. Measured peak RSS for a 12 MB body is
+    /// ~6× the payload, and what remains is the clone chain in context assembly,
+    /// not this function.
+    fn encode_body<T: serde::Serialize>(&self, req: &T) -> Result<Bytes, ProtoError> {
+        let raw = canonical::to_bytes(req)?;
+        if !self.gzip_request {
+            return Ok(Bytes::from(raw));
+        }
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&raw).map_err(ProtoError::Gzip)?;
+        let compressed = enc.finish().map_err(ProtoError::Gzip)?;
+        tracing::debug!(
+            raw = raw.len(),
+            compressed = compressed.len(),
+            "gzipped request body"
+        );
+        Ok(Bytes::from(compressed))
+    }
+
+    /// Log a request under `--debug` without dumping the entire conversation.
+    ///
+    /// Emits the byte count always and a bounded head of the body, since the
+    /// interesting part (model, tools, the leading messages) is at the front.
+    /// `SC_DEBUG_FULL_BODY=1` restores the unbounded dump. Never logs the API
+    /// key — that lives in the `Authorization` header, which is not touched here.
+    fn log_request(&self, url: &str, body: &Bytes, streaming: bool) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let tag = if streaming { " (stream)" } else { "" };
+        let full = std::env::var("SC_DEBUG_FULL_BODY").as_deref() == Ok("1");
+        if full || body.len() <= DEBUG_BODY_PREVIEW {
+            tracing::debug!(
+                "→ POST {url}{tag} [{} bytes]\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            return;
+        }
+        let cut = floor_char_boundary(body, DEBUG_BODY_PREVIEW);
+        tracing::debug!(
+            "→ POST {url}{tag} [{} bytes, showing first {cut}; set SC_DEBUG_FULL_BODY=1 for all]\n{}",
+            body.len(),
+            String::from_utf8_lossy(&body[..cut])
+        );
+    }
+
     /// One non-streaming round trip. Returns the parsed response.
     pub async fn complete(
         &self,
@@ -189,12 +287,9 @@ impl ChatClient {
             parallel_tool_calls: None,
             stream_options: None,
         };
-        let body = canonical::to_string(&req)?;
+        let body = self.encode_body(&req)?;
         let url = format!("{}/chat/completions", self.base_url);
-        // The body is canonical JSON (no key — the key is in the Authorization
-        // header, which we never log). --debug output contains full conversation
-        // content; share with care.
-        tracing::debug!("→ POST {url}\n{body}");
+        self.log_request(&url, &body, false);
         let resp = self.send_with_retry(&url, &body).await?;
         let status = resp.status();
         let parsed: ChatCompletionResponse = resp.json().await?;
@@ -228,9 +323,9 @@ impl ChatClient {
             parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
             stream_options: Some(StreamOptions { include_usage: true }),
         };
-        let body = canonical::to_string(&req)?;
+        let body = self.encode_body(&req)?;
         let url = format!("{}/chat/completions", self.base_url);
-        tracing::debug!("→ POST {url} (stream)\n{body}");
+        self.log_request(&url, &body, true);
         let resp = self.send_with_retry(&url, &body).await?;
         let status = resp.status();
         tracing::debug!("← {status} streaming");
@@ -238,6 +333,20 @@ impl ChatClient {
             Box::pin(resp.bytes_stream());
         Ok(Box::pin(EventStream::new(body)))
     }
+}
+
+/// Largest index `≤ cap` in `bytes` that isn't inside a UTF-8 sequence, so a
+/// preview slice is lossless. A continuation byte matches `0b10xxxxxx`; walking
+/// back past at most three of them reaches a lead byte.
+fn floor_char_boundary(bytes: &[u8], cap: usize) -> usize {
+    if cap >= bytes.len() {
+        return bytes.len();
+    }
+    let mut cut = cap;
+    while cut > 0 && bytes[cut] & 0xC0 == 0x80 {
+        cut -= 1;
+    }
+    cut
 }
 
 /// A stream of [`AgentStreamEvent`] driven by polling the HTTP body through
@@ -378,7 +487,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let client = ChatClient::new(format!("http://{addr}"), "k".into(), "m".into(), Duration::from_secs(60))
+        let client = ChatClient::new(format!("http://{addr}"), "k".into(), "m".into(), Some(Duration::from_secs(60)))
             .unwrap()
             .with_retry(RetryOpts {
                 max_retries: 2,

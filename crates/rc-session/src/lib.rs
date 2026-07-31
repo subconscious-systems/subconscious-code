@@ -147,6 +147,11 @@ pub fn load(path: &Path) -> Result<Session> {
 
 /// Find the most recently modified `.jsonl` session file in `dir`, for
 /// `--continue` (resume the last session). `None` if the dir is empty/absent.
+///
+/// Files holding only a header and no turns are skipped: a session that died
+/// during startup (or one the user opened and immediately quit) has nothing to
+/// resume, and picking it as "the last session" would silently strip the history
+/// the user actually meant to continue.
 pub fn latest(dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     entries
@@ -161,8 +166,21 @@ pub fn latest(dir: &Path) -> Option<PathBuf> {
                 None
             }
         })
+        .filter(|(p, _)| has_turns(p))
         .max_by_key(|(_, m)| *m)
         .map(|(p, _)| p)
+}
+
+/// Does this session file hold at least one turn line beyond the header? Cheap:
+/// stops at the second line rather than parsing the file.
+fn has_turns(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else { return false };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .nth(1)
+        .is_some()
 }
 
 #[cfg(test)]
@@ -258,22 +276,58 @@ mod tests {
         assert_eq!(loaded.messages.len(), turns.len());
     }
 
+    /// Write a session file with a header and, optionally, one turn.
+    fn write_session_file(dir: &Path, name: &str, with_turn: bool) -> PathBuf {
+        let path = dir.join(name);
+        let session = sample_session(dir);
+        let mut store = SessionStore::create(path.clone(), &session).unwrap();
+        if with_turn {
+            store.append_turn(&sample_turns()[0]).unwrap();
+        }
+        path
+    }
+
     #[test]
     fn latest_finds_newest_jsonl() {
         let dir = tempdir().unwrap();
         // No sessions yet.
         assert!(latest(dir.path()).is_none());
 
-        let old = dir.path().join("old.jsonl");
-        std::fs::write(&old, "{\"type\":\"header\",\"id\":\"old\",\"cwd\":\"/\",\"model\":\"m\",\"mode\":\"default\",\"extra_dirs\":[]}").unwrap();
+        write_session_file(dir.path(), "old.jsonl", true);
 
         // Ensure a measurable mtime gap.
         std::thread::sleep(Duration::from_millis(50));
-        let new = dir.path().join("new.jsonl");
-        std::fs::write(&new, "{\"type\":\"header\",\"id\":\"new\",\"cwd\":\"/\",\"model\":\"m\",\"mode\":\"default\",\"extra_dirs\":[]}").unwrap();
+        write_session_file(dir.path(), "new.jsonl", true);
 
         let found = latest(dir.path()).unwrap();
         assert_eq!(found.file_name().unwrap(), "new.jsonl");
+    }
+
+    /// A header-only file is an aborted session — startup failed, or the user
+    /// quit before saying anything. `--continue` must skip it and resume the
+    /// newest session that actually has history, not silently start blank.
+    #[test]
+    fn latest_skips_turnless_orphan_files() {
+        let dir = tempdir().unwrap();
+        write_session_file(dir.path(), "real.jsonl", true);
+
+        std::thread::sleep(Duration::from_millis(50));
+        write_session_file(dir.path(), "orphan.jsonl", false);
+
+        let found = latest(dir.path()).expect("the real session is still found");
+        assert_eq!(
+            found.file_name().unwrap(),
+            "real.jsonl",
+            "the newer header-only orphan must not win"
+        );
+    }
+
+    #[test]
+    fn latest_is_none_when_every_file_is_an_orphan() {
+        let dir = tempdir().unwrap();
+        write_session_file(dir.path(), "a.jsonl", false);
+        write_session_file(dir.path(), "b.jsonl", false);
+        assert!(latest(dir.path()).is_none(), "nothing resumable here");
     }
 
     #[test]

@@ -43,7 +43,7 @@ async fn completes_a_simple_turn() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "test-key".to_string(), "mock".to_string(), Duration::from_secs(600)).unwrap();
+    let client = ChatClient::new(server.uri(), "test-key".to_string(), "mock".to_string(), Some(Duration::from_secs(600))).unwrap();
     let messages = vec![WireMessage::User { content: "say hi".into() }];
     let resp = client.complete(&messages, &CompleteOpts::default()).await.unwrap();
 
@@ -54,19 +54,19 @@ async fn completes_a_simple_turn() {
     assert_eq!(usage.prompt_tokens, 5);
     assert_eq!(usage.cached_tokens(), Some(5));
 
-    // The request body must be canonical: top-level keys sorted (messages,
-    // model, stream — the None optionals are skipped), compact.
+    // The request body is serialized straight to bytes (no Value round-trip),
+    // so keys follow struct declaration order rather than being alphabetized.
+    // What matters for prefix caching is that the bytes are *stable* and
+    // compact, not that they're sorted — see `canonical::to_bytes`.
     let received = server.received_requests().await.expect("requests recorded");
     assert_eq!(received.len(), 1);
     let body = std::str::from_utf8(&received[0].body).unwrap();
     assert!(
-        body.starts_with("{\"messages\":"),
-        "expected canonical key order (messages first), got: {body}"
+        body.starts_with(r#"{"model":"mock","messages":"#),
+        "expected declaration order (model first), got: {body}"
     );
-    assert!(
-        body.contains(r#","model":"mock","stream":false}"#),
-        "expected compact, sorted tail, got: {body}"
-    );
+    assert!(body.ends_with(r#""stream":false}"#), "expected compact tail, got: {body}");
+    assert!(!body.contains("\n") && !body.contains(": "), "expected compact JSON: {body}");
 }
 
 #[tokio::test]
@@ -78,7 +78,7 @@ async fn surfaces_non_2xx_as_status_error() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "test-key".to_string(), "mock".to_string(), Duration::from_secs(600)).unwrap();
+    let client = ChatClient::new(server.uri(), "test-key".to_string(), "mock".to_string(), Some(Duration::from_secs(600))).unwrap();
     let messages = vec![WireMessage::User { content: "hi".into() }];
     let err = client.complete(&messages, &CompleteOpts::default()).await.unwrap_err();
     let s = err.to_string();
@@ -87,7 +87,7 @@ async fn surfaces_non_2xx_as_status_error() {
 
 #[tokio::test]
 async fn rejects_empty_api_key_upfront() {
-    let err = ChatClient::new("http://x".to_string(), String::new(), "m".to_string(), Duration::from_secs(600)).unwrap_err();
+    let err = ChatClient::new("http://x".to_string(), String::new(), "m".to_string(), Some(Duration::from_secs(600))).unwrap_err();
     assert!(err.to_string().contains("API key"));
 }
 
@@ -102,7 +102,7 @@ async fn honors_a_configured_request_timeout() {
 
     // 50 ms timeout; the mock responds after 2 s, so the client must give up fast
     // (proving the configured timeout is honored — it was hardcoded 600 s).
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_millis(50)).unwrap();
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_millis(50))).unwrap();
     let messages = vec![WireMessage::User { content: "hi".into() }];
     let start = std::time::Instant::now();
     let err = client.complete(&messages, &CompleteOpts::default()).await.unwrap_err();
@@ -137,7 +137,7 @@ async fn retries_on_429_then_succeeds() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600))
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600)))
         .unwrap()
         .with_retry(retry_opts(3));
     let resp = client
@@ -158,7 +158,7 @@ async fn gives_up_after_exhausting_retries_on_503() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600))
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600)))
         .unwrap()
         .with_retry(retry_opts(2));
     let err = client
@@ -179,7 +179,7 @@ async fn does_not_retry_non_transient_4xx() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600))
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600)))
         .unwrap()
         .with_retry(retry_opts(3));
     let err = client
@@ -215,7 +215,7 @@ async fn respects_retry_after_header_on_429() {
 
     // base_delay 5 s would dominate if backoff were used; Retry-After: 1 (under
     // the 10 s cap) should win → ~1 s, not ~5 s.
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600))
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600)))
         .unwrap()
         .with_retry(RetryOpts {
             max_retries: 3,

@@ -42,6 +42,10 @@ pub(crate) struct ViewState {
     pub current_text: String,
     pub mode: AgentMode,
     pub last_usage: Option<Usage>,
+    /// M8: size of the last context sent (chars, estimated tokens). Shown in the
+    /// status bar so the operator can watch the context grow — Subconscious Code
+    /// has no window to exceed, which only makes the number more interesting.
+    pub last_context: Option<(usize, usize)>,
     pub busy: bool,
     pub pending_ask: Option<PendingAsk>,
     pub composer: String,
@@ -58,6 +62,7 @@ impl ViewState {
             current_text: String::new(),
             mode: AgentMode::Default,
             last_usage: None,
+            last_context: None,
             busy: false,
             pending_ask: None,
             composer: String::new(),
@@ -114,15 +119,40 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect) {
     let cached = usage.and_then(|u| u.cached_tokens()).unwrap_or(0);
     let cached_str = if cached > 0 { format!(" ({} cached)", cached) } else { String::new() };
     let activity = if state.busy { "working" } else { "idle" };
+    // The context figure is the headline number for this agent, so it gets a
+    // human-scaled rendering rather than a raw char count.
+    let ctx_str = match state.last_context {
+        Some((chars, est)) => format!(" | ctx: {} (~{} tok)", human_bytes(chars), human_count(est)),
+        None => String::new(),
+    };
     let line = format!(
-        " {} | {} | tokens: {}{} | {}",
+        " {} | {} | tokens: {}{}{} | {}",
         state.model_name,
         mode_name(state.mode),
         tokens,
         cached_str,
+        ctx_str,
         activity,
     );
     frame.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), area);
+}
+
+/// Render a char count as B/K/M, so a large context reads at a glance.
+fn human_bytes(n: usize) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{:.1}K", n as f64 / 1_000.0),
+        n => format!("{n}"),
+    }
+}
+
+/// Render a token count as K/M.
+fn human_count(n: usize) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{:.1}K", n as f64 / 1_000.0),
+        n => format!("{n}"),
+    }
 }
 
 fn draw_composer(frame: &mut Frame, state: &ViewState, area: Rect) {
@@ -232,6 +262,32 @@ mod tests {
         assert!(screen.contains("mock-model"), "model name: {screen}");
         assert!(screen.contains("plan"), "mode: {screen}");
         assert!(screen.contains("working"), "busy state: {screen}");
+    }
+
+    /// The context figure is the headline number for this agent, so it has to
+    /// actually reach the status bar — and at a readable scale.
+    #[test]
+    fn status_line_shows_context_size() {
+        let mut state = ViewState::new("m".into());
+        state.last_context = Some((12_071_555, 2_748_220));
+        let screen = rendered(&state);
+        assert!(screen.contains("ctx: 12.1M"), "context chars: {screen}");
+        assert!(screen.contains("2.7M tok"), "estimated tokens: {screen}");
+    }
+
+    /// No context yet (before the first request) means no stale figure shown.
+    #[test]
+    fn status_line_omits_context_before_the_first_request() {
+        let state = ViewState::new("m".into());
+        assert!(!rendered(&state).contains("ctx:"));
+    }
+
+    #[test]
+    fn human_scales_read_at_a_glance() {
+        assert_eq!(human_bytes(999), "999");
+        assert_eq!(human_bytes(12_071_555), "12.1M");
+        assert_eq!(human_bytes(16_384), "16.4K");
+        assert_eq!(human_count(2_748_220), "2.7M");
     }
 
     #[test]

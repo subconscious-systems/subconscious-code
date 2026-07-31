@@ -111,6 +111,11 @@ pub fn preserve_line_endings(old: Option<&str>, new: &str) -> String {
 /// Cap output to `cap` chars: keep the first `head` + last `tail`, noting how
 /// many chars were elided. Returns (was_truncated, body).
 pub fn cap_output(s: &str, cap: usize, head: usize, tail: usize) -> (bool, String) {
+    // `cap == 0` means unlimited — the Subconscious Code default. Checked before
+    // the char count so the common unlimited path doesn't walk the string.
+    if cap == 0 {
+        return (false, s.to_string());
+    }
     let n = s.chars().count();
     if n <= cap {
         return (false, s.to_string());

@@ -69,7 +69,7 @@ async fn debug_request_log_has_body_but_not_the_api_key() {
         server.uri(),
         "secret-key-xyz".into(),
         "mock".into(),
-        std::time::Duration::from_secs(60),
+        Some(std::time::Duration::from_secs(60)),
     )
     .unwrap();
     let messages = vec![WireMessage::User { content: "fingerprint-me".into() }];

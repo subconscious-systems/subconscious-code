@@ -27,6 +27,8 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.1", features = ["fmt", "env-filter"] }
 bytes = "1"
+# Request-body gzip (opt-in): at our body sizes wire time dominates.
+flate2 = "1"
 wiremock = "0.6"
 insta = "1"
 

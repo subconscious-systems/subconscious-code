@@ -32,7 +32,7 @@ async fn streams_text_finish_and_usage() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600)).unwrap();
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600))).unwrap();
     let mut stream = client
         .stream(
             &[WireMessage::User { content: "hi".into() }],
@@ -89,7 +89,7 @@ async fn stream_assembles_tool_call_args_across_fragments() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600)).unwrap();
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600))).unwrap();
     let mut stream = client
         .stream(
             &[WireMessage::User { content: "read it".into() }],
@@ -140,7 +140,7 @@ async fn stream_retries_on_429_then_streams() {
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Duration::from_secs(600))
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600)))
         .unwrap()
         .with_retry(RetryOpts { max_retries: 2, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(5) });
     let mut stream = client

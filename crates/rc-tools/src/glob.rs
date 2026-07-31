@@ -11,7 +11,6 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-const CAP: usize = 1000;
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GlobInput {
@@ -22,13 +21,43 @@ pub struct GlobInput {
     pub path: Option<String>,
 }
 
-#[derive(Default)]
-pub struct Glob;
+pub struct Glob {
+    /// Max paths returned. `0` = every match (the default).
+    cap: usize,
+    /// Built at construction so the advertised cap matches the enforced one.
+    description: String,
+}
+
+impl Default for Glob {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Glob {
+    /// A `Glob` that returns every match.
     pub fn new() -> Self {
-        Self
+        Self::with_cap(0)
     }
+
+    /// A `Glob` bounded to `cap` paths (`0` = unlimited).
+    pub fn with_cap(cap: usize) -> Self {
+        Self { cap, description: glob_description(cap) }
+    }
+}
+
+/// The tool description, with the cap sentence matched to `cap`.
+fn glob_description(cap: usize) -> String {
+    let limit = if cap == 0 {
+        "every match is returned".to_string()
+    } else {
+        format!("capped at {cap}")
+    };
+    format!(
+        "Find files by glob pattern (e.g. `src/**/*.rs`), respecting .gitignore. \
+Results are absolute paths sorted by modification time (newest first), {limit}. \
+`*` matches one path segment; `**` matches across segments."
+    )
 }
 
 #[async_trait]
@@ -38,9 +67,7 @@ impl Tool for Glob {
     }
 
     fn description(&self) -> &str {
-        "Find files by glob pattern (e.g. `src/**/*.rs`), respecting .gitignore. \
-Results are absolute paths sorted by modification time (newest first), capped at 1000. \
-`*` matches one path segment; `**` matches across segments."
+        &self.description
     }
 
     fn schema(&self) -> Value {
@@ -91,14 +118,16 @@ Results are absolute paths sorted by modification time (newest first), capped at
         }
 
         hits.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
-        let truncated = hits.len() > CAP;
+        // `cap == 0` = every match (the default).
+        let keep = if self.cap == 0 { hits.len() } else { self.cap };
+        let truncated = hits.len() > keep;
         let mut content: String = hits
             .iter()
-            .take(CAP)
+            .take(keep)
             .map(|(p, _)| format!("{}\n", p.to_string_lossy()))
             .collect();
         if truncated {
-            content.push_str(&format!("… [{} more matches omitted]\n", hits.len() - CAP));
+            content.push_str(&format!("… [{} more matches omitted]\n", hits.len() - keep));
         }
         Ok(ToolOutcome::Ok { content, truncated, artifacts: Vec::new() })
     }

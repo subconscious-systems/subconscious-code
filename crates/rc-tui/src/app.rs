@@ -111,6 +111,9 @@ impl App {
             AgentEvent::PermissionDecision { .. } => v.pending_ask = None,
             AgentEvent::Iter { .. } => {}
             AgentEvent::Usage(u) => v.last_usage = Some(u),
+            AgentEvent::Context { chars, est_tokens } => {
+                v.last_context = Some((chars, est_tokens))
+            }
             AgentEvent::Outcome(_) => {
                 v.flush_text();
                 v.busy = false;

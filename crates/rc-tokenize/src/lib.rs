@@ -74,6 +74,20 @@ impl Estimator {
         (text.chars().count() as f64 / factor).ceil() as usize
     }
 
+    /// Estimate tokens from a char count that the caller already computed.
+    ///
+    /// The counting-free form of [`Self::estimate`], for the request path: the
+    /// assembled context can be hundreds of megabytes, and walking it a second
+    /// time just to size it is waste. Callers sum char counts as they go and
+    /// pass the total here.
+    pub fn estimate_chars(&self, chars: usize) -> usize {
+        let factor = self.factor();
+        if factor <= 0.0 {
+            return chars.div_ceil(4);
+        }
+        (chars as f64 / factor).ceil() as usize
+    }
+
     /// Estimate the total tokens across an iterator of string slices (the
     /// projected wire messages). Sums per-message estimates; callers pass the
     /// rendered form of each message.

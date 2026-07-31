@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 rc-proto = { path = "../rc-proto" }
+rc-tokenize = { path = "../rc-tokenize" }
 rc-perm = { path = "../rc-perm" }
 serde.workspace = true
 serde_json.workspace = true

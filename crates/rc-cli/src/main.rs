@@ -1,15 +1,28 @@
-//! `rc` — a terminal agent harness speaking OpenAI-compatible chat completions.
+//! `sc` — Subconscious Code: a terminal coding agent speaking OpenAI-compatible
+//! chat completions.
 //!
-//! M1: headless agent loop. `rc -p "what's in <file>"` drives the streaming
-//! loop with the `Read` tool registered, executes the tool call, and prints
-//! the model's final answer. The TUI, more tools, and permissions arrive in
-//! later milestones.
+//! Two entry points: a headless one-shot (`sc -p "<prompt>"`) and the
+//! interactive TUI (bare `sc`). Both drive the same agent loop over the same
+//! tools, permission engine, and context assembler.
+//!
+//! The defining choice: **no context-window limit and no request-size cap.**
+//! Every per-item truncation cap is configurable and ships at `0` (unlimited);
+//! the request body is serialized exactly once into refcounted `Bytes`, so a
+//! retry costs a refcount rather than a re-copy; and the total request timeout
+//! is off by default, so a large upload isn't mistaken for a hung one.
+//!
+//! Known cost, measured: peak RSS runs ~6× the payload (12 MB body → 86.7 MB
+//! peak against a 15.2 MB baseline). That multiple lives in the assembly
+//! pipeline's `Turn`/`WireMessage` clones, not the transport. Budget memory
+//! accordingly for a very large context until those clones are removed.
+
+mod doctor;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use rc_config::Settings;
 use rc_core::agent::{AgentLoop, LoopOutcome};
-use rc_core::model::{ChatModel, Model, NullSink};
+use rc_core::model::{ChatModel, Model};
 use rc_core::registry::ToolRegistry;
 use rc_core::tool::Tool;
 use rc_core::turn::{Session, Turn};
@@ -17,7 +30,7 @@ use rc_core::{
     AskResponse, BypassChecker, ContextAssembler, Mode, NullPrompter, PermissionChecker,
     PermissionEngine, Prompter,
 };
-use rc_ctx::{ContextAssembler as CtxAssembler, Environment};
+use rc_ctx::{Caps as CtxCaps, ContextAssembler as CtxAssembler, Environment};
 use rc_proto::{ChatClient, RetryOpts};
 use rc_tools::{Bash, Edit, Glob, Grep, Read, Write};
 use std::io::{IsTerminal, Write as IoWrite};
@@ -30,12 +43,13 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rc",
+    name = "sc",
     version,
-    about = "A Claude Code–style agent harness (chat completions backend).",
-    long_about = "M4: a headless one-shot (`rc -p \"<prompt>\"`) or the interactive \
-                  TUI (just `rc`). Either way it speaks an OpenAI-compatible chat \
-                  completions backend."
+    about = "Subconscious Code — a terminal coding agent with no context limit.",
+    long_about = "Subconscious Code (`sc`): a headless one-shot (`sc -p \"<prompt>\"`) or \
+                  the interactive TUI (just `sc`). Either way it speaks an \
+                  OpenAI-compatible chat completions backend, with every context cap \
+                  unlimited by default."
 )]
 struct Cli {
     /// One-shot headless mode: run the agent loop for PROMPT and print the answer (§5.8 U14).
@@ -43,11 +57,11 @@ struct Cli {
     print: Option<String>,
 
     /// Override the model for this invocation (§5.6 A9).
-    #[arg(long, env = "RC_MODEL")]
+    #[arg(long, env = "SC_MODEL")]
     model: Option<String>,
 
     /// Override the base URL (§5.6 G3).
-    #[arg(long, env = "RC_BASE_URL")]
+    #[arg(long, env = "SC_BASE_URL")]
     base_url: Option<String>,
 
     /// Dump request/response and emit tracing to stderr (§5.9 O5).
@@ -55,37 +69,51 @@ struct Cli {
     debug: bool,
 
     /// Skip all permission prompts (still hard-denies catastrophic commands).
-    /// Refused in CI without RC_DANGEROUS=1.
+    /// Refused in CI without SC_DANGEROUS=1.
     #[arg(long = "dangerously-skip-permissions")]
     dangerously_skip_permissions: bool,
 
-    /// Resume the most recent session (the newest `~/.rc/sessions/*.jsonl`).
-    /// Replays its turns into the conversation and continues it.
-    #[arg(long, conflicts_with = "resume")]
+    /// Resume the most recent session (the newest `~/.sc/sessions/*.jsonl` that
+    /// has actual history). Replays its turns and continues it.
+    ///
+    /// Spelled `--continue` (the field can't be, since `continue` is a Rust
+    /// keyword); `--continue-last` stays as an alias.
+    #[arg(long = "continue", alias = "continue-last", conflicts_with = "resume")]
     continue_last: bool,
 
     /// Resume a specific session file (an absolute path to a `*.jsonl`).
     #[arg(long, value_name = "PATH")]
     resume: Option<PathBuf>,
 
-    /// Per-response completion-token cap (overrides RC_MAX_TOKENS; 0 = provider default).
+    /// Per-response completion-token cap (overrides SC_MAX_TOKENS; 0 = provider default).
     #[arg(long, value_name = "N")]
     max_tokens: Option<u32>,
 
-    /// Sampling temperature (overrides RC_TEMPERATURE; e.g. 0 for reproducible runs).
+    /// Sampling temperature (overrides SC_TEMPERATURE; e.g. 0 for reproducible runs).
     #[arg(long, value_name = "T")]
     temperature: Option<f32>,
 
     /// M7: confine every approved `Bash` command at the kernel level (Linux:
     /// Landlock + seccomp). Denies writes outside the workspace roots and
-    /// network. Off by default; also settable via RC_SANDBOX=1.
+    /// network. Off by default; also settable via SC_SANDBOX=1.
     #[arg(long)]
     sandbox: bool,
 
     /// M7: allow network under `--sandbox` (otherwise denied). Also via
-    /// RC_SANDBOX_NET=1. Implies --sandbox.
+    /// SC_SANDBOX_NET=1. Implies --sandbox.
     #[arg(long = "sandbox-net")]
     sandbox_net: bool,
+
+    /// Verify the endpoint before trusting it: config, non-streaming, streaming,
+    /// and tool-call support. Exits non-zero if a check fails.
+    #[arg(long)]
+    doctor: bool,
+
+    /// With --doctor, also measure the gateway's maximum request size by
+    /// uploading 1/10/32/100/500 MB bodies until one is refused. That ceiling —
+    /// not this client — is what bounds the context.
+    #[arg(long = "body-ladder", requires = "doctor")]
+    body_ladder: bool,
 }
 
 #[tokio::main]
@@ -116,20 +144,28 @@ async fn run(cli: Cli) -> Result<()> {
 
     tracing::debug!(model = %settings.model, base_url = %settings.base_url, "settings loaded");
 
+    // `sc doctor` runs before the API-key requirement so it can *report* a
+    // missing key as a failed check instead of erroring out with no diagnostics.
+    if cli.doctor {
+        let ok = doctor::run(&settings, cli.body_ladder).await?;
+        if !ok {
+            anyhow::bail!("doctor: one or more checks failed");
+        }
+        return Ok(());
+    }
+
     let api_key = settings
         .api_key
         .clone()
-        .context("no API key: set $RC_API_KEY (or the var named by provider.api_key_env)")?;
+        .context("no API key: set $SC_API_KEY (or the var named by provider.api_key_env)")?;
 
-    // T1: request timeout is configurable (was hardcoded 600s). Clamp 0 → default
-    // to avoid a Duration::ZERO footgun. This is a *total* timeout; on the
-    // streaming path it caps the whole stream, so a small value can cut a stream
+    // T1: the *total* request timeout. `0` means off, which is the default —
+    // a total budget also covers the upload, so on a huge body it can expire
+    // mid-upload and trigger a retry that re-uploads from scratch. Liveness is
+    // enforced by the idle bound below instead, which distinguishes a stalled
+    // stream from a merely large one. When set, a small value can cut a stream
     // mid-tool-call (the loop synthesizes Interrupted results — §4.2).
-    let timeout = Duration::from_millis(if settings.timeout_ms == 0 {
-        600_000
-    } else {
-        settings.timeout_ms
-    });
+    let timeout = (settings.timeout_ms > 0).then(|| Duration::from_millis(settings.timeout_ms));
     // T2: idle bound on the model stream (0 = off). A stall (no chunk for this
     // long) aborts with ProtoError::Idle instead of waiting out the total timeout.
     let idle = if settings.idle_timeout_ms == 0 {
@@ -155,7 +191,7 @@ async fn run(cli: Cli) -> Result<()> {
         .filter(|&n| n > 0);
     let temperature = cli.temperature.or(settings.temperature);
     // M7: opt-in kernel sandbox for Bash (§7.6). CLI flags force-on; env
-    // (RC_SANDBOX / RC_SANDBOX_NET) and the settings file are the base layer.
+    // (SC_SANDBOX / SC_SANDBOX_NET) and the settings file are the base layer.
     let mut sandbox_enabled = settings.sandbox.enabled;
     let mut sandbox_allow_net = settings.sandbox.allow_net;
     if cli.sandbox_net {
@@ -170,23 +206,29 @@ async fn run(cli: Cli) -> Result<()> {
     });
     let client = Arc::new(
         ChatClient::new(settings.base_url.clone(), api_key, settings.model.clone(), timeout)?
-            .with_retry(retry),
+            .with_retry(retry)
+            .with_request_gzip(settings.request_gzip),
     );
     let model = Arc::new(ChatModel::new(client)) as Arc<dyn Model>;
+    // The context caps (§8). Every one ships at 0 = unlimited; a settings file or
+    // SC_* env var dials them back in for a small-context model. Each tool is
+    // told its own cap so the schema it advertises matches what it enforces.
+    let caps = settings.context;
     let tools = Arc::new(ToolRegistry::new(vec![
-        Arc::new(Read::new()) as Arc<dyn Tool>,
+        Arc::new(Read::with_limits(caps.read_default_limit, caps.read_max_line_chars))
+            as Arc<dyn Tool>,
         Arc::new(Write::new()) as Arc<dyn Tool>,
         Arc::new(Edit::new()) as Arc<dyn Tool>,
-        Arc::new(Glob::new()) as Arc<dyn Tool>,
-        Arc::new(Grep::new()) as Arc<dyn Tool>,
-        Arc::new(Bash::new()) as Arc<dyn Tool>,
+        Arc::new(Glob::with_cap(caps.glob_cap)) as Arc<dyn Tool>,
+        Arc::new(Grep::with_cap(caps.grep_output_cap)) as Arc<dyn Tool>,
+        Arc::new(Bash::with_cap(caps.bash_output_cap)) as Arc<dyn Tool>,
     ]));
     // Permission engine (§7): bypass, or the real engine from the settings block.
     let permission: Arc<dyn PermissionChecker> = if cli.dangerously_skip_permissions {
         if std::env::var("CI").as_deref() == Ok("true")
-            && std::env::var("RC_DANGEROUS").as_deref() != Ok("1")
+            && std::env::var("SC_DANGEROUS").as_deref() != Ok("1")
         {
-            anyhow::bail!("refusing --dangerously-skip-permissions in CI (set RC_DANGEROUS=1 to override)");
+            anyhow::bail!("refusing --dangerously-skip-permissions in CI (set SC_DANGEROUS=1 to override)");
         }
         Arc::new(BypassChecker)
     } else {
@@ -247,7 +289,8 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     let agent = AgentLoop::new(model, tools, permission)
-        .with_assembler(build_assembler(&session))
+        .with_assembler(build_assembler(&session, &caps))
+        .with_max_iters(caps.max_iters)
         .with_idle_timeout(idle)
         .with_turn_timeout(turn_timeout)
         .with_max_tokens(max_tokens)
@@ -267,16 +310,22 @@ async fn run(cli: Cli) -> Result<()> {
 /// platform, date, git branch) plus the hierarchical memory files rooted at the
 /// session cwd. Wired into the `AgentLoop` so the model gets a real system
 /// prompt and `@file` mention expansion (M6).
-fn build_assembler(session: &Session) -> Arc<dyn ContextAssembler> {
+fn build_assembler(
+    session: &Session,
+    caps: &rc_config::ContextConfig,
+) -> Arc<dyn ContextAssembler> {
     let env = Environment::from_cwd(&session.cwd);
-    let assembler = CtxAssembler::new(env);
+    let assembler = CtxAssembler::new(env).with_caps(CtxCaps {
+        inline_file: caps.inline_file_cap,
+        tool_result: caps.tool_result_cap,
+    });
     Arc::new(assembler) as Arc<dyn ContextAssembler>
 }
 
-/// `~/.rc/sessions/` — where session JSONL files live. Created on first use.
+/// `~/.sc/sessions/` — where session JSONL files live. Created on first use.
 fn sessions_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.rc/sessions")?;
-    Ok(PathBuf::from(home).join(".rc").join("sessions"))
+    let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.sc/sessions")?;
+    Ok(PathBuf::from(home).join(".sc").join("sessions"))
 }
 
 /// A compact, sortable UTC timestamp (`YYYYmmddTHHMMSS`) for fresh session ids,
@@ -324,12 +373,47 @@ async fn run_headless(
     } else {
         Box::new(NullPrompter)
     };
+    // Records the largest context sent during the run so the summary can report
+    // it — this is the number that matters when scale-testing the endpoint.
+    let sink = HeadlessSink::default();
     let outcome = agent
-        .run(&mut session, prompt, &NullSink, &*prompter, CancellationToken::new())
+        .run(&mut session, prompt, &sink, &*prompter, CancellationToken::new())
         .await
         .context("agent loop failed")?;
     print_result(&session, outcome);
+    sink.print_context();
     Ok(())
+}
+
+/// A headless [`EventSink`] that keeps only the peak context size. The `-p` path
+/// prints no incremental output, but the context figure belongs in the summary:
+/// it's the direct measure of whether an uncapped context actually went out.
+#[derive(Default)]
+struct HeadlessSink {
+    peak_chars: std::sync::atomic::AtomicUsize,
+    peak_tokens: std::sync::atomic::AtomicUsize,
+}
+
+impl rc_core::model::EventSink for HeadlessSink {
+    fn on_context(&self, chars: usize, est_tokens: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.peak_chars.fetch_max(chars, Relaxed);
+        self.peak_tokens.fetch_max(est_tokens, Relaxed);
+    }
+}
+
+impl HeadlessSink {
+    /// Report the peak context to stderr (stdout holds the answer for piping).
+    fn print_context(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let chars = self.peak_chars.load(Relaxed);
+        if chars > 0 {
+            eprintln!(
+                "context: {chars} chars (~{} est. tokens) at peak",
+                self.peak_tokens.load(Relaxed)
+            );
+        }
+    }
 }
 
 /// Interactive TUI: wire the agent loop into the rc-rt runtime and hand it to
@@ -346,9 +430,23 @@ async fn run_tui(
 ) -> Result<()> {
     let cwd = session.cwd.clone();
 
+    // Fail with a useful message instead of crossterm's raw-mode error. Without
+    // this, a piped or non-tty invocation dies with "Device not configured
+    // (os error 6)", which says nothing about what to do next.
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "sc needs a terminal for the interactive TUI.\n\
+             For non-interactive use, run a one-shot: sc -p \"<prompt>\""
+        );
+    }
+
     // Persistence: a fresh session gets a new timestamped file; a resumed
     // session re-opens its existing file in append mode (the header and old
     // turns are already on disk — no rewrite, no risk of losing history).
+    //
+    // Created *after* the terminal check on purpose: creating it first left a
+    // header-only orphan file behind on every failed startup, and `--continue`
+    // would then pick that orphan as the newest session and resume nothing.
     let session_id = session.id.clone();
     let path = sessions_dir.join(format!("{session_id}.jsonl"));
     let store = if session.messages.is_empty() {
