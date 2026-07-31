@@ -13,7 +13,7 @@ use std::collections::HashSet;
 /// environment block, memory chain, skill index) lands in M6 — see
 /// [`rc_ctx::ContextAssembler`], which builds the real system prompt and
 /// calls [`project_with`] with it.
-const SYSTEM_PROMPT: &str = "You are `rc`, an agent that helps with software engineering tasks in \
+const SYSTEM_PROMPT: &str = "You are `sc` (Subconscious Code), an agent that helps with software engineering tasks in \
 the user's repository. Use the provided tools to inspect and edit files. Be concise and direct. \
 When you have enough information, answer in plain text.";
 

@@ -9,11 +9,11 @@
 //! - **`@file` mention expansion**: `@path` tokens in a user turn are inlined
 //!   as fenced file blocks before the turn is projected, so the model sees the
 //!   file's contents without a `Read` round-trip (§8.3).
-//! - **Tool-output truncation** (the microcompaction seam, §8.5): large tool
-//!   result bodies are truncated to a per-result cap with a tail sentinel, so a
-//!   single giant `Read`/`Bash` doesn't blow the window. Full compaction (a
-//!   summary turn that evicts superseded tool results) is a later milestone; this
-//!   is the bounded per-result truncation the crate's own header calls out.
+//! - **Tool-output truncation** (the microcompaction seam, §8.5): a per-result
+//!   cap with a tail sentinel, so one giant `Read`/`Bash` can be bounded for a
+//!   small-context model. **Off by default** ([`Caps::unlimited`]) — Subconscious
+//!   Code sends tool results whole. The seam is where full compaction (a summary
+//!   turn that evicts superseded reads) would attach in a later milestone.
 //!
 //! `Turn` remains the source of truth; this crate only reads it and produces
 //! the wire form for the next request. It never mutates session state.
@@ -200,7 +200,7 @@ fn load_memory(path: &Path, label: &str) -> Option<Memory> {
 }
 
 /// The identity line that opens the §4.6 system prompt.
-const IDENTITY: &str = "You are `rc`, a terminal agent that helps with software engineering \
+const IDENTITY: &str = "You are `sc` (Subconscious Code), a terminal agent that helps with software engineering \
 tasks in the user's repository. Use the provided tools to inspect and edit files. Be concise and \
 direct. When you have enough information, answer in plain text.";
 
@@ -488,7 +488,7 @@ mod tests {
             git_branch: Some("main".into()),
         };
         let prompt = build_system_prompt(&env, &[]);
-        assert!(prompt.contains("You are `rc`"));
+        assert!(prompt.contains("You are `sc` (Subconscious Code)"));
         assert!(prompt.contains("Working directory: /repo"));
         assert!(prompt.contains("Platform: macOS"));
         assert!(prompt.contains("Date: Monday Jul 28, 2026"));

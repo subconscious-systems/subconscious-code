@@ -61,8 +61,15 @@ against the real endpoint** — that's the first thing to do on the Linux box.
 - `crates/rc-cli/src/main.rs` — clap name/about, `~/.sc/sessions`, `~/.sc/bg`
 - `crates/rc-ctx/src/lib.rs` — memory chain is `~/.sc/AGENTS.md` →
   `<cwd>/.sc/AGENTS.md` → `<cwd>/AGENTS.md`
-- `crates/rc-core/src/prompt.rs` — identity is now ``You are `sc` (Subconscious
-  Code)…``
+- Identity is now ``You are `sc` (Subconscious Code)…`` in both places it
+  lives: `crates/rc-ctx/src/lib.rs` (`IDENTITY`, the live assembler path) and
+  `crates/rc-core/src/project.rs` (`SYSTEM_PROMPT`, the legacy no-assembler
+  fallback). Verified on the wire, not just in source.
+- `crates/rc-tools/src/bash.rs` — env hygiene scrubs `SC_API_KEY` and marks
+  child shells with `SC_SESSION=1`. (The key was never actually exposed: the
+  generic `*_API_KEY` sweep already covered it.)
+- Module-header docs in `bash.rs` / `grep.rs` / `glob.rs` / `read.rs` /
+  `rc-ctx` no longer advertise the removed caps.
 - `crates/rc-proto/src/error.rs` — `NoApiKey` names `$SC_API_KEY`
 - `README.md` — rewritten around `sc` and the unlimited-context thesis
 

@@ -1,7 +1,7 @@
 //! The `Grep` tool (§6.5): content search with a Rust regex over the `ignore`
 //! walker. Modes: `content` (matching lines + line numbers, with -A/-B/-C
 //! context), `files_with_matches` (default — just paths), `count`. Binary files
-//! are skipped; output capped at 30k chars.
+//! are skipped; output is unbounded by default (see [`Grep::with_cap`]).
 //!
 //! Uses `regex` + `ignore` (ripgrep's walker) rather than `grep-searcher`/
 //! `grep-regex` — same "no shelling out to rg, no quoting bugs" guarantee (§6.5),

@@ -2,8 +2,9 @@
 //! `cd` *does* persist across calls (M7): after a successful, contained `cd`,
 //! the live working directory in the shared [`ShellState`] is updated, and the
 //! agent loop syncs it into `ctx.cwd`/`session.cwd` for subsequent calls. stdin
-//! is closed so commands don't block on input; output is capped at 30k chars
-//! (head 10k + tail 20k) with ANSI stripped; the exit code leads.
+//! is closed so commands don't block on input; output is returned in full by
+//! default (ANSI stripped, exit code first) — see [`Bash::with_cap`] to bound it
+//! for a small-context model.
 //!
 //! Env hygiene (M7/§6.6): the shell is `bash --noprofile --norc` when available
 //! (no interactive rc), and toolchain bin dirs (nvm/pyenv/conda/`~/.local/bin`)
@@ -314,7 +315,7 @@ impl Bash {
 /// Apply env hygiene (drop secrets, set non-interactive vars) to a tokio
 /// `Command`. `PATH` is set separately by the caller.
 fn apply_env_hygiene(cmd: &mut tokio::process::Command) {
-    cmd.env_remove("RC_API_KEY");
+    cmd.env_remove("SC_API_KEY");
     for (k, _) in std::env::vars() {
         if k.ends_with("_API_KEY") || k.ends_with("_TOKEN") || k.ends_with("_SECRET") {
             cmd.env_remove(&k);
@@ -325,12 +326,12 @@ fn apply_env_hygiene(cmd: &mut tokio::process::Command) {
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .env("CI", "1")
-        .env("RC_SESSION", "1");
+        .env("SC_SESSION", "1");
 }
 
 /// Same env hygiene for a std `Command` (background shells).
 fn apply_env_hygiene_std(cmd: &mut Command) {
-    cmd.env_remove("RC_API_KEY");
+    cmd.env_remove("SC_API_KEY");
     for (k, _) in std::env::vars() {
         if k.ends_with("_API_KEY") || k.ends_with("_TOKEN") || k.ends_with("_SECRET") {
             cmd.env_remove(&k);
@@ -341,7 +342,7 @@ fn apply_env_hygiene_std(cmd: &mut Command) {
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .env("CI", "1")
-        .env("RC_SESSION", "1");
+        .env("SC_SESSION", "1");
 }
 
 /// The `pre_exec` closure type accepted by both `tokio::process::Command` and

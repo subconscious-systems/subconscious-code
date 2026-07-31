@@ -590,7 +590,7 @@ async fn loop_without_assembler_uses_legacy_default_prompt() {
     use rc_proto::WireMessage;
     match req.messages.first() {
         Some(WireMessage::System { content }) => {
-            assert!(content.contains("You are `rc`"), "default prompt: {content}");
+            assert!(content.contains("You are `sc`"), "default prompt: {content}");
             assert!(!content.contains("SENTINEL"), "no custom prompt without an assembler");
         }
         other => panic!("expected a system message, got {other:?}"),

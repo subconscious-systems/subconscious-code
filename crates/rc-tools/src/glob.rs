@@ -1,6 +1,6 @@
 //! The `Glob` tool (§6.4): fast path matching over the `ignore` walker (which
 //! respects `.gitignore`/`.ignore`/hidden rules), sorted by mtime descending,
-//! capped at 1000, absolute paths.
+//! absolute paths. Every match is returned by default; see [`Glob::with_cap`].
 
 use crate::util::{params_schema, resolve_within};
 use async_trait::async_trait;
