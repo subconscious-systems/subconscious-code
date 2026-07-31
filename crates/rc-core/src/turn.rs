@@ -13,11 +13,14 @@ use std::time::{Duration, SystemTime};
 /// A tool call in the domain model. `arguments` is the model's (or repaired)
 /// JSON argument *string*, preserved verbatim so the assistant message re-sent
 /// next turn is byte-identical (§4.6).
+/// `arguments` is `Arc<str>` so cloning a `ToolCall` (which happens for every
+/// re-sent assistant message, §4.6) is a refcount bump, not a deep copy of what
+/// can be a whole-file Write/Edit payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: String,
+    pub arguments: Arc<str>,
 }
 
 /// A conversation turn (§4.1). `Turn` is the source of truth; the wire form is
@@ -27,14 +30,14 @@ pub struct ToolCall {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Turn {
     User {
-        content: String,
+        content: Arc<str>,
         #[serde(with = "epoch_millis", default = "epoch_millis::zero")]
         ts: SystemTime,
     },
     Assistant {
-        text: String,
+        text: Arc<str>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning: Option<String>,
+        reasoning: Option<Arc<str>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,7 +61,7 @@ pub enum Turn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolResultBody {
-    Ok { content: String, truncated: bool },
+    Ok { content: Arc<str>, truncated: bool },
     Error { message: String, retryable: bool },
     Denied { reason: String },
     Interrupted,
@@ -67,15 +70,20 @@ pub enum ToolResultBody {
 impl ToolResultBody {
     /// Render to the `role:tool` message content. Errors/denials are marked so
     /// the model can tell a result from a file's literal contents.
-    pub fn render(&self) -> String {
+    ///
+    /// Returns `Arc<str>` so the common case (an uncapped `Ok` body) shares the
+    /// body's allocation with the session turn and the prepared turn — projecting
+    /// a `ToolResult` into a `WireMessage::Tool` is then a refcount bump, not a
+    /// copy of (potentially) many megabytes.
+    pub fn render(&self) -> Arc<str> {
         match self {
             ToolResultBody::Ok { content, truncated: true } => {
-                format!("{content}\n[output truncated]")
+                Arc::from(format!("{content}\n[output truncated]"))
             }
             ToolResultBody::Ok { content, .. } => content.clone(),
-            ToolResultBody::Error { message, .. } => format!("[tool error: {message}]"),
-            ToolResultBody::Denied { reason } => format!("[denied: {reason}]"),
-            ToolResultBody::Interrupted => "[interrupted by user]".to_string(),
+            ToolResultBody::Error { message, .. } => Arc::from(format!("[tool error: {message}]")),
+            ToolResultBody::Denied { reason } => Arc::from(format!("[denied: {reason}]")),
+            ToolResultBody::Interrupted => Arc::from("[interrupted by user]"),
         }
     }
 
@@ -97,7 +105,7 @@ impl ToolResultBody {
                 let head = &content[..head];
                 let elided = content.len() - head.len();
                 ToolResultBody::Ok {
-                    content: format!("{head}\n[… {elided} bytes truncated]"),
+                    content: Arc::from(format!("{head}\n[… {elided} bytes truncated]")),
                     truncated: true,
                 }
             }
@@ -111,7 +119,7 @@ impl From<crate::tool::ToolOutcome> for ToolResultBody {
         use crate::tool::ToolOutcome;
         match o {
             ToolOutcome::Ok { content, truncated, .. } => {
-                ToolResultBody::Ok { content, truncated }
+                ToolResultBody::Ok { content: Arc::from(content), truncated }
             }
             ToolOutcome::Error { message, retryable } => ToolResultBody::Error { message, retryable },
             ToolOutcome::Denied { reason } => ToolResultBody::Denied { reason },
@@ -235,7 +243,7 @@ mod tests {
         // chars (2 bytes each) over a `cap` must produce a head of at most
         // `cap` bytes — `.chars().take(cap)` would wrongly keep `cap` chars
         // (i.e. 2*cap bytes), blowing the window it's meant to protect.
-        let body = ToolResultBody::Ok { content: "é".repeat(100), truncated: false };
+        let body = ToolResultBody::Ok { content: "é".repeat(100).into(), truncated: false };
         let cap = 50;
         let out = body.truncate_body(cap);
         let ToolResultBody::Ok { content, truncated } = out else { panic!() };

@@ -13,6 +13,7 @@ use rc_proto::{
     WireMessage,
 };
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::{Stream, StreamExt};
 
@@ -152,7 +153,10 @@ async fn consume_stream(
                 reasoning.push_str(&r);
             }
             AgentStreamEvent::ToolCallReady { id, name, arguments } => {
-                let call = ToolCall { id, name, arguments };
+                // `arguments` arrives as an owned `String` from the stream parser;
+                // wrap it once here so every later re-send of this call is a
+                // refcount bump, not a copy.
+                let call = ToolCall { id, name, arguments: Arc::from(arguments) };
                 sink.on_tool_start(&call);
                 tool_calls.push(FinalizedToolCall::Call(call));
             }

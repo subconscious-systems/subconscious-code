@@ -71,7 +71,7 @@ fn resp_with_call(id: &str, name: &str, args: Value) -> ModelResponse {
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
             id: id.to_string(),
             name: name.to_string(),
-            arguments: args.to_string(),
+            arguments: args.to_string().into(),
         })],
         finish_reason: FinishReason::ToolCalls,
         usage: None,
@@ -286,7 +286,7 @@ async fn session_store_persists_turns_after_each_run() {
         "expected 4 persisted turns: {:?}",
         loaded.messages
     );
-    assert!(matches!(&loaded.messages[0], Turn::User { content, .. } if content == "hello"));
+    assert!(matches!(&loaded.messages[0], Turn::User { content, .. } if content.as_ref() == "hello"));
     // The final assistant turn carries the "done" text.
-    assert!(matches!(&loaded.messages[3], Turn::Assistant { text, .. } if text == "done"));
+    assert!(matches!(&loaded.messages[3], Turn::Assistant { text, .. } if text.as_ref() == "done"));
 }

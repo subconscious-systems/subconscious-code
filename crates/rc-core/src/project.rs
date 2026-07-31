@@ -8,6 +8,7 @@ use crate::turn::{NoteKind, Turn};
 use rc_proto::{FunctionCall, WireMessage};
 use rc_proto::ToolCall as WireToolCall;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Minimal system prompt for M1–M5. The full §4.6 system prompt (identity,
 /// environment block, memory chain, skill index) lands in M6 — see
@@ -32,7 +33,7 @@ pub fn project(messages: &[Turn]) -> Vec<WireMessage> {
 /// system prompt (identity + environment + memory chain + skill index) and
 /// hands it here, then the turn projection stays identical to the legacy path.
 pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> {
-    let mut out = vec![WireMessage::System { content: system_prompt.to_string() }];
+    let mut out = vec![WireMessage::System { content: Arc::from(system_prompt) }];
     for turn in messages {
         match turn {
             Turn::User { content, .. } => {
@@ -184,18 +185,61 @@ mod tests {
         let wire = project_with(&turns, "CUSTOM SYSTEM PROMPT");
         assert!(matches!(
             wire.first(),
-            Some(WireMessage::System { content }) if content == "CUSTOM SYSTEM PROMPT"
+            Some(WireMessage::System { content }) if content.as_ref() == "CUSTOM SYSTEM PROMPT"
         ));
         // The rest mirrors the default path's tail (same length, same user msg).
         let default = project(&turns);
         assert_eq!(wire.len(), default.len());
         assert!(matches!(
             &wire[1],
-            WireMessage::User { content: UserContent::Text(t) } if t == "hi"
+            WireMessage::User { content: UserContent::Text(t) } if t.as_ref() == "hi"
         ));
         assert!(matches!(
             &default[1],
-            WireMessage::User { content: UserContent::Text(t) } if t == "hi"
+            WireMessage::User { content: UserContent::Text(t) } if t.as_ref() == "hi"
         ));
+    }
+
+    #[test]
+    fn projection_shares_body_allocations_via_arc() {
+        // The memory optimization: projecting a Turn into a WireMessage (which
+        // happens every request) must be a refcount bump, not a deep copy of
+        // the body. Pin that with `Arc::ptr_eq` across the assembly seam — if any
+        // step drops to `.to_string()` / `.to_owned()`, the pointers diverge and
+        // this fails. `Arc::ptr_eq` is reliable at any size (Arc has no
+        // small-string optimization), so a modest body is enough.
+        let big_body: Arc<str> = Arc::from("x".repeat(4096));
+        let big_text: Arc<str> = Arc::from("y".repeat(4096));
+        let turns = vec![
+            Turn::User { content: big_text.clone(), ts: SystemTime::now() },
+            Turn::ToolResult {
+                call_id: "c1".into(),
+                tool: "X".into(),
+                result: ToolResultBody::Ok { content: big_body.clone(), truncated: false },
+                duration: Default::default(),
+            },
+        ];
+        let wire = project_with(&turns, "sys");
+        // wire[0] = System, wire[1] = User, wire[2] = Tool.
+        match &wire[1] {
+            WireMessage::User { content: UserContent::Text(t) } => {
+                assert!(Arc::ptr_eq(t, &big_text), "user content must share the turn's allocation");
+            }
+            _ => panic!("expected user message at index 1"),
+        }
+        match &wire[2] {
+            WireMessage::Tool { content, .. } => {
+                assert!(Arc::ptr_eq(content, &big_body), "tool body must share the turn's allocation");
+            }
+            _ => panic!("expected tool message at index 2"),
+        }
+        // A second request re-projects the same turns; that must not copy either.
+        let wire2 = project_with(&turns, "sys");
+        match (&wire[2], &wire2[2]) {
+            (WireMessage::Tool { content: a, .. }, WireMessage::Tool { content: b, .. }) => {
+                assert!(Arc::ptr_eq(a, b), "re-projection must not copy the body");
+            }
+            _ => panic!("expected tool messages in both projections"),
+        }
     }
 }

@@ -421,13 +421,9 @@ fn infer_cwd(command: &str, cwd: &Path) -> Option<PathBuf> {
             continue;
         }
         if toks[0] == "cd" || toks[0] == "pushd" {
-            match cd_target(toks) {
-                Some(target) => {
-                    cur = resolve_target(&target, &cur);
-                    changed = true;
-                }
-                None => return None, // untrackable cd → can't be confident
-            }
+            let target = cd_target(toks)?; // untrackable cd → can't be confident
+            cur = resolve_target(&target, &cur);
+            changed = true;
         }
     }
     if changed {

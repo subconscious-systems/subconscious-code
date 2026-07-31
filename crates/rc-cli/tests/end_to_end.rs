@@ -45,7 +45,7 @@ async fn read_tool_runs_through_the_loop() {
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
                 id: "c1".into(),
                 name: "Read".into(),
-                arguments: serde_json::json!({ "file_path": path }).to_string(),
+                arguments: serde_json::json!({ "file_path": path }).to_string().into(),
             })],
             finish_reason: FinishReason::ToolCalls,
             usage: None,

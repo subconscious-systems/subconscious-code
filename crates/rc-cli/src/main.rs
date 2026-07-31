@@ -19,7 +19,7 @@
 mod doctor;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rc_config::Settings;
 use rc_core::agent::{AgentLoop, LoopOutcome};
 use rc_core::model::{ChatModel, Model};
@@ -105,15 +105,25 @@ struct Cli {
     sandbox_net: bool,
 
     /// Verify the endpoint before trusting it: config, non-streaming, streaming,
-    /// and tool-call support. Exits non-zero if a check fails.
-    #[arg(long)]
-    doctor: bool,
+    /// and tool-call support. Exits non-zero if a check fails. Run as
+    /// `sc doctor` (see [`Command::Doctor`).
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-    /// With --doctor, also measure the gateway's maximum request size by
-    /// uploading 1/10/32/100/500 MB bodies until one is refused. That ceiling —
-    /// not this client — is what bounds the context.
-    #[arg(long = "body-ladder", requires = "doctor")]
-    body_ladder: bool,
+/// Optional subcommands. `None` (bare `sc`, or `sc -p "..."`) runs the agent.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Verify the endpoint before trusting it: config, non-streaming, streaming,
+    /// and tool-call support. Exits non-zero if a check fails. Runs before the
+    /// API-key requirement so it can *report* a missing key as a failed check.
+    Doctor {
+        /// Also measure the gateway's maximum request size by uploading
+        /// 1/10/32/100/500 MB bodies until one is refused. That ceiling —
+        /// not this client — is what bounds the context.
+        #[arg(long = "body-ladder")]
+        body_ladder: bool,
+    },
 }
 
 #[tokio::main]
@@ -146,8 +156,8 @@ async fn run(cli: Cli) -> Result<()> {
 
     // `sc doctor` runs before the API-key requirement so it can *report* a
     // missing key as a failed check instead of erroring out with no diagnostics.
-    if cli.doctor {
-        let ok = doctor::run(&settings, cli.body_ladder).await?;
+    if let Some(Command::Doctor { body_ladder }) = cli.command {
+        let ok = doctor::run(&settings, body_ladder).await?;
         if !ok {
             anyhow::bail!("doctor: one or more checks failed");
         }
@@ -328,35 +338,11 @@ fn sessions_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".sc").join("sessions"))
 }
 
-/// A compact, sortable UTC timestamp (`YYYYmmddTHHMMSS`) for fresh session ids,
-/// without pulling in chrono — `--continue` picks the newest file by mtime, so
-/// monotonicity is what matters, not the format.
+/// A fresh session id (timestamp + pid) so each run gets its own session file
+/// and `--continue` can find the newest one unambiguously. The timestamp part
+/// uses the shared `rc_tokenize::time` helper (no chrono).
 fn chrono_like_ts() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs = now % 60;
-    let mins = (now / 60) % 60;
-    let hours = (now / 3600) % 24;
-    let days = now / 86400;
-    // Days since 1970-01-01 -> a proleptic Gregorian Y-M-D (no leap-second fuss).
-    let (y, m, d) = civil_from_days(days as i64);
-    format!("{y:04}{m:02}{d:02}T{hours:02}{mins:02}{secs:02}")
-}
-
-/// Howard Hinnant's days-from-civil inverse: days since 1970-01-01 → (y, m, d).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (y + if m <= 2 { 1 } else { 0 }, m as u32, d as u32)
+    format!("session-{}-{}", rc_tokenize::time::sortable_timestamp(), std::process::id())
 }
 
 /// Headless `-p`: one turn, then print the final assistant text. An interactive

@@ -35,7 +35,7 @@ fn call(id: &str, name: &str, args: serde_json::Value) -> FinalizedToolCall {
     FinalizedToolCall::Call(ToolCall {
         id: id.into(),
         name: name.into(),
-        arguments: args.to_string(),
+        arguments: args.to_string().into(),
     })
 }
 

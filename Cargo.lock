@@ -1433,6 +1433,7 @@ version = "0.1.0"
 dependencies = [
  "rc-core",
  "rc-proto",
+ "rc-tokenize",
  "serde",
  "serde_json",
  "tempfile",

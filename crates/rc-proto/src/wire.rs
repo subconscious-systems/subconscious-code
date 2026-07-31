@@ -13,29 +13,50 @@
 //!     calls.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Deserialize a nullable sequence as its `Default` when the JSON value is
+/// `null`. `#[serde(default)]` alone only covers the *absent*-field case; many
+/// OpenAI-compatible gateways send `"tool_calls": null` in text-only responses
+/// and streaming deltas, which otherwise fails with
+/// "invalid type: null, expected a sequence". Use it with `#[serde(default)]`
+/// so both absent and null collapse to the empty default.
+pub fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 
 /// A single message in the conversation — the wire projection of a `Turn`.
 ///
 /// Field order in this enum is not significant to serialization (`serde` tags
 /// on `role`), but the *conversation order* is rigid (see module docs).
+///
+/// Content fields are `Arc<str>` so projecting a `Turn` into a `WireMessage`
+/// (per request) is a refcount bump, not a deep copy of (potentially) many
+/// megabytes of tool-result or expanded-`@file` content. `Arc<str>` serializes
+/// identically to `String`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum WireMessage {
     System {
-        content: String,
+        content: Arc<str>,
     },
     User {
         content: UserContent,
     },
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<Arc<str>>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         tool_calls: Vec<ToolCall>,
     },
     Tool {
         tool_call_id: String,
-        content: String,
+        content: Arc<str>,
     },
 }
 
@@ -45,19 +66,25 @@ pub enum WireMessage {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum UserContent {
-    Text(String),
+    Text(Arc<str>),
     // Parts(Vec<ContentPart>), // M1+ — image_url blocks for vision.
 }
 
 impl From<String> for UserContent {
     fn from(s: String) -> Self {
+        UserContent::Text(Arc::from(s))
+    }
+}
+
+impl From<Arc<str>> for UserContent {
+    fn from(s: Arc<str>) -> Self {
         UserContent::Text(s)
     }
 }
 
 impl From<&str> for UserContent {
     fn from(s: &str) -> Self {
-        UserContent::Text(s.to_string())
+        UserContent::Text(Arc::from(s))
     }
 }
 
@@ -80,7 +107,7 @@ pub enum ToolCallType {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FunctionCall {
     pub name: String,
-    pub arguments: String,
+    pub arguments: Arc<str>,
 }
 
 /// Chat completions request. `stream: false` for the non-streaming path,
@@ -169,7 +196,7 @@ pub struct ResponseMessage {
     pub role: String,
     pub content: Option<String>,
     /// Present when the assistant requested tool calls. M1 wires the loop.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -255,5 +282,29 @@ mod tests {
         a.add(&b);
         assert_eq!(a.total_tokens, 6);
         assert!(a.prompt_tokens_details.is_none(), "no cached -> details stay None");
+    }
+
+    /// GLM-class gateways send `"tool_calls": null` in text-only responses.
+    /// `#[serde(default)]` only covers the *absent* field; an explicit null must
+    /// collapse to an empty vec, not fail with "invalid type: null, expected a
+    /// sequence" (observed against the real gateway via `sc --doctor`).
+    #[test]
+    fn response_message_tolerates_null_tool_calls() {
+        let with_null: ResponseMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi","tool_calls":null}"#)
+                .expect("null tool_calls must deserialize to empty");
+        assert!(with_null.tool_calls.is_empty(), "null -> empty");
+
+        let without: ResponseMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#)
+                .expect("absent tool_calls must deserialize");
+        assert!(without.tool_calls.is_empty(), "absent -> empty");
+
+        let with_calls: ResponseMessage = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(with_calls.tool_calls.len(), 1, "a real tool call still parses");
     }
 }

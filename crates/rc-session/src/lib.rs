@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(loaded.extra_dirs, vec![PathBuf::from("/tmp/extra")]);
         assert_eq!(loaded.messages.len(), turns.len());
         // Spot-check a couple of turns survive structurally.
-        assert!(matches!(&loaded.messages[0], Turn::User { content, .. } if content == "hello"));
+        assert!(matches!(&loaded.messages[0], Turn::User { content, .. } if content.as_ref() == "hello"));
         assert!(matches!(&loaded.messages[2], Turn::ToolResult { tool, .. } if tool == "Read"));
     }
 
@@ -368,7 +368,7 @@ mod tests {
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.messages.len(), turns.len() + 1);
-        assert!(matches!(loaded.messages.last(), Some(Turn::User { content, .. }) if content == "after resume"));
+        assert!(matches!(loaded.messages.last(), Some(Turn::User { content, .. }) if content.as_ref() == "after resume"));
     }
 
     #[test]

@@ -223,9 +223,11 @@ impl ChatClient {
     /// those bytes.
     ///
     /// This removes serialization as a memory multiplier; it does not make the
-    /// whole request path allocation-free. Measured peak RSS for a 12 MB body is
-    /// ~6× the payload, and what remains is the clone chain in context assembly,
-    /// not this function.
+    /// whole request path allocation-free. The ~6× peak RSS measured for a 12 MB
+    /// body was taken before the `Arc<str>` change to context assembly (which
+    /// made turn→wire projection a refcount bump); the new figure has not been
+    /// re-measured. Either way, what's left is upstream of this function, not
+    /// in it.
     fn encode_body<T: serde::Serialize>(&self, req: &T) -> Result<Bytes, ProtoError> {
         let raw = canonical::to_bytes(req)?;
         if !self.gzip_request {

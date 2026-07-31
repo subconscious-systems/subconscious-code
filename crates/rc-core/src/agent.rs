@@ -96,7 +96,22 @@ pub struct AgentLoop {
     /// the context has grown. Subconscious Code deliberately has no window
     /// threshold for this to trip.
     pub estimator: Estimator,
+    /// Hard per-tool-result backstop (bytes). Distinct from the user-facing
+    /// per-tool caps (which default to unlimited and are a product choice). A
+    /// runaway `Bash`/`Read` can pour gigabytes into the context; `max_iters`
+    /// and the turn timeout are the only other guards. This cap is applied to
+    /// every tool result before it enters the session, head-truncated with a
+    /// sentinel so the model sees it was cut. `0` disables it (truly
+    /// unlimited); the default is [`HARD_TOOL_RESULT_CAP`].
+    pub hard_tool_result_cap: usize,
 }
+
+/// Default hard backstop on a single tool result: 100 MB. The shipped
+/// user-facing caps are unlimited (the product thesis), but a single runaway
+/// command shouldn't be able to push the process toward OOM before
+/// [`AgentLoop::max_iters`] or the turn timeout fires. Set
+/// `hard_tool_result_cap = 0` to disable it entirely.
+pub const HARD_TOOL_RESULT_CAP: usize = 100 * 1024 * 1024;
 
 impl AgentLoop {
     pub fn new(
@@ -116,6 +131,7 @@ impl AgentLoop {
             temperature: None,
             sandbox: None,
             estimator: Estimator::new(),
+            hard_tool_result_cap: HARD_TOOL_RESULT_CAP,
         }
     }
 
@@ -180,6 +196,17 @@ impl AgentLoop {
         self
     }
 
+    /// Hard per-tool-result backstop in bytes (the runaway guard, distinct
+    /// from the user-facing per-tool caps). `0` disables it (truly unlimited).
+    /// The default is [`HARD_TOOL_RESULT_CAP`] (100 MB): large enough to never
+    /// clip a legitimate tool result, small enough to keep a runaway command
+    /// from pushing the process toward OOM. Builder.
+    #[must_use]
+    pub fn with_hard_tool_result_cap(mut self, cap: usize) -> Self {
+        self.hard_tool_result_cap = cap;
+        self
+    }
+
     /// Run a full turn for `user_input`. Mutates `session` (pushes turns).
     pub async fn run(
         &self,
@@ -189,7 +216,7 @@ impl AgentLoop {
         prompter: &dyn Prompter,
         cancel: CancellationToken,
     ) -> Result<LoopOutcome, LoopError> {
-        session.messages.push(Turn::User { content: user_input, ts: SystemTime::now() });
+        session.messages.push(Turn::User { content: Arc::from(user_input), ts: SystemTime::now() });
         let turn_start = SystemTime::now();
 
         // M7: sync the session cwd from the live shell state (a `cd` from the
@@ -262,6 +289,10 @@ impl AgentLoop {
             };
             let ModelResponse { text, reasoning, tool_calls, finish_reason, usage } =
                 self.model.complete(req, sink).await?;
+            // Wrap the response text once; the assistant turn (and any re-sends of
+            // it on later turns) then share this allocation via refcount bumps.
+            let text = Arc::<str>::from(text);
+            let reasoning = reasoning.map(Arc::<str>::from);
             if let Some(u) = &usage {
                 sink.on_usage(u);
                 session.total_usage.add(u);
@@ -285,7 +316,7 @@ impl AgentLoop {
                         assistant_calls.push(ToolCall {
                             id: call_id.clone(),
                             name: tool_name.clone(),
-                            arguments: raw,
+                            arguments: Arc::from(raw),
                         });
                         exec_list.push(ExecItem::ParseError { call_id, tool_name, error });
                     }
@@ -308,7 +339,28 @@ impl AgentLoop {
                     return Ok(LoopOutcome::Stop);
                 }
                 FinishReason::Length => {
-                    tracing::warn!("finish_reason=length; stopping (auto-continue is A13)");
+                    // A13: auto-continue. The model ran out of completion tokens
+                    // mid-answer. If there are no outstanding tool calls, inject a
+                    // "continue" user turn and loop again so the model finishes,
+                    // instead of stopping with a warning and a partial answer. If
+                    // there *are* outstanding tool calls, the stream was cut mid-
+                    // tool-call — synthesize Interrupted results (the invariant
+                    // must hold) and stop, since re-continuing with outstanding
+                    // calls would re-send a malformed assistant message.
+                    if assistant_calls.is_empty() {
+                        session.messages.push(Turn::Assistant { text, reasoning, calls: Vec::new(), usage });
+                        let continued = session.messages.len();
+                        session.messages.push(Turn::User {
+                            content: Arc::from("continue"),
+                            ts: SystemTime::now(),
+                        });
+                        tracing::debug!(len_idx = continued, "finish=length; auto-continuing");
+                        // Re-enter the loop without returning; the next iteration
+                        // assembles the context with the new user turn and the
+                        // partial assistant answer already on it.
+                        continue;
+                    }
+                    tracing::warn!("finish_reason=length with outstanding tool calls; stopping");
                     session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls.clone(), usage });
                     synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Length);
@@ -330,6 +382,16 @@ impl AgentLoop {
             )
             .await;
             for (call_id, tool, result, duration) in results {
+                // Hard runaway backstop: cap any single tool result before it
+                // enters the session. Distinct from the user-facing per-tool
+                // caps (which default to unlimited and are enforced inside
+                // each tool); this is a process-safety floor applied uniformly
+                // to every tool. `0` disables it (truly unlimited).
+                let result = if self.hard_tool_result_cap > 0 {
+                    result.truncate_body(self.hard_tool_result_cap)
+                } else {
+                    result
+                };
                 sink.on_tool_end(&call_id, &tool, &result);
                 session
                     .messages

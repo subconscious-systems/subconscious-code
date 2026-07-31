@@ -22,6 +22,7 @@ use rc_config::Settings;
 use rc_proto::wire::{FunctionDefinition, ToolDefinition, ToolType};
 use rc_proto::{ChatClient, CompleteOpts, ProtoError, WireMessage};
 use serde_json::json;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
@@ -110,12 +111,20 @@ pub async fn run(settings: &Settings, body_ladder: bool) -> Result<bool> {
     if body_ladder {
         println!();
         println!("request-size ceiling");
-        let ceiling = probe_body_ladder(&client).await;
-        for (size, status) in &ceiling {
+        println!();
+        println!("  per-string  (one message — the model server's per-JSON-string limit):");
+        let single = probe_body_ladder(&client).await;
+        for (size, status) in &single {
             println!("{}", status.render(&human(*size)));
         }
         println!();
-        summarize_ceiling(&ceiling);
+        println!("  per-request (payload spread across 256 KB messages — the proxy/total limit):");
+        let chunked = probe_chunked_ladder(&client).await;
+        for (size, status) in &chunked {
+            println!("{}", status.render(&human(*size)));
+        }
+        println!();
+        summarize_ceilings(&single, &chunked);
     } else {
         println!();
         println!("Run with --body-ladder to measure the gateway's maximum request size.");
@@ -301,39 +310,183 @@ async fn probe_body_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
     out
 }
 
-/// Interpret the ladder result, naming the usual culprit for the size found.
-fn summarize_ceiling(results: &[(usize, Status)]) {
-    let largest_ok = results.iter().rev().find(|(_, s)| !s.is_fail()).map(|(n, _)| *n);
-    match largest_ok {
+/// Walk the ladder with the payload spread across many small, alternating
+/// user/assistant messages — each well under the per-string ceiling — to
+/// measure the **total** request ceiling. This is the limit a proxy/gateway
+/// enforces, and the one the unlimited-context thesis actually needs: a small
+/// per-string limit is survivable iff the total can still grow by chunking.
+async fn probe_chunked_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
+    /// Each message stays well under the ~1 MB per-JSON-string limit observed
+    /// on GLM-class servers, so a failure here is about the *total*, not the
+    /// string.
+    const CHUNK: usize = 256 * 1024;
+    let mut out = Vec::new();
+    for &size in LADDER {
+        let n = size.div_ceil(CHUNK);
+        let pad = "x".repeat(CHUNK);
+        let mut msgs = Vec::with_capacity(n);
+        for i in 0..n {
+            if i % 2 == 0 {
+                msgs.push(WireMessage::User { content: pad.clone().into() });
+            } else {
+                msgs.push(WireMessage::Assistant {
+                    content: Some(Arc::from(pad.as_str())),
+                    tool_calls: vec![],
+                });
+            }
+        }
+        let opts = CompleteOpts { max_tokens: Some(16), ..Default::default() };
+        let t = Instant::now();
+        let status = match client.complete(&msgs, &opts).await {
+            Ok(_) => {
+                let secs = t.elapsed().as_secs_f64();
+                let mbps = (size as f64 / (1 << 20) as f64) / secs.max(0.001);
+                Status::Pass(format!("accepted in {secs:.1}s ({mbps:.1} MB/s)"))
+            }
+            Err(e) => Status::Fail(describe(&e)),
+        };
+        let stop = status.is_fail();
+        out.push((size, status));
+        if stop {
+            break;
+        }
+    }
+    out
+}
+
+/// Largest rung the gateway accepted, or `None` if even the first was refused.
+fn largest_accepted(results: &[(usize, Status)]) -> Option<usize> {
+    results.iter().rev().find(|(_, s)| !s.is_fail()).map(|(n, _)| *n)
+}
+
+/// The first rung the gateway rejected, with its byte size and error message —
+/// the message is what distinguishes a token/context-length limit (a model
+/// property) from a byte/payload limit (a proxy property).
+fn first_failure(results: &[(usize, Status)]) -> Option<(usize, &str)> {
+    results.iter().find_map(|(n, s)| match s {
+        Status::Fail(m) => Some((*n, m.as_str())),
+        _ => None,
+    })
+}
+
+/// Does a failure message describe a token / context-length limit rather than a
+/// byte/payload one? GLM-class servers reject with "Request requires an
+/// estimated N tokens, exceeding the selected route's configured context
+/// length" — that's the model's context window, not a proxy cap.
+fn is_token_limit(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("token") && (m.contains("context") || m.contains("length"))
+}
+
+/// The rejected token estimate from a token-limit message, if any. Pulls the
+/// integer preceding "tokens" ("...an estimated 2621465 tokens..."), tolerating
+/// the space between the number and the word.
+fn rejected_token_count(msg: &str) -> Option<u64> {
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find("tokens")?;
+    let before = &msg[..idx];
+    let bytes = before.as_bytes();
+    // Skip whitespace between the number and "tokens" ("2621465 tokens").
+    let mut end = before.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    if start == end {
+        return None;
+    }
+    before[start..end].parse().ok()
+}
+
+/// Interpret both ladders together. The thesis turns on whether the *total*
+/// can exceed the per-string limit by spreading content across messages.
+fn summarize_ceilings(single: &[(usize, Status)], chunked: &[(usize, Status)]) {
+    let per_string = largest_accepted(single);
+    let per_request = largest_accepted(chunked);
+    let fmt = |n: Option<usize>| match n {
+        Some(x) => human(x),
+        None => "rejected at 1 MB".to_string(),
+    };
+    println!("per-string  ceiling: {}  (one message or tool result)", fmt(per_string));
+    // A chunked failure that mentions tokens/context-length is the route's
+    // context window (a token budget), not a byte/payload cap — label it as such
+    // so nobody chases a proxy setting that isn't the constraint.
+    let token_limited = first_failure(chunked)
+        .map(|(_, m)| is_token_limit(m))
+        .unwrap_or(false);
+    if token_limited {
+        println!("per-request ceiling: TOKEN/context-length limit  (the route's context window)");
+    } else {
+        println!("per-request ceiling: {}  (total body, chunked across messages)", fmt(per_request));
+    }
+    println!();
+    match per_request {
+        Some(r) if r >= 32 << 20 => {
+            println!("Total requests clear 32 MB — Claude Code's cap. The per-string limit");
+            println!("({}) only means a single message or tool result must be split; the", fmt(per_string));
+            println!("whole context is bounded by {} at the proxy, not by this client.", human(r));
+        }
+        Some(r) if r > per_string.unwrap_or(0) && token_limited => {
+            // The total can grow past the per-string limit by chunking, but the
+            // route's token context window is the real ceiling — and it's a
+            // model/route property, not a proxy byte limit. Say so plainly.
+            let (rej_bytes, msg) = first_failure(chunked).expect("token_limited implies a failure");
+            let single = human(per_string.unwrap_or(1 << 20));
+            println!("Chunking helps: a chunked total of {} passes where a single {}", human(r), single);
+            println!("{} message is rejected. But the *total* is bounded by the route's", single);
+            println!("configured context length — a TOKEN limit, not a byte/payload limit.");
+            println!("{} was accepted; {} was rejected as \"exceeding the selected", human(r), human(rej_bytes));
+            match rejected_token_count(msg) {
+                Some(t) => {
+                    let passed = (t as f64 * (r as f64 / rej_bytes as f64)) as u64;
+                    println!("route's configured context length\" (~{t} tokens vs ~{passed} for the size");
+                    println!("that passed). The route's context window is the real ceiling:");
+                    println!("between ~{passed} and ~{t} tokens.");
+                }
+                None => println!("route's configured context length\"."),
+            }
+            println!("That's a model/route property — NOT a proxy byte limit, and not");
+            println!("something nginx `client_max_body_size` can raise. To use more context,");
+            println!("the route's context length must be configured higher on the model side.");
+        }
+        Some(r) if r > per_string.unwrap_or(0) => {
+            println!("Chunking helps: total {} exceeds the single-message {}.", human(r), fmt(per_string));
+            println!("Large contexts survive by spreading across messages, but the total is");
+            print_proxy_culprit(r);
+        }
+        Some(r) => {
+            println!("Chunking does NOT help — the total is capped at {} just like a", human(r));
+            println!("single string. The model server itself bounds the context; no");
+            println!("client-side change can lift it.");
+        }
         None => {
-            println!("The gateway rejected even a 1 MB body. Something upstream is capping");
-            println!("requests hard — check the proxy in front of the model server.");
+            println!("Even a 1 MB chunked request was rejected — the path caps total bodies");
+            println!("hard. Check the proxy in front of the model server.");
         }
-        Some(n) if n >= 32 << 20 => {
-            println!("Largest accepted body: {}. That clears Claude Code's 32 MB cap,", human(n));
-            println!("so the client is the only thing that would bound context — and it doesn't.");
-        }
-        // Exactly 10 MB is the AWS API Gateway signature, and it's the one
-        // result that means the goal is unreachable on this route.
-        Some(n) if n == 10 << 20 => {
-            println!("Largest accepted body: 10 MB — exactly AWS API Gateway's payload limit.");
-            println!();
-            println!("That limit cannot be raised. If API Gateway is in the path, a larger");
-            println!("context needs a route that bypasses it (an ALB, or direct-to-origin);");
-            println!("no client-side change can lift it. Note this is *below* Claude Code's");
-            println!("32 MB cap, so on this route we'd be more limited, not less.");
-        }
-        Some(n) if n > 10 << 20 => {
-            println!("Largest accepted body: {}. Past API Gateway's 10 MB ceiling but", human(n));
-            println!("below Claude Code's 32 MB cap — worth finding what imposes this limit.");
-        }
-        Some(n) => {
-            println!("Largest accepted body: {}.", human(n));
-            println!();
-            println!("A ceiling at 1 MB is usually nginx's default `client_max_body_size`,");
-            println!("which can be raised. Whatever sits in front of the model server is");
-            println!("what needs changing — this client imposes no cap of its own.");
-        }
+    }
+}
+
+/// Name the usual culprit for a total-body ceiling, when chunking helps.
+fn print_proxy_culprit(n: usize) {
+    // Exactly 10 MB is the AWS API Gateway signature, and the one result that
+    // means the goal is unreachable on this route.
+    if n == 10 << 20 {
+        println!("capped at 10 MB — exactly AWS API Gateway's payload limit, which");
+        println!("cannot be raised. Bypass API Gateway (an ALB, or direct-to-origin) to");
+        println!("go larger; no client-side change lifts it. Note this is *below*");
+        println!("Claude Code's 32 MB cap, so on this route we'd be more limited.");
+    } else if n >= 32 << 20 {
+        println!("capped at {} — past API Gateway and at/above Claude Code's 32 MB.", human(n));
+    } else if n <= 1 << 20 {
+        println!("capped at {} — usually nginx's default `client_max_body_size`,", human(n));
+        println!("which can be raised. Whatever sits in front of the model server is");
+        println!("what needs changing — this client imposes no cap of its own.");
+    } else {
+        println!("capped at {} — between 1 and 10 MB. Find what imposes this limit;", human(n));
+        println!("it's in the proxy path, not this client.");
     }
 }
 
@@ -345,6 +498,23 @@ fn describe(e: &ProtoError) -> String {
         ProtoError::Status { status, body } => {
             let snippet: String = body.chars().take(160).collect();
             format!("HTTP {status} — {snippet}")
+        }
+        // reqwest's top-level Display ("error decoding response body") hides the
+        // serde detail that actually says what's wrong; walk the source chain so
+        // a parse failure points at the field instead of the transport.
+        ProtoError::Http(http) => {
+            use std::error::Error;
+            let mut full = http.to_string();
+            let mut src: Option<&dyn Error> = http.source();
+            while let Some(s) = src {
+                let msg = s.to_string();
+                if !msg.is_empty() && !full.contains(&msg) {
+                    full.push_str(": ");
+                    full.push_str(&msg);
+                }
+                src = s.source();
+            }
+            full
         }
         other => other.to_string(),
     }
@@ -394,5 +564,41 @@ mod tests {
     fn ladder_covers_api_gateway_and_claude_code_limits() {
         assert!(LADDER.contains(&(10 << 20)), "API Gateway's 10 MB ceiling");
         assert!(LADDER.contains(&(32 << 20)), "Claude Code's 32 MB cap");
+    }
+
+    /// A token/context-length rejection (the route's context window) must be
+    /// distinguished from a byte/payload rejection (a proxy cap) — the two call
+    /// for opposite conclusions, and only the error body tells them apart.
+    #[test]
+    fn token_limit_is_detected_from_error_body() {
+        // Real shape from the GLM route: "Request requires an estimated 2621465
+        // tokens, exceeding the selected route's configured context length".
+        let msg = "HTTP 400 — {\"error\":{\"code\":\"invalid_request\",\"message\":\
+                   \"Request requires an estimated 2621465 tokens, exceeding the \
+                   selected route's configured context length\"}}";
+        assert!(is_token_limit(msg));
+        assert_eq!(rejected_token_count(msg), Some(2_621_465));
+
+        // A proxy/payload rejection is NOT a token limit.
+        let proxy = "HTTP 413 — <html>Request Entity Too Large</html>";
+        assert!(!is_token_limit(proxy));
+        assert_eq!(rejected_token_count(proxy), None);
+
+        // The per-JSON-string limit is a byte limit, not a token one.
+        let per_string = "HTTP 400 — {\"message\":\"JSON string must not exceed 1048576 bytes\"}";
+        assert!(!is_token_limit(per_string));
+    }
+
+    /// `first_failure` returns the smallest rejected rung, not any later one.
+    #[test]
+    fn first_failure_picks_the_smallest_rejected_rung() {
+        let ladder = vec![
+            (1 << 20, Status::Pass("ok".into())),
+            (10 << 20, Status::Fail("HTTP 400 — too big".into())),
+            (32 << 20, Status::Fail("HTTP 400 — also too big".into())),
+        ];
+        assert_eq!(first_failure(&ladder), Some((10 << 20, "HTTP 400 — too big")));
+        // Largest accepted skips the failures and finds the rung before them.
+        assert_eq!(largest_accepted(&ladder), Some(1 << 20));
     }
 }

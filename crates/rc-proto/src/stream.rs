@@ -54,7 +54,7 @@ pub struct Delta {
     pub reasoning_content: Option<String>,
     #[serde(default)]
     pub reasoning: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::wire::null_to_default")]
     pub tool_calls: Vec<ToolCallDelta>,
 }
 
@@ -502,6 +502,30 @@ impl StreamFuser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A streaming delta that sends `"tool_calls": null` (GLM-class gateways do
+    /// this on text/content chunks) must deserialize to an empty vec, not fail
+    /// with "invalid type: null, expected a sequence" — observed against the
+    /// real gateway, where it killed tool-calling entirely (`sc --doctor`).
+    #[test]
+    fn delta_tolerates_null_tool_calls() {
+        let chunk: ChatCompletionChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi","tool_calls":null}}]}"#,
+        )
+        .expect("null tool_calls must deserialize to empty");
+        assert!(chunk.choices[0].delta.tool_calls.is_empty(), "null -> empty");
+
+        let no_field: ChatCompletionChunk =
+            serde_json::from_str(r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#).unwrap();
+        assert!(no_field.choices[0].delta.tool_calls.is_empty(), "absent -> empty");
+
+        let with_call: ChatCompletionChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"c1","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(with_call.choices[0].delta.tool_calls.len(), 1, "a real call still parses");
+    }
 
     struct XorShift(u64);
     impl XorShift {

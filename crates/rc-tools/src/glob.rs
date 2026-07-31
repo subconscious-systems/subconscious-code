@@ -117,7 +117,7 @@ impl Tool for Glob {
             }
         }
 
-        hits.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+        hits.sort_by_key(|b| std::cmp::Reverse(b.1)); // newest first
         // `cap == 0` = every match (the default).
         let keep = if self.cap == 0 { hits.len() } else { self.cap };
         let truncated = hits.len() > keep;

@@ -12,7 +12,7 @@ license = "MIT OR Apache-2.0"
 # so versions stay in lockstep and the dependency direction in §1 is enforced
 # by what each crate is allowed to pull in.
 [workspace.dependencies]
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # M0: rt + macros. M1: sync (semaphore). M2: process + io-util + time (Bash).
