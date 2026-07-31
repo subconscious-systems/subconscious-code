@@ -54,7 +54,7 @@ pub fn prepare(roots: &[PathBuf], allow_net: bool) -> io::Result<Prepared> {
 }
 
 fn ioerr(e: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// Build and populate a Landlock ruleset: deny all FS access by default; allow
@@ -104,7 +104,7 @@ fn build_landlock_inner(roots: &[PathBuf]) -> io::Result<OwnedFd> {
     // by the forked child.
     let created_fd: Option<OwnedFd> = created.into();
     let Some(ruleset) = created_fd else {
-        return Err(io::Error::new(io::ErrorKind::Other, "landlock: ruleset has no fd"));
+        return Err(io::Error::other("landlock: ruleset has no fd"));
     };
     let raw = ruleset.as_raw_fd();
     let dup = unsafe { libc::dup(raw) };
@@ -162,6 +162,8 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 
 /// Map a network syscall name to its per-arch `libc::SYS_*` number.
 fn sysno(name: &str) -> Option<i64> {
+    // `libc::SYS_*` are `c_long` (= i64 on 64-bit Linux, the only target this
+    // file compiles for), so no cast is needed.
     Some(match name {
         "socket" => libc::SYS_socket,
         "socketpair" => libc::SYS_socketpair,
@@ -179,7 +181,7 @@ fn sysno(name: &str) -> Option<i64> {
         "getpeername" => libc::SYS_getpeername,
         "getsockname" => libc::SYS_getsockname,
         _ => return None,
-    } as i64)
+    })
 }
 
 /// Build the `pre_exec` closure (child-side, syscalls only) and the parent-side
@@ -204,6 +206,14 @@ pub fn install(
         // allocation. `fd` is a raw i32 captured by value; `bpf` is an owned Vec
         // moved in (reading it does not allocate).
         unsafe {
+            // NO_NEW_PRIVS must be set BEFORE both `landlock_restrict_self` and
+            // `seccomp(SECCOMP_SET_MODE_FILTER)`: each requires it (or
+            // CAP_SYS_ADMIN, which an unprivileged caller doesn't have) and
+            // returns EPERM otherwise. It also survives exec, so the filter
+            // and Landlock domain stick to the exec'd shell.
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
             if let Some(fd) = fd {
                 // Apply the Landlock domain to this process (inherited by the
                 // exec'd shell). 0 = no flags.
@@ -213,12 +223,6 @@ pub fn install(
                 libc::close(fd);
             }
             if let Some(bpf) = bpf.as_ref() {
-                // NO_NEW_PRIVS is required so an unprivileged exec'd process
-                // can't shed the filter via setuid, and so the filter survives
-                // exec into the shell.
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
                 let prog = libc::sock_fprog {
                     len: bpf.len() as u16,
                     filter: bpf.as_ptr() as *mut libc::sock_filter,
@@ -254,6 +258,11 @@ mod linux_tests {
         let prepared = sandbox.prepare().expect("prepare");
         let (pre_exec, _guard) = prepared.install();
         let mut cmd = Command::new("/bin/sh");
+        // Run inside the first root so relative paths in the test command resolve
+        // beneath an allowed Landlock root, not the test process's cwd.
+        if let Some(root) = roots.first() {
+            cmd.current_dir(root);
+        }
         cmd.arg("-c").arg(shell_cmd);
         unsafe {
             use std::os::unix::process::CommandExt;
@@ -287,7 +296,11 @@ mod linux_tests {
     #[test]
     fn write_outside_root_is_denied() {
         let dir = tempdir().unwrap();
-        let outside = tempdir().unwrap();
+        // The "outside" dir must NOT live under `/tmp`: `Sandbox::new` always
+        // adds `/tmp` as a writable root, so a tempdir() there is still inside
+        // the sandbox. Put it under `$HOME`, which is never an allowed root.
+        let home = std::env::var_os("HOME").expect("$HOME set");
+        let outside = tempfile::tempdir_in(&home).expect("tempdir in $HOME");
         let target = outside.path().join("escaped.txt");
         let out = sandbox_cmd(
             &[dir.path().to_path_buf()],
@@ -295,7 +308,12 @@ mod linux_tests {
             &format!("echo x > {}", target.display()),
         );
         // Landlock denies open(O_WRONLY) → the shell command fails.
-        assert!(!out.status.success(), "write outside root unexpectedly succeeded");
+        assert!(
+            !out.status.success(),
+            "write outside root unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
         assert!(!target.exists(), "file escaped the sandbox");
     }
 
