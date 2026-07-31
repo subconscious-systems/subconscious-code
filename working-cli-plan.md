@@ -1,9 +1,9 @@
 # `sc` — Subconscious Code: working-CLI plan
 
 **Status: implemented.** Every code phase below is done, committed, and green
-(242 tests, clippy clean at `-D warnings`). What remains is what only you can do:
+(243 tests, clippy clean at `-D warnings`). What remains is what only you can do:
 run it against the real gateway on the Linux box. Phase 0 and Phase 5 are the
-live-verification steps, and `sc doctor` now automates most of Phase 0.
+live-verification steps, and `sc --doctor` now automates most of Phase 0.
 
 ## 0. Product identity — done
 
@@ -22,17 +22,17 @@ Crate names stay `rc-*` (Phase 6 — cosmetic, deliberately not done).
 
 ---
 
-## Phase 0 — Provider bring-up → run `sc doctor` on the box
+## Phase 0 — Provider bring-up → run `sc --doctor` on the box
 
 This is now one command instead of four curl invocations:
 
 ```sh
 export SC_API_KEY=...
-sc doctor                 # config + non-streaming + streaming + tool calling
-sc doctor --body-ladder   # also measures the maximum request size
+sc --doctor                 # config + non-streaming + streaming + tool calling
+sc --doctor --body-ladder   # also measures the maximum request size
 ```
 
-`sc doctor` reports:
+`sc --doctor` reports:
 
 - the fully resolved config, with every cap spelled out (a silent 16 KB
   tool-result cap is exactly what this is meant to catch);
@@ -160,12 +160,27 @@ A 12 MB tool result, end-to-end through the real binary:
 
 So the earlier "~1× peak memory" framing was wrong, and the code comments and
 README have been corrected. Serialization is now one copy of that total instead
-of four; the remaining multiple is the clone chain in context assembly
+of four; the remaining multiple was the clone chain in context assembly
 (`prepare_turns` clones the turn list → `project_with` clones into
-`WireMessage` → `to_bytes`). Removing those needs `Arc<str>`/borrowed bodies
-through the assembly path, which is the next real optimization and is not in
-this plan's scope. **At ~6×, a 500 MB context wants ~3 GB of RAM — size the
-Linux box accordingly.**
+`WireMessage` → `to_bytes`).
+
+**That clone chain is now gone.** The large string fields — `Turn::User.content`,
+`Turn::Assistant.text`/`reasoning`, `ToolCall.arguments`, `ToolResultBody::Ok.content`,
+and the matching `WireMessage`/`UserContent`/`FunctionCall` fields — are `Arc<str>`.
+The response text and tool-call arguments are wrapped in `Arc` once at the source
+(agent loop / stream consumer); projecting a `Turn` into a `WireMessage` (per
+request) and re-projecting the same turns on a later request are refcount bumps,
+not deep copies. The one remaining copy is the single `to_bytes` serialization
+into the request buffer, which is inherent. Pinned by
+`projection_shares_body_allocations_via_arc` (`rc-core`): `Arc::ptr_eq` holds from
+the session turn through both projections — a regression to `.to_string()`
+anywhere on the path makes it fail.
+
+The **~6× measured multiple was taken before this change** and has not been
+re-measured (it needs the Linux box and a real ≥12 MB body). Expect it to drop
+— the assembly clones were the bulk of the multiple — but the new number is
+yours to record with `sc --doctor --body-ladder` and a scale run. Until then,
+size the box to the old figure.
 
 ### Also done
 
@@ -188,7 +203,7 @@ Linux box accordingly.**
 
 ### The gateway ceiling — still yours to measure
 
-`sc doctor --body-ladder` does this in one command. The interpretation is baked
+`sc --doctor --body-ladder` does this in one command. The interpretation is baked
 in, including the case that would sink the whole thesis:
 
 - **exactly 10 MB** → AWS API Gateway's payload limit, which *cannot be raised*.
@@ -218,7 +233,7 @@ in, including the case that would sink the whole thesis:
 
 Done here:
 
-- `cargo test --workspace` — **242 passed, 0 failed**
+- `cargo test --workspace` — **243 passed, 0 failed**
 - `cargo clippy --workspace --all-targets` — zero warnings
 - **Linux type-check.** All OS-gated code lives in `rc-sandbox`, and it
   type-checks for Linux including its Linux-only tests:
@@ -228,27 +243,75 @@ Done here:
   OS-gated. This matters because `linux.rs` had never been compiled before.
 - **End-to-end against a fake gateway**: streaming, fragmented tool-call
   reassembly, tool execution, second turn, final answer, usage metering, a
-  12 MB uncapped tool result on the wire, and `sc doctor` including the ladder.
+  12 MB uncapped tool result on the wire, and `sc --doctor` including the ladder.
 - **New regression tests**: uncapped tool results reach the wire
   (`rc-core/tests/agent_loop.rs`), caps default to unlimited and round-trip from
   JSON (`rc-config`, `rc-ctx`), `Read` returns whole files, `to_bytes` stability
   and BTreeMap ordering (`rc-proto`), `latest` skips orphans (`rc-session`),
-  context size renders in the status bar (`rc-tui`).
+  context size renders in the status bar (`rc-tui`), and `Arc<str>` sharing
+  through the assembly path (`projection_shares_body_allocations_via_arc` in
+  `rc-core`).
 
-Left for the Linux box:
+Also verified end-to-end against the fake gateway: `Write` creates files and
+`Bash` executes (`exit: 0 / hello-from-bash`) once granted, a project-level
+`./.sc/settings.json` is picked up, and the generated tool descriptions correctly
+advertise "the whole file" / "no size limit" when caps are off.
 
-1. `sc doctor` and `sc doctor --body-ladder` against the real gateway.
-2. `sc -p "..."` — a real one-shot against `gw-glm-5.2`.
-3. **The interactive TUI in a real terminal.** Still unverified: driving it
-   through a `script`-allocated pty with file-fed stdin didn't deliver
-   keystrokes, so the composer, streaming render, permission prompt,
-   `Shift+Tab`, `@file` completion, `/rewind`, and `--continue` all need human
-   eyes at least once.
-4. **The scale test.** Read several MB of real files into a session and record
-   (a) peak RSS vs context size — expect ~6×, (b) time-to-first-token vs body
-   size, (c) behavior at the gateway ceiling. Those numbers are the demo.
-5. **Sandbox on Linux** — `sc --sandbox` exercises Landlock+seccomp for the first
-   time on real kernels. It type-checks; it has never run.
+One behaviour to know before testing: **headless runs fail closed.** With no TTY
+there is nobody to answer an Ask, so `sc -p "fix X"` denies every `Write`/`Edit`/
+`Bash` and the model just gets denied tool results. Grant rules in
+`./.sc/settings.json` (`"allow": ["Write", "Edit", "Bash(cargo:*)"]`) or pass
+`--dangerously-skip-permissions`. The TUI asks interactively, so it is unaffected.
+
+### Verified on the box (2026-07-31, spark-39f8, real Linux kernel)
+
+Driven through `tmux send-keys` against a local fake chat-completions SSE
+gateway (Python, proper chunked framing) — `script`-fed pty stdin was the wrong
+tool; `tmux` delivers keystrokes reliably:
+
+- **Interactive TUI, end to end.** Launches and renders in a real pty;
+  keystrokes land; composer submits on Enter; **streaming response renders**
+  live; **tool call** (`-> Bash …`) + **permission prompt** (`[y]once [s]ession
+  [a]lways [n]o`) + grant + **tool result** (`<- Bash: exit: 0 …`) + **second
+  turn** final answer; usage metering and the **context estimator** both render
+  in the status bar (`ctx: 598 (~150 tok)`).
+- **Slash commands** (`/help`, `/clear`, `/mode`, `/rewind`) execute — but note
+  the wart: `refresh_menu` reopens the menu on an exact match, so a single Enter
+  re-accepts instead of submitting; the user must press `Esc` then `Enter`.
+- **`@file` completion** popup and **`Shift+Tab`** mode cycle
+  (default → acceptEdits → plan → bypassPermissions) both work.
+- **Session persistence + `--continue`**: a TUI session is written to
+  `~/.sc/sessions/*.jsonl`; `sc --continue --debug -p …` loads the full prior
+  conversation (user → tool call → tool result → assistant) into the assembled
+  context. (A headless `-p` run is deliberately ephemeral — no session is
+  written, so `--continue` after `-p` correctly finds nothing.)
+- **`--sandbox` on a real kernel.** `sc --sandbox --dangerously-skip-permissions
+  -p …` ran: Landlock+seccomp initialized, the process survived, outbound HTTP
+  to the gateway worked, and the `Bash` tool actually `fork`/`execve`'d under
+  the filter (`exit: 0 / hello-from-bash`). This was risk #5 ("never run").
+- **Headless one-shot** end to end against the fake gateway: streaming,
+  metering, peak-context line.
+
+Bugs found and fixed while testing on the box:
+
+- **Sandbox `NO_NEW_PRIVS` ordering.** It was set *between* `landlock_restrict_self`
+  and `seccomp`, so `landlock_restrict_self` returned `EPERM` on an unprivileged
+  caller — the sandbox was completely non-functional (every install path
+  failed). Moved to *before* both (`crates/rc-sandbox/src/linux.rs`). The
+  runtime test above is the first time this code has ever run.
+- **TUI header said `rc`, not `sc`.** The status-line banner still showed the
+  old binary name; fixed (`crates/rc-tui/src/app.rs`).
+
+Still needs the real gateway (`SC_API_KEY`) — cannot be done from macOS and
+not yet done on the box:
+
+1. `sc --doctor` and `sc --doctor --body-ladder` against the real endpoint — the
+   make-or-break body-ceiling measurement.
+2. `sc -p "…"` — a real one-shot against `gw-glm-5.2`.
+3. **The scale test.** Read several MB of real files into a session and record
+   (a) peak RSS vs context size — **the `Arc<str>` change should bring the old
+   ~6× multiple down; re-measure it**, (b) time-to-first-token vs body size,
+   (c) behavior at the gateway ceiling. Those numbers are the demo.
 
 ---
 
@@ -264,7 +327,7 @@ names still say `rc`. Worth one mechanical commit later.
 
 1. **Small model.** `small_model` defaults to `gw-glm-5.2` (same as the main
    model) since no separate small model was specified. Nothing reads it yet.
-2. **Gateway body ceiling** — `sc doctor --body-ladder` answers this in a minute.
+2. **Gateway body ceiling** — `sc --doctor --body-ladder` answers this in a minute.
    It's the one result that could invalidate the thesis on this route.
 3. **`stream_options.include_usage`** — doctor warns if unsupported; only
    metering and estimator calibration degrade.
@@ -278,8 +341,11 @@ names still say `rc`. Worth one mechanical commit later.
 
 - **Highest: the gateway is AWS API Gateway.** Its 10 MB payload limit cannot be
   raised, and that would cap us *below* Claude Code's 32 MB. Measure first.
-- **Memory at ~6× the payload.** Fine at 12 MB, ~3 GB at 500 MB. The assembly
-  clones are the next optimization; until then, RAM is the practical ceiling.
+- **Memory at ~6× the payload (pre-`Arc` measurement).** Fine at 12 MB, ~3 GB at
+  500 MB. The assembly clone chain is now eliminated (`Arc<str>` through the
+  path; see Phase 3), so the real multiple should be lower — but it has not been
+  re-measured. RAM is still the practical ceiling until you record the new
+  figure on the Linux box.
 - **Unlimited output is genuinely unlimited.** A runaway `Bash` can pour
   gigabytes into the context. `max_iters` (1000) and the turn timeout are the
   remaining backstops — keep them on.
@@ -293,7 +359,7 @@ git clone <repo> && cd subconscious-code
 cargo install --path crates/rc-cli
 export SC_API_KEY=...
 
-sc doctor --body-ladder      # verify the endpoint and find the real ceiling
+sc --doctor --body-ladder      # verify the endpoint and find the real ceiling
 sc -p "summarize src/"       # headless smoke test
 sc                           # the TUI
 ```

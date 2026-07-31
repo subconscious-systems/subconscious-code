@@ -14,7 +14,7 @@ thing.
 ```sh
 cargo install --path crates/rc-cli    # puts `sc` on your PATH
 export SC_API_KEY=...                 # your gateway key
-sc doctor                             # verify the endpoint before trusting it
+sc --doctor                             # verify the endpoint before trusting it
 ```
 
 Defaults point at `https://awsgateway.orangelinelabs.com/v1` with model
@@ -27,13 +27,32 @@ with `SC_BASE_URL` / `SC_MODEL`, or persistently in `~/.sc/settings.json`.
 sc                       # interactive TUI
 sc --continue            # resume the most recent session
 sc -p "explain src/"     # headless one-shot, prints the answer to stdout
-sc doctor --body-ladder  # measure the gateway's real maximum request size
+sc --doctor --body-ladder  # measure the gateway's real maximum request size
 ```
 
 In the TUI: `Shift+Tab` cycles permission mode, `Esc` cancels a turn, `Ctrl+C`
 quits, `@` completes file paths, `/` completes commands (`/clear`, `/help`,
 `/mode`, `/rewind`). The status bar shows the model, mode, token usage, and the
 current context size.
+
+## Permissions
+
+`Read`/`Glob`/`Grep` run freely. `Write`/`Edit`/`Bash` escalate to an Ask, which
+the TUI answers inline (`y` once / `s` session / `a` always / `n` no).
+
+**Headless runs fail closed.** With no TTY there's nobody to ask, so a `-p` run
+*denies* every write and command — the model gets a denied tool result and
+carries on. That's deliberate, but it means `sc -p "fix the bug"` won't modify
+anything until you either grant rules or bypass:
+
+```json
+// ./.sc/settings.json — grant what this project needs
+{ "permissions": { "allow": ["Write", "Edit", "Bash(cargo:*)", "Bash(git:*)"] } }
+```
+
+Or `sc -p "..." --dangerously-skip-permissions` (still hard-denies catastrophic
+commands; refuses to run in CI without `SC_DANGEROUS=1`). `Shift+Tab` in the TUI
+cycles default → acceptEdits → plan → bypassPermissions.
 
 ## What "no limit" means concretely
 
@@ -81,9 +100,12 @@ before the request left the process.
 
 Honest numbers, measured end-to-end with a 12 MB tool result: **86.7 MB peak RSS
 against a 15.2 MB baseline — about 6× the payload.** Serialization is one copy of
-that now; the rest is `Turn`/`WireMessage` cloning in the assembly pipeline
-(`prepare_turns` → `project_with`), which is the next thing to fix. Budget
-memory accordingly before pushing to hundreds of megabytes.
+that now, and the `Turn`/`WireMessage` cloning in the assembly pipeline
+(`prepare_turns` → `project_with`) is gone — the large string fields are
+`Arc<str>`, so projecting a turn into a wire message is a refcount bump, not a
+copy (pinned by `projection_shares_body_allocations_via_arc`). The 6× figure was
+taken *before* that change and hasn't been re-measured, so expect lower but
+budget to the old number until you measure on the box.
 
 Other size-related choices:
 
@@ -98,7 +120,7 @@ Other size-related choices:
   confirmed to honor `Content-Encoding` — a server that ignores it will try to
   parse compressed bytes as JSON. JSON-wrapped source compresses 5-10×.
 
-**The client is not the binding constraint — the gateway is.** `sc doctor
+**The client is not the binding constraint — the gateway is.** `sc --doctor
 --body-ladder` uploads 1 / 10 / 32 / 100 / 500 MB bodies until one is refused
 and names the likely culprit. A ceiling at exactly 10 MB is AWS API Gateway,
 whose payload limit cannot be raised; 1 MB is usually nginx's default
@@ -135,7 +157,7 @@ Memory files load hierarchically, lowest precedence first: `~/.sc/AGENTS.md` →
 
 ```sh
 cargo build --workspace
-cargo test  --workspace          # 242 tests
+cargo test  --workspace          # 243 tests
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -149,5 +171,5 @@ cargo check -p rc-sandbox --target x86_64-unknown-linux-gnu --all-targets
 Milestones: chat completions (M0), streaming + tool loop (M1), core tools (M2),
 permissions (M3), TUI (M4), session persistence (M5), context assembly (M6),
 background shells + sandbox + rewind (M7), and the unlimited-context/request
-track plus `sc doctor` (M8). Still ahead: MCP, hooks, skills, and full
+track plus `sc --doctor` (M8). Still ahead: MCP, hooks, skills, and full
 compaction — see `working-cli-plan.md`.
