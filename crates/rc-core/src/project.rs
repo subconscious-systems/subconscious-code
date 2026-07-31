@@ -5,10 +5,23 @@
 //! model switches (§4.1). Never store wire messages as state.
 
 use crate::turn::{NoteKind, Turn};
-use rc_proto::{FunctionCall, WireMessage};
+use rc_proto::{FunctionCall, UserContent, WireMessage};
 use rc_proto::ToolCall as WireToolCall;
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// The largest a single message's `content` may be, in *escaped* bytes.
+/// GLM-class gateways reject any one message whose serialized `content`
+/// exceeds ~1 MB — `400 "messages[N].content must not exceed 1048576 serialized
+/// bytes"` — a per-**message** limit, not a per-string or total-body one (see
+/// `sc doctor --body-ladder`). A large user paste or tool result is therefore
+/// split into multiple messages, each under this cap (1 MB is 1_048_576); the
+/// gateway accepts consecutive user messages and multiple `role:tool` messages
+/// sharing one `tool_call_id` (both verified against the real gateway), and the
+/// model reads the chunks as one input. The total is still bounded by the
+/// route's token context window, which is a model property — no client change
+/// lifts it.
+const MAX_STRING_ESCAPED: usize = 1_000_000;
 
 /// Minimal system prompt for M1–M5. The full §4.6 system prompt (identity,
 /// environment block, memory chain, skill index) lands in M6 — see
@@ -36,9 +49,7 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
     let mut out = vec![WireMessage::System { content: Arc::from(system_prompt) }];
     for turn in messages {
         match turn {
-            Turn::User { content, .. } => {
-                out.push(WireMessage::User { content: content.clone().into() })
-            }
+            Turn::User { content, .. } => push_user(&mut out, content),
             Turn::Assistant { text, calls, .. } => {
                 let tool_calls: Vec<WireToolCall> = calls
                     .iter()
@@ -55,25 +66,109 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
                 } else {
                     Some(text.clone())
                 };
+                // NOTE: a single assistant turn with >1 MB of text is not chunked
+                // here — splitting one assistant message would duplicate its
+                // tool_calls or reorder the turn. Such a turn is rare (it needs
+                // ~250k+ output tokens in one go); if it ever bites, chunking it
+                // needs a dedicated strategy, not the user/tool split below.
                 out.push(WireMessage::Assistant { content, tool_calls });
             }
             Turn::ToolResult { call_id, result, .. } => {
-                out.push(WireMessage::Tool {
-                    tool_call_id: call_id.clone(),
-                    content: result.render(),
-                });
+                // A tool result with a rendered body over the per-message limit
+                // is split into multiple `role:tool` messages sharing one
+                // `tool_call_id`. The gateway accepts this (verified against the
+                // real gateway) and the model reads the chunks as one result;
+                // the tool-answer invariant still holds because the run stays
+                // contiguous and the id set matches.
+                let body = result.render();
+                if escaped_len(&body) <= MAX_STRING_ESCAPED {
+                    out.push(WireMessage::Tool {
+                        tool_call_id: call_id.clone(),
+                        content: body,
+                    });
+                } else {
+                    for chunk in chunk_by_escaped_len(&body, MAX_STRING_ESCAPED) {
+                        out.push(WireMessage::Tool {
+                            tool_call_id: call_id.clone(),
+                            content: chunk,
+                        });
+                    }
+                }
             }
             Turn::SystemNote { kind, text } => {
                 // Never into the system prompt (already sent); a user-side block.
-                let rendered = match kind {
+                let rendered: Arc<str> = match kind {
                     NoteKind::Compaction => format!("<session-summary>{text}</session-summary>"),
                     NoteKind::ModeChange | NoteKind::Notice => format!("[note] {text}"),
-                };
-                out.push(WireMessage::User { content: rendered.into() });
+                }
+                .into();
+                push_user(&mut out, &rendered);
             }
         }
     }
     out
+}
+
+/// Push one or more `role:user` messages for `content`: a single message when
+/// it fits the per-message limit (a refcount bump of the source `Arc`), or
+/// multiple consecutive user messages — each under the limit — when it
+/// doesn't. The gateway accepts consecutive user messages (verified against
+/// the real gateway) and the model reads them as one input; concatenating the
+/// chunks reconstructs the original. Only oversized content allocates; the
+/// common path keeps the source allocation shared.
+fn push_user(out: &mut Vec<WireMessage>, content: &Arc<str>) {
+    if escaped_len(content) <= MAX_STRING_ESCAPED {
+        out.push(WireMessage::User { content: UserContent::Text(content.clone()) });
+    } else {
+        for chunk in chunk_by_escaped_len(content, MAX_STRING_ESCAPED) {
+            out.push(WireMessage::User { content: UserContent::Text(chunk) });
+        }
+    }
+}
+
+/// The byte length `s` occupies as a JSON string literal (escapes included),
+/// not counting the surrounding quotes. This mirrors `serde_json`'s default
+/// escaping exactly — `"` and `\` as 2 bytes, the short control forms
+/// (`\b \t \n \f \r`) as 2, other control chars as `\u00XX` (6), and non-ASCII
+/// as raw UTF-8 (serde_json does not escape non-ASCII). Pinned against
+/// `serde_json::to_string` by the `escaped_len_matches_serde_json` test, so a
+/// serializer change that breaks the assumption fails loudly.
+fn escaped_len(s: &str) -> usize {
+    s.chars().map(escape_len_char).sum()
+}
+
+fn escape_len_char(c: char) -> usize {
+    match c {
+        '"' | '\\' => 2,
+        '\u{08}' | '\t' | '\n' | '\u{0c}' | '\r' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Split `s` into owned `Arc<str>` chunks, each with [`escaped_len`] ≤ `max`,
+/// such that concatenating the chunks reconstructs `s` exactly. Splits only on
+/// `char` boundaries (UTF-8 safe). Any single char fits (`max` is ~1 MB), so
+/// the loop never deadlocks. Used to keep every JSON string under the
+/// gateway's per-string limit while preserving the full content.
+fn chunk_by_escaped_len(s: &str, max: usize) -> Vec<Arc<str>> {
+    let mut chunks = Vec::new();
+    let mut buf = String::new();
+    let mut cur = 0usize;
+    for c in s.chars() {
+        let e = escape_len_char(c);
+        if cur + e > max && !buf.is_empty() {
+            chunks.push(Arc::from(buf.as_str()));
+            buf.clear();
+            cur = 0;
+        }
+        buf.push(c);
+        cur += e;
+    }
+    if !buf.is_empty() {
+        chunks.push(Arc::from(buf.as_str()));
+    }
+    chunks
 }
 
 /// The tool-answer invariant (§4.2 / §3.1 trap 3): every assistant `tool_calls`
@@ -241,5 +336,134 @@ mod tests {
             }
             _ => panic!("expected tool messages in both projections"),
         }
+    }
+
+    /// `escaped_len` must mirror `serde_json`'s default escaping exactly — the
+    /// chunker's "under the limit" guarantee is only as good as this match.
+    #[test]
+    fn escaped_len_matches_serde_json_exactly() {
+        let cases = [
+            "hello",
+            "with \"quotes\" and \\backslashes",
+            "tab\there\nnewline",
+            "control\x01\x07\x1f chars",
+            "unicode: é, 中, 😀, ☃",
+            "",
+            "\"\"\"\"\"\"",
+            "\\\\\\\\",
+        ];
+        for s in cases {
+            let serde_len = serde_json::to_string(s).unwrap().len();
+            assert_eq!(escaped_len(s) + 2, serde_len, "escape mismatch for {s:?}");
+        }
+    }
+
+    /// A string well over the limit — including high-escape chars — must split
+    /// into chunks each under the limit (in *escaped* bytes) that concatenate
+    /// back to the original exactly.
+    #[test]
+    fn chunks_stay_under_limit_and_concatenate_back() {
+        let max = 1_000_000;
+        let mut big = String::from("start \u{1} mid ");
+        big.push_str(&"x".repeat(max * 2 + 12345));
+        big.push_str("\"end\" \\\\");
+        let chunks = chunk_by_escaped_len(&big, max);
+        assert!(chunks.len() >= 3, "expected multiple chunks: {}", chunks.len());
+        for c in &chunks {
+            assert!(escaped_len(c) <= max, "chunk over limit: {}", escaped_len(c));
+        }
+        let rejoined: String = chunks.iter().map(|c| c.as_ref()).collect();
+        assert_eq!(rejoined, big, "chunks must reconstruct the original");
+    }
+
+    /// An oversized user message projects to multiple consecutive `role:user`
+    /// messages — each under the per-message limit — whose concatenation
+    /// preserves the full content. (An array of parts within one message does
+    /// NOT help: the gateway's 1 MB limit is per *message*, so a parts array
+    /// still exceeds it. Verified against the real gateway.)
+    #[test]
+    fn oversized_user_message_projects_to_multiple_user_messages() {
+        let big: Arc<str> = Arc::from("x".repeat(MAX_STRING_ESCAPED + 500_000));
+        let turns = vec![Turn::User { content: big.clone(), ts: SystemTime::now() }];
+        let wire = project(&turns);
+        // wire[0] is the system message; the rest are the user chunks.
+        let user_msgs: Vec<&WireMessage> = wire[1..]
+            .iter()
+            .filter(|m| matches!(m, WireMessage::User { .. }))
+            .collect();
+        assert!(user_msgs.len() >= 2, "expected >=2 user messages: {}", user_msgs.len());
+        for m in &user_msgs {
+            let WireMessage::User { content: UserContent::Text(t) } = m else {
+                panic!("chunked user content must be bare Text: {m:?}");
+            };
+            assert!(escaped_len(t) <= MAX_STRING_ESCAPED, "chunk over limit");
+        }
+        let rejoined: String = user_msgs
+            .iter()
+            .map(|m| match m {
+                WireMessage::User { content: UserContent::Text(t) } => t.as_ref(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(rejoined.as_str(), big.as_ref(), "chunks must reconstruct the original");
+    }
+
+    /// Small user content stays a single bare `Text` message and shares the
+    /// source `Arc` (the chunker only allocates for oversized content).
+    #[test]
+    fn small_user_message_stays_text_and_shares_allocation() {
+        let s: Arc<str> = Arc::from("hello".to_string());
+        let turns = vec![Turn::User { content: s.clone(), ts: SystemTime::now() }];
+        let wire = project(&turns);
+        // Exactly one user message, and its content shares the source Arc.
+        let user_msgs: Vec<&WireMessage> = wire[1..]
+            .iter()
+            .filter(|m| matches!(m, WireMessage::User { .. }))
+            .collect();
+        assert_eq!(user_msgs.len(), 1, "small content is one message: {user_msgs:?}");
+        let WireMessage::User { content: UserContent::Text(t) } = user_msgs[0] else {
+            panic!("small user content must stay Text");
+        };
+        assert!(Arc::ptr_eq(t, &s), "small content must share the source Arc");
+    }
+
+    /// An oversized tool result projects to multiple `role:tool` messages
+    /// sharing one `tool_call_id` (the gateway accepts this and the model
+    /// concatenates); the tool-answer invariant still holds.
+    #[test]
+    fn oversized_tool_result_projects_to_multiple_same_id_tool_messages() {
+        let big_body: Arc<str> = Arc::from("x".repeat(MAX_STRING_ESCAPED + 500_000));
+        let turns = vec![
+            Turn::Assistant { text: "".into(), reasoning: None, calls: vec![call("c1")], usage: None },
+            Turn::ToolResult {
+                call_id: "c1".into(),
+                tool: "X".into(),
+                result: ToolResultBody::Ok { content: big_body.clone(), truncated: false },
+                duration: Default::default(),
+            },
+        ];
+        let wire = project(&turns);
+        let tool_msgs: Vec<&WireMessage> = wire[1..]
+            .iter()
+            .filter(|m| matches!(m, WireMessage::Tool { .. }))
+            .collect();
+        assert!(tool_msgs.len() >= 2, "expected >=2 tool messages: {}", tool_msgs.len());
+        for m in &tool_msgs {
+            let WireMessage::Tool { tool_call_id, content } = m else { unreachable!() };
+            assert_eq!(tool_call_id, "c1", "all chunks share the call id");
+            assert!(escaped_len(content) <= MAX_STRING_ESCAPED, "chunk over limit");
+        }
+        let rejoined: String = tool_msgs
+            .iter()
+            .map(|m| match m {
+                WireMessage::Tool { content, .. } => content.as_ref(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(rejoined, big_body.as_ref());
+        assert!(
+            verify_invariant(&wire).is_ok(),
+            "tool-answer invariant must hold with a chunked tool result"
+        );
     }
 }

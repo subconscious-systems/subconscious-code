@@ -62,7 +62,11 @@ pub enum WireMessage {
 
 /// User message content: a plain string today, an array of parts once vision
 /// is wired (§3.5). `#[serde(untagged)]` with a single variant serializes as a
-/// bare string; adding `Parts` later keeps the wire shape stable.
+/// bare string; adding `Parts` later keeps the wire shape stable. A large user
+/// message that would exceed the gateway's per-message byte limit is split
+/// into multiple `role:user` messages in the projection (see `rc_core::project`),
+/// not into an array here — the limit is per *message*, so a parts array does
+/// not help.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum UserContent {
