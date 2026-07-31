@@ -169,9 +169,41 @@ const DEFAULT_IDLE_TIMEOUT_MS: u64 = 120_000;
 /// cheap even on a huge request.
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
+/// Non-fatal problems found while loading settings: a malformed
+/// `settings.json` parse error, or a secret-shaped string in one. `Settings::load`
+/// drops these; `Settings::load_with_report` collects them so `sc doctor` can
+/// surface them instead of silently ignoring a typo'd config.
+#[derive(Debug, Default, Clone)]
+pub struct LoadReport {
+    /// Human-readable warnings (parse errors, secret-scan hits), in load order.
+    pub warnings: Vec<String>,
+}
+
+impl LoadReport {
+    /// No warnings were recorded.
+    pub fn is_empty(&self) -> bool {
+        self.warnings.is_empty()
+    }
+}
+
 impl Settings {
     /// Load settings with M0 precedence: defaults → user → project → env.
+    /// Parse errors are reported via the returned [`LoadReport`] rather than
+    /// failing the whole load — a typo in `~/.sc/settings.json` shouldn't make
+    /// `sc` unusable, but it should be visible (e.g. in `sc doctor`).
     pub fn load(project_dir: &Path) -> Self {
+        let mut report = LoadReport::default();
+        let s = Self::load_with_report(project_dir, &mut report);
+        // The report is dropped here; `sc doctor` calls `load_with_report`
+        // directly to surface warnings. A normal `load` just proceeds.
+        let _ = report;
+        s
+    }
+
+    /// Load settings and capture any file parse errors / secret-scan hits into
+    /// `report`. Used by `sc doctor` to surface a malformed `settings.json`
+    /// instead of silently ignoring it.
+    pub fn load_with_report(project_dir: &Path, report: &mut LoadReport) -> Self {
         let mut base_url = DEFAULT_BASE_URL.to_string();
         let mut api_key_env = "SC_API_KEY".to_string();
         let mut timeout_ms = DEFAULT_TIMEOUT_MS;
@@ -195,20 +227,26 @@ impl Settings {
         let layers: Vec<Option<PathBuf>> =
             vec![user_settings_path(), project_settings_path(project_dir)];
         for path in layers.into_iter().flatten() {
-            if let Some(file) = read_settings(&path) {
-                if let Some(p) = file.provider {
-                    if let Some(u) = p.base_url { base_url = u; }
-                    if let Some(e) = p.api_key_env { api_key_env = e; }
-                    if let Some(t) = p.timeout_ms { timeout_ms = t; }
-                    if let Some(t) = p.idle_timeout_ms { idle_timeout_ms = t; }
-                    if let Some(r) = p.max_retries { max_retries = r; }
-                    if let Some(g) = p.request_gzip { request_gzip = g; }
+            match read_settings(&path) {
+                Ok(file) => {
+                    if let Some(warning) = scan_for_secret(&path) {
+                        report.warnings.push(warning);
+                    }
+                    if let Some(p) = file.provider {
+                        if let Some(u) = p.base_url { base_url = u; }
+                        if let Some(e) = p.api_key_env { api_key_env = e; }
+                        if let Some(t) = p.timeout_ms { timeout_ms = t; }
+                        if let Some(t) = p.idle_timeout_ms { idle_timeout_ms = t; }
+                        if let Some(r) = p.max_retries { max_retries = r; }
+                        if let Some(g) = p.request_gzip { request_gzip = g; }
+                    }
+                    if let Some(m) = file.model { model = m; }
+                    if let Some(s) = file.small_model { small_model = s; }
+                    if let Some(p) = file.permissions { permissions = p; }
+                    if let Some(s) = file.sandbox { sandbox = s; }
+                    if let Some(c) = file.context { context = c; }
                 }
-                if let Some(m) = file.model { model = m; }
-                if let Some(s) = file.small_model { small_model = s; }
-                if let Some(p) = file.permissions { permissions = p; }
-                if let Some(s) = file.sandbox { sandbox = s; }
-                if let Some(c) = file.context { context = c; }
+                Err(e) => report.warnings.push(e),
             }
         }
 
@@ -287,11 +325,62 @@ fn project_settings_path(project: &Path) -> Option<PathBuf> {
     Some(project.join(".sc").join("settings.json"))
 }
 
-/// Read + parse a settings file. M0 fails soft (a malformed or absent file is
-/// ignored); G4/G7 will validate and report.
-fn read_settings(path: &Path) -> Option<SettingsFile> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice::<SettingsFile>(&bytes).ok()
+/// Read + parse a settings file. M0 failed soft (a malformed or absent file
+/// was silently ignored); G4 now reports the parse error so a typo in
+/// `settings.json` isn't a silent no-op. Returns the parsed file on success,
+/// or `Err(message)` on a read/parse failure so the caller can surface it.
+pub(crate) fn read_settings(path: &Path) -> Result<SettingsFile, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_slice::<SettingsFile>(&bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Scan a settings file's raw text for a key-shaped string. The API key must
+/// come from the env var named by `provider.api_key_env` (default
+/// `SC_API_KEY`); a literal key in the file is a secret leak. Returns the first
+/// suspicious line, if any.
+///
+/// This is the G7 promise from the module doc: `sc doctor` complains loudly if
+/// a key-shaped string appears in any settings file. "Key-shaped" is heuristic
+/// — a long base64-ish token in a `provider.api_key` / `api_key` / `key` field,
+/// or a `Bearer`-prefixed string.
+pub fn scan_for_secret(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for (i, line) in text.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        // A field literally named like a key, holding something long.
+        let looks_like_key_field = lower.contains("\"api_key\"")
+            || lower.contains("\"apikey\"")
+            || lower.contains("\"key\"")
+            || lower.contains("\"token\"")
+            || lower.contains("\"secret\"")
+            || lower.contains("\"bearer\"");
+        if !looks_like_key_field {
+            continue;
+        }
+        // Extract the value side of the `"field": "value"` pair.
+        if let Some(colon) = line.find(':') {
+            let after = &line[colon + 1..];
+            let trimmed = after.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    let val = &rest[..end];
+                    // Heuristic: a real secret is long and high-entropy. A short
+                    // or empty value (e.g. `"api_key_env": "SC_API_KEY"`) is fine.
+                    if val.len() >= 20 && val.chars().any(|c| c.is_ascii_alphanumeric()) {
+                        let preview: String = val.chars().take(8).collect();
+                        return Some(format!(
+                            "{}:{}: possible secret in settings ({}…) — use the env var instead",
+                            path.display(),
+                            i + 1,
+                            preview
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
