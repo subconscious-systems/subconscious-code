@@ -14,6 +14,7 @@ mod app;
 mod complete;
 mod diff;
 mod markdown;
+mod theme;
 mod view;
 
 use std::io::Stdout;

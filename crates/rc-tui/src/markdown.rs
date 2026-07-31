@@ -14,24 +14,26 @@
 //! pure and cheap to call on the small growing buffer.
 
 use ratatui::style::{Color, Modifier, Style};
+
+use crate::theme;
 use ratatui::text::{Line, Span};
 
 fn heading_style(level: usize) -> Style {
     // Dim the color as the heading level deepens; all are bold.
     let color = match level {
-        1 | 2 => Color::Cyan,
-        3 => Color::Blue,
+        1 | 2 => theme::ACCENT,
+        3 => theme::ACCENT_DIM,
         _ => Color::DarkGray,
     };
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
 fn code_span_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(theme::ACCENT_BRIGHT)
 }
 
 fn code_block_style() -> Style {
-    Style::default().fg(Color::Green)
+    Style::default().fg(theme::ACCENT_DIM)
 }
 
 fn quote_style() -> Style {
@@ -39,7 +41,7 @@ fn quote_style() -> Style {
 }
 
 fn link_style() -> Style {
-    Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED)
+    Style::default().fg(theme::ACCENT_BRIGHT).add_modifier(Modifier::UNDERLINED)
 }
 
 /// Parse a block of markdown into styled lines (one logical line per source
@@ -90,14 +92,14 @@ pub fn parse_blocks(text: &str) -> Vec<Line<'static>> {
         }
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
             let rest = &trimmed[2..];
-            let mut spans = vec![Span::styled("• ", Style::default().fg(Color::Cyan))];
+            let mut spans = vec![Span::styled("• ", Style::default().fg(theme::ACCENT))];
             spans.extend(parse_inline(rest));
             out.push(Line::from(spans));
             continue;
         }
         if let Some(rest) = strip_ordered(line) {
             let num: String = line.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
-            let mut spans = vec![Span::styled(format!("{num}. "), Style::default().fg(Color::Cyan))];
+            let mut spans = vec![Span::styled(format!("{num}. "), Style::default().fg(theme::ACCENT))];
             spans.extend(parse_inline(rest));
             out.push(Line::from(spans));
             continue;

@@ -13,6 +13,7 @@ use rc_core::{AgentMode, Usage};
 use serde_json::Value;
 
 use crate::complete::Completion;
+use crate::theme;
 
 /// A pending permission ask the user must answer before the turn proceeds.
 #[derive(Clone)]
@@ -53,6 +54,16 @@ pub(crate) struct ViewState {
     /// no `@`/`/` trigger at the caret or the user dismissed it.
     pub menu: Option<CompletionMenu>,
     pub model_name: String,
+    /// Scrollback: `true` pins the view to the bottom (auto-scrolls as new
+    /// content arrives). Scrolling up sets it `false` so the view holds steady
+    /// while the conversation grows below it; submitting, `/clear`, `End`, or
+    /// paging down to the bottom set it `true` again.
+    pub follow: bool,
+    /// When not [`Self::follow`], the index of the topmost transcript line shown.
+    pub scroll_top: usize,
+    /// Last transcript area height, recorded each draw so the keymap can page by
+    /// a real screenful rather than a guessed constant.
+    pub area_height: usize,
 }
 
 impl ViewState {
@@ -68,6 +79,9 @@ impl ViewState {
             composer: String::new(),
             menu: None,
             model_name,
+            follow: true,
+            scroll_top: 0,
+            area_height: 0,
         }
     }
 
@@ -81,11 +95,22 @@ impl ViewState {
     }
 }
 
-pub(crate) fn draw(frame: &mut Frame, state: &ViewState) {
+pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
     let area = frame.area();
+    // The composer is a single-line input. Three rows — top border, the line,
+    // bottom border — put the caret on the box's vertical center; the old
+    // four-row box left the caret on the top inner row with a blank line
+    // below, so it read as top-aligned. A pending permission ask needs two
+    // lines, so it keeps a four-row box; the bottom strip grows by one row
+    // only while an ask is on screen.
+    let bottom = if state.pending_ask.is_some() {
+        Constraint::Length(4)
+    } else {
+        Constraint::Length(3)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(4)])
+        .constraints([Constraint::Min(1), Constraint::Length(1), bottom])
         .split(area);
     draw_transcript(frame, state, chunks[0]);
     draw_status(frame, state, chunks[1]);
@@ -100,16 +125,45 @@ pub(crate) fn draw(frame: &mut Frame, state: &ViewState) {
     }
 }
 
-fn draw_transcript(frame: &mut Frame, state: &ViewState, area: Rect) {
-    // Show the bottom of the transcript (latest lines) within the area height.
+fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect) {
     let h = area.height as usize;
-    let start = state.transcript.len().saturating_sub(h);
-    let mut lines: Vec<Line<'static>> = state.transcript[start..].to_vec();
+    state.area_height = h;
+
     // The in-progress text is re-parsed each frame (small/growing) — that's the
     // only per-frame parse; completed turns above are already cached.
-    if !state.current_text.is_empty() {
-        lines.extend(crate::markdown::parse_blocks(&state.current_text));
+    let streaming: Vec<Line<'static>> = if state.current_text.is_empty() {
+        Vec::new()
+    } else {
+        crate::markdown::parse_blocks(&state.current_text)
+    };
+    let tr_len = state.transcript.len();
+    let total = tr_len + streaming.len();
+
+    // The visible window: pinned to the bottom when following, else the user's
+    // held position. Only the visible rows are cloned, not the whole transcript
+    // (huge at scale) — same property as the pre-scroll code.
+    let start = if state.follow {
+        total.saturating_sub(h)
+    } else {
+        state.scroll_top.min(total.saturating_sub(h))
+    };
+    let end = (start + h).min(total);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start);
+    for i in start..end {
+        if i < tr_len {
+            lines.push(state.transcript[i].clone());
+        } else {
+            lines.push(streaming[i - tr_len].clone());
+        }
     }
+    // Blank the area first. `Paragraph` only writes the cells its (wrapped)
+    // text covers, and ratatui double-buffers — it diffs against the previous
+    // frame rather than clearing — so a cell the new frame doesn't touch keeps
+    // last frame's glyph. When a long dim tool-preview line wraps to N rows and
+    // a one-line scroll changes the layout, the tail of the previous word
+    // isn't overwritten and stays put: "portions of some words scrolling, the
+    // rest stuck." Clearing gives each frame a clean slate.
+    frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
 }
 
@@ -126,15 +180,39 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect) {
         None => String::new(),
     };
     let line = format!(
-        " {} | {} | tokens: {}{}{} | {}",
+        " {} | {} | tokens: {}{}{} | {}{}",
         state.model_name,
         mode_name(state.mode),
         tokens,
         cached_str,
         ctx_str,
         activity,
+        scroll_indicator(state),
     );
-    frame.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), area);
+    frame.render_widget(Paragraph::new(line).style(Style::new().fg(theme::ACCENT)), area);
+}
+
+/// When the user has scrolled up away from the bottom, surface it in the status
+/// bar — both that the view is held and how many lines of new content sit below
+/// it. Empty (nothing shown) when following the bottom.
+fn scroll_indicator(state: &ViewState) -> String {
+    if state.follow {
+        return String::new();
+    }
+    let streaming = if state.current_text.is_empty() {
+        0
+    } else {
+        crate::markdown::parse_blocks(&state.current_text).len()
+    };
+    let total = state.transcript.len() + streaming;
+    let h = state.area_height.max(1);
+    let top = state.scroll_top.min(total.saturating_sub(h));
+    let below = total.saturating_sub(top + h);
+    if below == 0 {
+        " | ↑ top".to_string()
+    } else {
+        format!(" | ↑ {below} below")
+    }
 }
 
 /// Render a char count as B/K/M, so a large context reads at a glance.
@@ -195,9 +273,9 @@ fn draw_menu(frame: &mut Frame, menu: &CompletionMenu, composer_area: Rect) {
         let marker = if i == start { "▶ " } else { "  " };
         let line = Line::from(format!("{marker}{cand}"));
         if i == start {
-            lines.push(line.style(Style::new().fg(Color::Black).bg(Color::Cyan)));
+            lines.push(line.style(Style::new().fg(Color::Black).bg(theme::ACCENT)));
         } else {
-            lines.push(line.style(Style::new().fg(Color::Yellow)));
+            lines.push(line.style(Style::new().fg(theme::ACCENT_BRIGHT)));
         }
     }
     // Render the popup with a clear background so it doesn't bleed the transcript.
@@ -215,7 +293,7 @@ fn draw_ask(frame: &mut Frame, ask: &PendingAsk, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(line)
-            .style(Style::new().fg(Color::Yellow))
+            .style(Style::new().fg(theme::ACCENT_BRIGHT))
             .block(Block::default().borders(Borders::ALL).title("permission")),
         area,
     );
@@ -237,7 +315,7 @@ mod tests {
     use ratatui::Terminal;
 
     /// Render `state` to a 60x10 TestBackend and return the joined cell symbols.
-    fn rendered(state: &ViewState) -> String {
+    fn rendered(state: &mut ViewState) -> String {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, state)).unwrap();
@@ -258,7 +336,7 @@ mod tests {
         let mut state = ViewState::new("mock-model".into());
         state.mode = AgentMode::Plan;
         state.busy = true;
-        let screen = rendered(&state);
+        let screen = rendered(&mut state);
         assert!(screen.contains("mock-model"), "model name: {screen}");
         assert!(screen.contains("plan"), "mode: {screen}");
         assert!(screen.contains("working"), "busy state: {screen}");
@@ -270,7 +348,7 @@ mod tests {
     fn status_line_shows_context_size() {
         let mut state = ViewState::new("m".into());
         state.last_context = Some((12_071_555, 2_748_220));
-        let screen = rendered(&state);
+        let screen = rendered(&mut state);
         assert!(screen.contains("ctx: 12.1M"), "context chars: {screen}");
         assert!(screen.contains("2.7M tok"), "estimated tokens: {screen}");
     }
@@ -278,8 +356,8 @@ mod tests {
     /// No context yet (before the first request) means no stale figure shown.
     #[test]
     fn status_line_omits_context_before_the_first_request() {
-        let state = ViewState::new("m".into());
-        assert!(!rendered(&state).contains("ctx:"));
+        let mut state = ViewState::new("m".into());
+        assert!(!rendered(&mut state).contains("ctx:"));
     }
 
     #[test]
@@ -299,7 +377,7 @@ mod tests {
             input: Value::Null,
             reason: "Edit requires confirmation".into(),
         });
-        let screen = rendered(&state);
+        let screen = rendered(&mut state);
         assert!(screen.contains("permission"), "ask block titled: {screen}");
         assert!(screen.contains("Edit requires confirmation"), "reason: {screen}");
         assert!(screen.contains("[y]once"), "answer keys: {screen}");
@@ -311,9 +389,30 @@ mod tests {
         state.transcript.push(Line::from("-> Read README.md"));
         state.transcript.push(Line::from("<- Read: # rc"));
         state.current_text = "streaming answer".into();
-        let screen = rendered(&state);
+        let screen = rendered(&mut state);
         assert!(screen.contains("-> Read README.md"), "tool start line: {screen}");
         assert!(screen.contains("streaming answer"), "in-progress text: {screen}");
+    }
+
+    #[test]
+    fn scroll_up_shows_older_lines_and_indicator() {
+        // A 60x10 screen leaves the transcript ~5 rows. With 20 lines pushed,
+        // following shows the bottom; scrolling to the top shows the oldest and
+        // flags the state in the status bar.
+        let mut state = ViewState::new("m".into());
+        for i in 0..20 {
+            state.transcript.push(Line::from(format!("line {i}")));
+        }
+        let screen = rendered(&mut state);
+        assert!(screen.contains("line 19"), "follow shows the bottom: {screen}");
+        assert!(!screen.contains("line 0"), "top hidden when following: {screen}");
+
+        state.follow = false;
+        state.scroll_top = 0;
+        let screen = rendered(&mut state);
+        assert!(screen.contains("line 0"), "scrolled to top shows oldest: {screen}");
+        assert!(!screen.contains("line 19"), "bottom hidden when scrolled up: {screen}");
+        assert!(screen.contains("↑"), "status flags the scroll state: {screen}");
     }
 
     #[test]
@@ -322,7 +421,7 @@ mod tests {
         let mut state = ViewState::new("m".into());
         state.transcript.extend(crate::markdown::parse_blocks("# Heading\n\nsome **bold** text"));
         state.transcript.push(crate::diff::word_diff_line("old word", "new word"));
-        let screen = rendered(&state);
+        let screen = rendered(&mut state);
         assert!(screen.contains("Heading"), "heading: {screen}");
         assert!(screen.contains("bold"), "bold: {screen}");
         // The inline word diff interleaves the deleted ("old") and inserted
@@ -344,7 +443,7 @@ mod tests {
             },
             selected: 0,
         });
-        let screen = rendered(&state);
+        let screen = rendered(&mut state);
         assert!(screen.contains("commands"), "menu title: {screen}");
         assert!(screen.contains("/clear"), "first candidate: {screen}");
         assert!(screen.contains("/mode"), "second candidate: {screen}");
@@ -365,7 +464,7 @@ mod tests {
             },
             selected: 0,
         });
-        let screen = rendered(&state);
+        let screen = rendered(&mut state);
         // No "files"/"commands" title block should appear.
         assert!(!screen.contains("files"), "no menu for empty candidates: {screen}");
         assert!(!screen.contains("commands"), "no menu title: {screen}");
