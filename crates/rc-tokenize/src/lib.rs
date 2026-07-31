@@ -13,6 +13,14 @@
 //!
 //! M0 shipped only a naive byte proxy so call sites could compile; M6 keeps it
 //! as a public free function for tests and cheap non-decision estimates.
+//!
+//! This crate is also the home for the small shared date utility
+//! ([`time::civil_from_days`], [`time::today_string`]) used by `rc-ctx` (the
+//! environment block date) and `rc-cli` (sortable session ids). It's a
+//! dependency-free leaf crate, so the two former duplicates of Howard
+//! Hinnant's algorithm consolidate here.
+
+pub mod time;
 
 use std::sync::Mutex;
 
