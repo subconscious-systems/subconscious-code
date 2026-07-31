@@ -51,7 +51,7 @@ impl App {
                 theme::logo_glyph(),
                 view.model_name
             ),
-            Style::default().fg(theme::ACCENT),
+            theme::palette().accent(),
         ));
         Self { runtime, stream, view, cwd, quit: false }
     }
@@ -264,7 +264,7 @@ impl App {
                                         theme::logo_glyph(),
                                         self.view.model_name
                                     ),
-                                    Style::default().fg(theme::ACCENT),
+                                    theme::palette().accent(),
                                 ));
                             }
                             SlashAction::CycleMode => {
@@ -534,12 +534,14 @@ fn summarize_args(args: &str) -> String {
     truncate(args, 80)
 }
 
-/// A styled "tool starting" line: `▸ Name  summary` — the tool name in the
-/// brand accent, the argument summary in the default foreground.
+/// A styled "tool starting" line: `▸ Name  summary` — the glyph in chrome, the
+/// tool name in the default foreground, the argument summary dimmed.
 fn tool_start_line(name: &str, summary: &str) -> Line<'static> {
+    let p = theme::palette();
     Line::from(vec![
-        Span::styled(format!("▸ {name}"), Style::default().fg(theme::ACCENT)),
-        Span::raw(format!("  {summary}")),
+        Span::styled("▸ ", p.chrome()),
+        Span::styled(name.to_string(), p.body()),
+        Span::styled(format!("  {summary}"), p.chrome()),
     ])
 }
 
@@ -556,33 +558,35 @@ fn tool_end_lines(tool: &str, result: &ToolResultBody) -> Vec<Line<'static>> {
         ToolResultBody::Denied { .. } => ('⊘', Color::Yellow),
         ToolResultBody::Interrupted => ('–', Color::DarkGray),
     };
+    let p = theme::palette();
+    let glyph_style = p.semantic(color);
     let body = result.render();
     let body_str: &str = body.as_ref();
 
     let header_spans = |body: &str| -> Vec<Span<'static>> {
         vec![
-            Span::styled(format!("{glyph} {tool}  "), Style::default().fg(color)),
-            Span::styled(body.to_string(), dim_style()),
+            Span::styled(format!("{glyph} {tool}  "), glyph_style),
+            Span::styled(body.to_string(), p.chrome()),
         ]
     };
 
     let mut lines = Vec::new();
     if body_str.is_empty() {
-        lines.push(Line::styled(format!("{glyph} {tool}"), Style::default().fg(color)));
+        lines.push(Line::styled(format!("{glyph} {tool}"), glyph_style));
     } else if !body_str.contains('\n') && body_str.chars().count() <= 100 {
         lines.push(Line::from(header_spans(body_str)));
     } else {
-        lines.push(Line::styled(format!("{glyph} {tool}"), Style::default().fg(color)));
+        lines.push(Line::styled(format!("{glyph} {tool}"), glyph_style));
         let mut more = false;
         for (i, line) in body_str.lines().enumerate() {
             if i >= 3 {
                 more = true;
                 break;
             }
-            lines.push(Line::styled(format!("│ {}", truncate(line, 120)), dim_style()));
+            lines.push(Line::styled(format!("│ {}", truncate(line, 120)), p.chrome()));
         }
         if more {
-            lines.push(Line::styled("│ …", dim_style()));
+            lines.push(Line::styled("│ …", p.chrome()));
         }
     }
     lines
@@ -599,11 +603,11 @@ fn edit_args(args: &str) -> Option<(String, String, String)> {
 }
 
 fn dim_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    theme::palette().chrome()
 }
 
 fn error_style() -> Style {
-    Style::default().fg(Color::Red)
+    theme::palette().semantic(Color::Red)
 }
 
 /// Char-safe truncation with an ellipsis. Bounded by the output size, not the

@@ -5,7 +5,6 @@
 //! single-line composer. Markdown / word-level diff land in M4b.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -189,7 +188,7 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect) {
         activity,
         scroll_indicator(state),
     );
-    frame.render_widget(Paragraph::new(line).style(Style::new().fg(theme::ACCENT)), area);
+    frame.render_widget(Paragraph::new(line).style(theme::palette().chrome()), area);
 }
 
 /// When the user has scrolled up away from the bottom, surface it in the status
@@ -273,9 +272,9 @@ fn draw_menu(frame: &mut Frame, menu: &CompletionMenu, composer_area: Rect) {
         let marker = if i == start { "▶ " } else { "  " };
         let line = Line::from(format!("{marker}{cand}"));
         if i == start {
-            lines.push(line.style(Style::new().fg(Color::Black).bg(theme::ACCENT)));
+            lines.push(line.style(theme::palette().menu_selected()));
         } else {
-            lines.push(line.style(Style::new().fg(theme::ACCENT_BRIGHT)));
+            lines.push(line.style(theme::palette().code()));
         }
     }
     // Render the popup with a clear background so it doesn't bleed the transcript.
@@ -293,7 +292,7 @@ fn draw_ask(frame: &mut Frame, ask: &PendingAsk, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(line)
-            .style(Style::new().fg(theme::ACCENT_BRIGHT))
+            .style(theme::palette().body())
             .block(Block::default().borders(Borders::ALL).title("permission")),
         area,
     );
