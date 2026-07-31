@@ -6,3 +6,21 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rc-core = { path = "../rc-core" }
+rc-perm = { path = "../rc-perm" }
+rc-sandbox = { path = "../rc-sandbox" }
+serde.workspace = true
+serde_json.workspace = true
+schemars = "0.8"
+async-trait = { workspace = true }
+blake3 = "1"
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
+similar = { version = "2", features = ["text"] }
+tempfile = "3"
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }

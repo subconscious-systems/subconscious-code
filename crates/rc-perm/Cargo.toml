@@ -6,3 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+shlex = "1"
+globset = "0.4"
+
+[dev-dependencies]

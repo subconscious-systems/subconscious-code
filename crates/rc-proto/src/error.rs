@@ -14,6 +14,16 @@ pub enum ProtoError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("no API key configured (set $RC_API_KEY or the var named by provider.api_key_env)")]
+    #[error("no API key configured (set $SC_API_KEY or the var named by provider.api_key_env)")]
     NoApiKey,
+
+    /// Compressing the request body failed (`request_gzip`).
+    #[error("gzip error: {0}")]
+    Gzip(std::io::Error),
+
+    /// T2: the streaming body produced no chunk for the idle window (a stall).
+    /// Distinct from `Http` (the total request timeout) so a caller can tell a
+    /// mid-stream stall from a connection / total-timeout failure.
+    #[error("stream stalled: no chunk for {0:?}")]
+    Idle(std::time::Duration),
 }
