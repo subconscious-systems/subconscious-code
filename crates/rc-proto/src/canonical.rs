@@ -88,7 +88,11 @@ mod tests {
 
     #[test]
     fn sorts_keys_recursively_and_is_compact() {
-        let s = Schema { z: 1, a: 2, m: Nested { y: 3, b: 4 } };
+        let s = Schema {
+            z: 1,
+            a: 2,
+            m: Nested { y: 3, b: 4 },
+        };
         let out = to_string(&s).unwrap();
         assert_eq!(out, r#"{"a":2,"m":{"b":4,"y":3},"z":1}"#);
     }
@@ -97,7 +101,11 @@ mod tests {
     /// twice yields identical bytes, so a retry re-sends the same prefix.
     #[test]
     fn to_bytes_is_stable_across_calls() {
-        let s = Schema { z: 1, a: 2, m: Nested { y: 3, b: 4 } };
+        let s = Schema {
+            z: 1,
+            a: 2,
+            m: Nested { y: 3, b: 4 },
+        };
         assert_eq!(to_bytes(&s).unwrap(), to_bytes(&s).unwrap());
     }
 
@@ -105,7 +113,11 @@ mod tests {
     /// alphabetized the way `to_string` canonicalizes.
     #[test]
     fn to_bytes_uses_declaration_order() {
-        let s = Schema { z: 1, a: 2, m: Nested { y: 3, b: 4 } };
+        let s = Schema {
+            z: 1,
+            a: 2,
+            m: Nested { y: 3, b: 4 },
+        };
         let out = String::from_utf8(to_bytes(&s).unwrap()).unwrap();
         assert_eq!(out, r#"{"z":1,"a":2,"m":{"y":3,"b":4}}"#);
     }
@@ -128,7 +140,10 @@ mod tests {
         let ba = to_bytes(&Value::Object(a)).unwrap();
         let bb = to_bytes(&Value::Object(b)).unwrap();
         assert_eq!(ba, bb, "preserve_order must stay off — see the doc comment");
-        assert_eq!(String::from_utf8(ba).unwrap(), r#"{"first":false,"second":true}"#);
+        assert_eq!(
+            String::from_utf8(ba).unwrap(),
+            r#"{"first":false,"second":true}"#
+        );
     }
 
     #[test]

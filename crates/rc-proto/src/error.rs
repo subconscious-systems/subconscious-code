@@ -17,6 +17,9 @@ pub enum ProtoError {
     #[error("no API key configured (set $SC_API_KEY or the var named by provider.api_key_env)")]
     NoApiKey,
 
+    #[error("session id is not a valid correlation header value")]
+    InvalidSessionId,
+
     /// Compressing the request body failed (`request_gzip`).
     #[error("gzip error: {0}")]
     Gzip(std::io::Error),

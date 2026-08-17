@@ -3,7 +3,10 @@
 //! `Turn` is the internal representation; the wire form is a fresh projection
 //! per request ([`crate::project`]), never stored as state.
 
-use crate::state::{ChangeJournal, ReadRegistry, SharedChangeJournal, SharedReadRegistry, SharedShellState, ShellState};
+use crate::state::{
+    ChangeJournal, ReadRegistry, SharedChangeJournal, SharedReadRegistry, SharedShellState,
+    ShellState,
+};
 use rc_proto::Usage;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -52,10 +55,7 @@ pub enum Turn {
     },
     /// Compaction markers, mode changes, notices — never injected into the
     /// system prompt (it's already sent); rendered as a user-side block.
-    SystemNote {
-        kind: NoteKind,
-        text: String,
-    },
+    SystemNote { kind: NoteKind, text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,9 +77,10 @@ impl ToolResultBody {
     /// copy of (potentially) many megabytes.
     pub fn render(&self) -> Arc<str> {
         match self {
-            ToolResultBody::Ok { content, truncated: true } => {
-                Arc::from(format!("{content}\n[output truncated]"))
-            }
+            ToolResultBody::Ok {
+                content,
+                truncated: true,
+            } => Arc::from(format!("{content}\n[output truncated]")),
             ToolResultBody::Ok { content, .. } => content.clone(),
             ToolResultBody::Error { message, .. } => Arc::from(format!("[tool error: {message}]")),
             ToolResultBody::Denied { reason } => Arc::from(format!("[denied: {reason}]")),
@@ -97,7 +98,10 @@ impl ToolResultBody {
     /// cut is floored to a char boundary so the head is always valid UTF-8.
     pub fn truncate_body(&self, cap: usize) -> ToolResultBody {
         match self {
-            ToolResultBody::Ok { content, truncated: _ } => {
+            ToolResultBody::Ok {
+                content,
+                truncated: _,
+            } => {
                 if content.len() <= cap {
                     return self.clone();
                 }
@@ -118,10 +122,15 @@ impl From<crate::tool::ToolOutcome> for ToolResultBody {
     fn from(o: crate::tool::ToolOutcome) -> Self {
         use crate::tool::ToolOutcome;
         match o {
-            ToolOutcome::Ok { content, truncated, .. } => {
-                ToolResultBody::Ok { content: Arc::from(content), truncated }
+            ToolOutcome::Ok {
+                content, truncated, ..
+            } => ToolResultBody::Ok {
+                content: Arc::from(content),
+                truncated,
+            },
+            ToolOutcome::Error { message, retryable } => {
+                ToolResultBody::Error { message, retryable }
             }
-            ToolOutcome::Error { message, retryable } => ToolResultBody::Error { message, retryable },
             ToolOutcome::Denied { reason } => ToolResultBody::Denied { reason },
             ToolOutcome::Interrupted => ToolResultBody::Interrupted,
         }
@@ -142,7 +151,17 @@ pub enum AgentMode {
     Default,
     AcceptEdits,
     Plan,
-    BypassPermissions,
+    /// Confirm *every* tool call, including reads — the cautious end of the
+    /// dial, where `Default` only stops for mutating tools.
+    Ask,
+    /// Run without prompting. Catastrophic commands are still hard-denied.
+    ///
+    /// Serialized as `auto`. `bypass_permissions` was the pre-rename spelling
+    /// and is accepted on read so session files written by older builds still
+    /// load — dropping it would silently reset a saved session to `default`,
+    /// which is exactly the "my mode didn't stick" bug this rename came with.
+    #[serde(alias = "bypass_permissions")]
+    Auto,
 }
 
 /// `AgentMode` (the TUI/session-facing enum) and `rc_perm::Mode` (the engine's)
@@ -154,7 +173,8 @@ impl From<AgentMode> for crate::Mode {
             AgentMode::Default => crate::Mode::Default,
             AgentMode::AcceptEdits => crate::Mode::AcceptEdits,
             AgentMode::Plan => crate::Mode::Plan,
-            AgentMode::BypassPermissions => crate::Mode::BypassPermissions,
+            AgentMode::Ask => crate::Mode::Ask,
+            AgentMode::Auto => crate::Mode::Auto,
         }
     }
 }
@@ -165,7 +185,8 @@ impl From<crate::Mode> for AgentMode {
             crate::Mode::Default => AgentMode::Default,
             crate::Mode::AcceptEdits => AgentMode::AcceptEdits,
             crate::Mode::Plan => AgentMode::Plan,
-            crate::Mode::BypassPermissions => AgentMode::BypassPermissions,
+            crate::Mode::Ask => AgentMode::Ask,
+            crate::Mode::Auto => AgentMode::Auto,
         }
     }
 }
@@ -229,7 +250,7 @@ mod tests {
             AgentMode::Default,
             AgentMode::AcceptEdits,
             AgentMode::Plan,
-            AgentMode::BypassPermissions,
+            AgentMode::Auto,
         ] {
             let perm: Mode = m.into();
             let back: AgentMode = perm.into();
@@ -243,10 +264,15 @@ mod tests {
         // chars (2 bytes each) over a `cap` must produce a head of at most
         // `cap` bytes — `.chars().take(cap)` would wrongly keep `cap` chars
         // (i.e. 2*cap bytes), blowing the window it's meant to protect.
-        let body = ToolResultBody::Ok { content: "é".repeat(100).into(), truncated: false };
+        let body = ToolResultBody::Ok {
+            content: "é".repeat(100).into(),
+            truncated: false,
+        };
         let cap = 50;
         let out = body.truncate_body(cap);
-        let ToolResultBody::Ok { content, truncated } = out else { panic!() };
+        let ToolResultBody::Ok { content, truncated } = out else {
+            panic!()
+        };
         assert!(truncated, "must be flagged truncated");
         // head (≤ cap bytes) + sentinel must not exceed cap + a small sentinel budget.
         assert!(
@@ -264,7 +290,10 @@ mod tests {
         // A representative turn of each kind must survive a serialize→deserialize
         // cycle (the JSONL persistence path, M5).
         let turns = vec![
-            Turn::User { content: "hello".into(), ts: UNIX_EPOCH + Duration::from_secs(1000) },
+            Turn::User {
+                content: "hello".into(),
+                ts: UNIX_EPOCH + Duration::from_secs(1000),
+            },
             Turn::Assistant {
                 text: "hi".into(),
                 reasoning: Some("thinking".into()),
@@ -278,10 +307,16 @@ mod tests {
             Turn::ToolResult {
                 call_id: "c1".into(),
                 tool: "Read".into(),
-                result: ToolResultBody::Ok { content: "body".into(), truncated: true },
+                result: ToolResultBody::Ok {
+                    content: "body".into(),
+                    truncated: true,
+                },
                 duration: Duration::from_millis(250),
             },
-            Turn::SystemNote { kind: NoteKind::Notice, text: "mode changed".into() },
+            Turn::SystemNote {
+                kind: NoteKind::Notice,
+                text: "mode changed".into(),
+            },
         ];
         for t in &turns {
             let j = serde_json::to_string(t).unwrap();
@@ -303,7 +338,10 @@ mod epoch_millis {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     pub fn serialize<S: Serializer>(t: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
-        let ms = t.duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let ms = t
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         (ms as u64).serialize(s)
     }
 

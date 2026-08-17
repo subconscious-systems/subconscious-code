@@ -33,7 +33,10 @@ pub(crate) async fn pump_task(
             UserAction::Submit(prompt) => {
                 let token = CancellationToken::new();
                 current_cancel = Some(token.clone());
-                let _ = driver_tx.send(DriverCmd::Run { prompt, cancel: token });
+                let _ = driver_tx.send(DriverCmd::Run {
+                    prompt,
+                    cancel: token,
+                });
             }
             UserAction::Cancel => {
                 if let Some(token) = current_cancel.take() {

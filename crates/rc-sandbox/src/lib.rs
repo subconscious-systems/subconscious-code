@@ -155,7 +155,10 @@ mod tests {
     fn new_dedups_tmp() {
         let s = Sandbox::new(vec![PathBuf::from("/repo"), PathBuf::from("/tmp")], true);
         assert_eq!(
-            s.roots().iter().filter(|r| r.as_path() == Path::new("/tmp")).count(),
+            s.roots()
+                .iter()
+                .filter(|r| r.as_path() == Path::new("/tmp"))
+                .count(),
             1
         );
         assert!(s.allow_net());
@@ -174,9 +177,21 @@ mod tests {
         // the Linux module maps to a libc::SYS_* constant. If you add a network
         // syscall to deny, add it here too (and a mapping in linux.rs).
         let expected = [
-            "socket", "socketpair", "connect", "bind", "listen", "accept",
-            "accept4", "sendto", "recvfrom", "sendmsg", "recvmsg", "getsockopt",
-            "setsockopt", "getpeername", "getsockname",
+            "socket",
+            "socketpair",
+            "connect",
+            "bind",
+            "listen",
+            "accept",
+            "accept4",
+            "sendto",
+            "recvfrom",
+            "sendmsg",
+            "recvmsg",
+            "getsockopt",
+            "setsockopt",
+            "getpeername",
+            "getsockname",
         ];
         for name in expected {
             assert!(NETWORK_SYSCALLS.contains(&name), "missing {name}");

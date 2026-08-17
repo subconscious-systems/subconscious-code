@@ -11,8 +11,8 @@ live-verification steps, and `sc --doctor` now automates most of Phase 0.
 | --- | --- |
 | Binary / command | `sc` |
 | Product name | Subconscious Code |
-| Default base URL | `https://awsgateway.orangelinelabs.com/v1` |
-| Default model | `gw-glm-5.2` |
+| Default base URL | `https://api-dev.subconscious.dev/v1` |
+| Default model | `subconscious/glm-5.2` |
 | API key | `$SC_API_KEY` (user-supplied; never in the repo) |
 | Config dir | `~/.sc/` (settings, sessions, memory, bg logs) |
 | Project dir | `./.sc/` |
@@ -307,7 +307,7 @@ not yet done on the box:
 
 1. `sc --doctor` and `sc --doctor --body-ladder` against the real endpoint — the
    make-or-break body-ceiling measurement.
-2. `sc -p "…"` — a real one-shot against `gw-glm-5.2`.
+2. `sc -p "…"` — a real one-shot against `subconscious/glm-5.2`.
 3. **The scale test.** Read several MB of real files into a session and record
    (a) peak RSS vs context size — **the `Arc<str>` change should bring the old
    ~6× multiple down; re-measure it**, (b) time-to-first-token vs body size,
@@ -325,7 +325,7 @@ names still say `rc`. Worth one mechanical commit later.
 
 ## Open questions
 
-1. **Small model.** `small_model` defaults to `gw-glm-5.2` (same as the main
+1. **Small model.** `small_model` defaults to `subconscious/glm-5.2` (same as the main
    model) since no separate small model was specified. Nothing reads it yet.
 2. **Gateway body ceiling** — `sc --doctor --body-ladder` answers this in a minute.
    It's the one result that could invalidate the thesis on this route.

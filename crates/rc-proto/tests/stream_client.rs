@@ -2,11 +2,11 @@
 //! emitting SSE. Proves the streaming path end-to-end — text deltas, tool-call
 //! argument reassembly across fragments, finish, and the trailing usage chunk.
 
-use std::time::Duration;
 use rc_proto::stream::AgentStreamEvent;
 use rc_proto::{ChatClient, CompleteOpts, RetryOpts, WireMessage};
+use std::time::Duration;
 use tokio_stream::StreamExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn sse_body(lines: &[&str]) -> String {
@@ -25,18 +25,34 @@ async fn streams_text_finish_and_usage() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
+        .and(header("x-subconscious-client", "subconscious_code"))
+        .and(header(
+            "x-subconscious-code-session-id",
+            "session-stream-123",
+        ))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(body.into_bytes(), "text/event-stream"),
+            ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"),
         )
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600))).unwrap();
+    let client = ChatClient::new(
+        server.uri(),
+        "k".into(),
+        "m".into(),
+        Some(Duration::from_secs(600)),
+    )
+    .unwrap();
+    let opts = CompleteOpts {
+        session_id: Some("session-stream-123".into()),
+        ..CompleteOpts::default()
+    };
     let mut stream = client
         .stream(
-            &[WireMessage::User { content: "hi".into() }],
-            &CompleteOpts::default(),
+            &[WireMessage::User {
+                content: "hi".into(),
+            }],
+            &opts,
             &[],
         )
         .await
@@ -73,26 +89,28 @@ async fn stream_assembles_tool_call_args_across_fragments() {
         }}]
     });
     let c3 = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
-    let body = sse_body(&[
-        &c1.to_string(),
-        &c2.to_string(),
-        &c3.to_string(),
-        "[DONE]",
-    ]);
+    let body = sse_body(&[&c1.to_string(), &c2.to_string(), &c3.to_string(), "[DONE]"]);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(body.into_bytes(), "text/event-stream"),
+            ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"),
         )
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600))).unwrap();
+    let client = ChatClient::new(
+        server.uri(),
+        "k".into(),
+        "m".into(),
+        Some(Duration::from_secs(600)),
+    )
+    .unwrap();
     let mut stream = client
         .stream(
-            &[WireMessage::User { content: "read it".into() }],
+            &[WireMessage::User {
+                content: "read it".into(),
+            }],
             &CompleteOpts::default(),
             &[],
         )
@@ -103,7 +121,11 @@ async fn stream_assembles_tool_call_args_across_fragments() {
     let mut finish = String::new();
     while let Some(ev) = stream.next().await {
         match ev.unwrap() {
-            AgentStreamEvent::ToolCallReady { id, name, arguments } => {
+            AgentStreamEvent::ToolCallReady {
+                id,
+                name,
+                arguments,
+            } => {
                 ready = Some((id, name, arguments));
             }
             AgentStreamEvent::Finish { reason } => finish = format!("{reason:?}"),
@@ -130,21 +152,50 @@ async fn stream_retries_on_429_then_streams() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
+        .and(header(
+            "x-subconscious-code-session-id",
+            "session-retry-123",
+        ))
         .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
         .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"))
+        .and(header(
+            "x-subconscious-code-session-id",
+            "session-retry-123",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"),
+        )
         .mount(&server)
         .await;
 
-    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), Some(Duration::from_secs(600)))
-        .unwrap()
-        .with_retry(RetryOpts { max_retries: 2, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(5) });
+    let client = ChatClient::new(
+        server.uri(),
+        "k".into(),
+        "m".into(),
+        Some(Duration::from_secs(600)),
+    )
+    .unwrap()
+    .with_retry(RetryOpts {
+        max_retries: 2,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    });
+    let opts = CompleteOpts {
+        session_id: Some("session-retry-123".into()),
+        ..CompleteOpts::default()
+    };
     let mut stream = client
-        .stream(&[WireMessage::User { content: "hi".into() }], &CompleteOpts::default(), &[])
+        .stream(
+            &[WireMessage::User {
+                content: "hi".into(),
+            }],
+            &opts,
+            &[],
+        )
         .await
         .unwrap();
     let mut text = String::new();
@@ -155,7 +206,11 @@ async fn stream_retries_on_429_then_streams() {
     }
     assert_eq!(text, "hi");
     assert_eq!(
-        server.received_requests().await.expect("requests recorded").len(),
+        server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .len(),
         2,
         "1 initial 429 + 1 retry 200"
     );

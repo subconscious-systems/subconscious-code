@@ -38,10 +38,17 @@ pub enum ToolOutcome {
 
 impl ToolOutcome {
     pub fn ok(content: String) -> Self {
-        Self::Ok { content, truncated: false, artifacts: Vec::new() }
+        Self::Ok {
+            content,
+            truncated: false,
+            artifacts: Vec::new(),
+        }
     }
     pub fn error(message: String) -> Self {
-        Self::Error { message, retryable: false }
+        Self::Error {
+            message,
+            retryable: false,
+        }
     }
 }
 

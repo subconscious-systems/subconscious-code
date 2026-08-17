@@ -29,7 +29,6 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-
 /// A single message in the conversation — the wire projection of a `Turn`.
 ///
 /// Field order in this enum is not significant to serialization (`serde` tags
@@ -231,20 +230,35 @@ impl Usage {
             .filter(|c| *c > 0)
     }
 
+    /// Fraction of prompt tokens served from the provider's prompt cache.
+    /// `None` means the backend did not report prompt-token details (or did
+    /// not report a usable prompt total); a reported zero is a real `0%` hit.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        let details = self.prompt_tokens_details.as_ref()?;
+        if self.prompt_tokens == 0 {
+            return None;
+        }
+        Some((details.cached_tokens.min(self.prompt_tokens) as f64) / self.prompt_tokens as f64)
+    }
+
     /// Accumulate `other` into `self` (saturating). For a session running total:
     /// each turn's prompt re-sends the prefix, so the summed `total_tokens` is an
     /// upper bound, not the marginal cost; `completion_tokens` is the true
     /// cumulative output, and `cached_tokens` sums cache-hit counts.
     pub fn add(&mut self, other: &Usage) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
-        self.completion_tokens = self.completion_tokens.saturating_add(other.completion_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         let cached = self
             .cached_tokens()
             .unwrap_or(0)
             .saturating_add(other.cached_tokens().unwrap_or(0));
         if cached > 0 {
-            self.prompt_tokens_details = Some(PromptTokensDetails { cached_tokens: cached });
+            self.prompt_tokens_details = Some(PromptTokensDetails {
+                cached_tokens: cached,
+            });
         }
     }
 }
@@ -285,7 +299,28 @@ mod tests {
         };
         a.add(&b);
         assert_eq!(a.total_tokens, 6);
-        assert!(a.prompt_tokens_details.is_none(), "no cached -> details stay None");
+        assert!(
+            a.prompt_tokens_details.is_none(),
+            "no cached -> details stay None"
+        );
+    }
+
+    #[test]
+    fn cache_hit_rate_uses_returned_prompt_tokens() {
+        let usage = Usage {
+            prompt_tokens: 80,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 20 }),
+            ..Usage::default()
+        };
+        assert_eq!(usage.cache_hit_rate(), Some(0.25));
+
+        let miss = Usage {
+            prompt_tokens: 80,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+            ..Usage::default()
+        };
+        assert_eq!(miss.cache_hit_rate(), Some(0.0));
+        assert_eq!(Usage::default().cache_hit_rate(), None);
     }
 
     /// GLM-class gateways send `"tool_calls": null` in text-only responses.
@@ -309,6 +344,10 @@ mod tests {
                 {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}"#,
         )
         .unwrap();
-        assert_eq!(with_calls.tool_calls.len(), 1, "a real tool call still parses");
+        assert_eq!(
+            with_calls.tool_calls.len(),
+            1,
+            "a real tool call still parses"
+        );
     }
 }

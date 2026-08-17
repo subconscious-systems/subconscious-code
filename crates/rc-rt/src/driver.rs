@@ -15,7 +15,10 @@ use crate::prompter::RuntimePrompter;
 pub(crate) enum DriverCmd {
     /// Run one turn for `prompt`; `cancel` is the per-turn token the pump also
     /// holds a handle to (so `Cancel` can fire it mid-turn).
-    Run { prompt: String, cancel: CancellationToken },
+    Run {
+        prompt: String,
+        cancel: CancellationToken,
+    },
     /// Update `session.mode` for rendering/persistence (enforcement already
     /// changed via `permission.set_mode` in the pump).
     SetMode(AgentMode),
@@ -65,7 +68,24 @@ pub(crate) async fn driver_task(
                 let _ = events.send(AgentEvent::Idle);
             }
             DriverCmd::SetMode(mode) => {
-                session.mode = mode;
+                if session.mode != mode {
+                    session.mode = mode;
+                    // The header is append-only, so record later mode changes
+                    // as metadata notes. rc-session replays the latest one on
+                    // resume while rc-tui keeps it out of the transcript.
+                    session.messages.push(Turn::SystemNote {
+                        kind: NoteKind::ModeChange,
+                        text: persisted_mode(mode).to_string(),
+                    });
+                    if let Some(store) = store.as_mut() {
+                        if let Some(turn) = session.messages.last() {
+                            if let Err(e) = store.append_turn(turn) {
+                                tracing::warn!("session persist (mode change) failed: {e}");
+                            }
+                        }
+                    }
+                    persisted = session.messages.len();
+                }
             }
             DriverCmd::Rewind { steps } => {
                 match rc_session::rewind::rewind_session(&mut session, steps) {
@@ -106,5 +126,15 @@ pub(crate) async fn driver_task(
     // drop, so this must be explicit.
     if let Ok(mut s) = session.shell_state.lock() {
         s.shutdown();
+    }
+}
+
+fn persisted_mode(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Default => "default",
+        AgentMode::AcceptEdits => "accept_edits",
+        AgentMode::Plan => "plan",
+        AgentMode::Ask => "ask",
+        AgentMode::Auto => "auto",
     }
 }

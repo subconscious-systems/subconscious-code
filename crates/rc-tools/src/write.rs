@@ -57,7 +57,12 @@ use `Write` only for new files or complete rewrites."
 
         let canon = match resolve_within_loose(&ctx.allowed_roots, &ctx.cwd, &inp.file_path) {
             Ok(p) => p,
-            Err(msg) => return Ok(ToolOutcome::Error { message: msg, retryable: false }),
+            Err(msg) => {
+                return Ok(ToolOutcome::Error {
+                    message: msg,
+                    retryable: false,
+                })
+            }
         };
 
         if canon.exists() {
@@ -147,7 +152,10 @@ mod tests {
         let ctx = test_ctx(dir.path());
         // Read first (registers in the registry).
         let _ = crate::Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &ctx)
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                &ctx,
+            )
             .await;
         let out = Write::new()
             .call(
@@ -167,7 +175,10 @@ mod tests {
         std::fs::write(&path, "v1\n").unwrap();
         let ctx = test_ctx(dir.path());
         let _ = crate::Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &ctx)
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                &ctx,
+            )
             .await;
         // Externally change the file (content differs from the recorded hash).
         std::fs::write(&path, "v2 — changed out of band\n").unwrap();

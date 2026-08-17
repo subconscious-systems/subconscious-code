@@ -101,7 +101,12 @@ impl Tool for Read {
 
         let canon = match resolve_within(&ctx.allowed_roots, &ctx.cwd, &inp.file_path) {
             Ok(p) => p,
-            Err(msg) => return Ok(ToolOutcome::Error { message: msg, retryable: false }),
+            Err(msg) => {
+                return Ok(ToolOutcome::Error {
+                    message: msg,
+                    retryable: false,
+                })
+            }
         };
 
         let bytes = match std::fs::read(&canon) {
@@ -177,7 +182,11 @@ fn render_lines(
     let mut out = String::new();
     for (i, line) in lines[start..end].iter().enumerate() {
         let lineno = start + i + 1; // 1-based
-        out.push_str(&format!("{:>6}\t{}\n", lineno, truncate_line(line, max_line_chars)));
+        out.push_str(&format!(
+            "{:>6}\t{}\n",
+            lineno,
+            truncate_line(line, max_line_chars)
+        ));
     }
     out
 }
@@ -216,7 +225,10 @@ mod tests {
         let path = dir.path().join("hello.txt");
         std::fs::write(&path, "first\nsecond\nthird\n").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                &test_ctx(dir.path()),
+            )
             .await
             .unwrap();
         match out {
@@ -235,7 +247,10 @@ mod tests {
         let path = dir.path().join("empty.txt");
         std::fs::write(&path, "").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                &test_ctx(dir.path()),
+            )
             .await
             .unwrap();
         match out {
@@ -250,7 +265,10 @@ mod tests {
         let path = dir.path().join("bin.dat");
         std::fs::write(&path, b"abc\x00def").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                &test_ctx(dir.path()),
+            )
             .await
             .unwrap();
         match out {
@@ -266,12 +284,18 @@ mod tests {
         let path = outside.path().join("secret.txt");
         std::fs::write(&path, "nope").unwrap();
         let out = Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), &test_ctx(dir.path()))
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                &test_ctx(dir.path()),
+            )
             .await
             .unwrap();
         match out {
             ToolOutcome::Error { message, .. } => {
-                assert!(message.contains("outside") || message.contains("roots"), "{message}")
+                assert!(
+                    message.contains("outside") || message.contains("roots"),
+                    "{message}"
+                )
             }
             o => panic!("expected an outside-roots refusal, got {o:?}"),
         }

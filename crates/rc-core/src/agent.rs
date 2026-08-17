@@ -4,8 +4,8 @@
 
 use crate::context::ContextAssembler;
 use crate::model::{EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse};
-use crate::prompt::{AskResponse, Prompter};
 use crate::project::{project, verify_invariant};
+use crate::prompt::{AskResponse, Prompter};
 use crate::registry::ToolRegistry;
 use crate::tool::{Concurrency, SandboxPolicy, Tool, ToolCtx, ToolOutcome};
 use crate::turn::{Session, ToolCall, ToolResultBody, Turn};
@@ -50,7 +50,10 @@ fn message_len(m: &WireMessage) -> usize {
         WireMessage::User { content } => match content {
             rc_proto::wire::UserContent::Text(t) => t.chars().count(),
         },
-        WireMessage::Assistant { content, tool_calls } => {
+        WireMessage::Assistant {
+            content,
+            tool_calls,
+        } => {
             content.as_deref().map_or(0, |c| c.chars().count())
                 + tool_calls
                     .iter()
@@ -216,7 +219,10 @@ impl AgentLoop {
         prompter: &dyn Prompter,
         cancel: CancellationToken,
     ) -> Result<LoopOutcome, LoopError> {
-        session.messages.push(Turn::User { content: Arc::from(user_input), ts: SystemTime::now() });
+        session.messages.push(Turn::User {
+            content: Arc::from(user_input),
+            ts: SystemTime::now(),
+        });
         let turn_start = SystemTime::now();
 
         // M7: sync the session cwd from the live shell state (a `cd` from the
@@ -284,11 +290,17 @@ impl AgentLoop {
                 opts: CompleteOpts {
                     max_tokens: self.max_tokens,
                     temperature: self.temperature,
+                    session_id: Some(session.id.clone()),
                     idle_timeout: self.idle_timeout,
                 },
             };
-            let ModelResponse { text, reasoning, tool_calls, finish_reason, usage } =
-                self.model.complete(req, sink).await?;
+            let ModelResponse {
+                text,
+                reasoning,
+                tool_calls,
+                finish_reason,
+                usage,
+            } = self.model.complete(req, sink).await?;
             // Wrap the response text once; the assistant turn (and any re-sends of
             // it on later turns) then share this allocation via refcount bumps.
             let text = Arc::<str>::from(text);
@@ -309,16 +321,26 @@ impl AgentLoop {
                         assistant_calls.push(c.clone());
                         exec_list.push(ExecItem::Call(c));
                     }
-                    FinalizedToolCall::ParseError { id, name, raw, error } => {
-                        let call_id =
-                            id.clone().unwrap_or_else(|| format!("parseerr_{}", assistant_calls.len()));
+                    FinalizedToolCall::ParseError {
+                        id,
+                        name,
+                        raw,
+                        error,
+                    } => {
+                        let call_id = id
+                            .clone()
+                            .unwrap_or_else(|| format!("parseerr_{}", assistant_calls.len()));
                         let tool_name = name.unwrap_or_default();
                         assistant_calls.push(ToolCall {
                             id: call_id.clone(),
                             name: tool_name.clone(),
                             arguments: Arc::from(raw),
                         });
-                        exec_list.push(ExecItem::ParseError { call_id, tool_name, error });
+                        exec_list.push(ExecItem::ParseError {
+                            call_id,
+                            tool_name,
+                            error,
+                        });
                     }
                 }
             }
@@ -331,10 +353,20 @@ impl AgentLoop {
             // `assistant_calls` into the turn; only the uncommon early paths clone.)
             match finish_reason {
                 FinishReason::ToolCalls => {
-                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls, usage });
+                    session.messages.push(Turn::Assistant {
+                        text,
+                        reasoning,
+                        calls: assistant_calls,
+                        usage,
+                    });
                 }
                 FinishReason::Stop => {
-                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls.clone(), usage });
+                    session.messages.push(Turn::Assistant {
+                        text,
+                        reasoning,
+                        calls: assistant_calls.clone(),
+                        usage,
+                    });
                     synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Stop);
                 }
@@ -348,7 +380,12 @@ impl AgentLoop {
                     // must hold) and stop, since re-continuing with outstanding
                     // calls would re-send a malformed assistant message.
                     if assistant_calls.is_empty() {
-                        session.messages.push(Turn::Assistant { text, reasoning, calls: Vec::new(), usage });
+                        session.messages.push(Turn::Assistant {
+                            text,
+                            reasoning,
+                            calls: Vec::new(),
+                            usage,
+                        });
                         let continued = session.messages.len();
                         session.messages.push(Turn::User {
                             content: Arc::from("continue"),
@@ -361,12 +398,22 @@ impl AgentLoop {
                         continue;
                     }
                     tracing::warn!("finish_reason=length with outstanding tool calls; stopping");
-                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls.clone(), usage });
+                    session.messages.push(Turn::Assistant {
+                        text,
+                        reasoning,
+                        calls: assistant_calls.clone(),
+                        usage,
+                    });
                     synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Length);
                 }
                 FinishReason::ContentFilter | FinishReason::Other(_) => {
-                    session.messages.push(Turn::Assistant { text, reasoning, calls: assistant_calls.clone(), usage });
+                    session.messages.push(Turn::Assistant {
+                        text,
+                        reasoning,
+                        calls: assistant_calls.clone(),
+                        usage,
+                    });
                     synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Stop);
                 }
@@ -393,9 +440,12 @@ impl AgentLoop {
                     result
                 };
                 sink.on_tool_end(&call_id, &tool, &result);
-                session
-                    .messages
-                    .push(Turn::ToolResult { call_id, tool, result, duration });
+                session.messages.push(Turn::ToolResult {
+                    call_id,
+                    tool,
+                    result,
+                    duration,
+                });
             }
         }
     }
@@ -414,11 +464,7 @@ fn allowed_roots(session: &Session) -> Vec<std::path::PathBuf> {
 /// no answers, which `verify_invariant` would flag next turn (debug_assert panic
 /// / a malformed request to the provider). The tools are NOT executed; each
 /// outstanding call gets an `Interrupted` result and a terminal `on_tool_end`.
-fn synthesize_interrupted(
-    messages: &mut Vec<Turn>,
-    calls: &[ToolCall],
-    sink: &dyn EventSink,
-) {
+fn synthesize_interrupted(messages: &mut Vec<Turn>, calls: &[ToolCall], sink: &dyn EventSink) {
     for c in calls {
         sink.on_tool_end(&c.id, &c.name, &ToolResultBody::Interrupted);
         messages.push(Turn::ToolResult {
@@ -432,7 +478,11 @@ fn synthesize_interrupted(
 
 enum ExecItem {
     Call(ToolCall),
-    ParseError { call_id: String, tool_name: String, error: String },
+    ParseError {
+        call_id: String,
+        tool_name: String,
+        error: String,
+    },
 }
 
 /// A pending parallel tool task: its batch index, call id/name, and the
@@ -498,25 +548,27 @@ async fn execute_batch(
                         );
                         false
                     }
-                    Decision::Ask(reason) => match prompter.ask(&call.name, &input, &reason).await {
-                        AskResponse::Once => true,
-                        AskResponse::Session(rule) | AskResponse::Always(rule) => {
-                            grants.push(rule);
-                            true
+                    Decision::Ask(reason) => {
+                        match prompter.ask(&call.name, &input, &reason).await {
+                            AskResponse::Once => true,
+                            AskResponse::Session(rule) | AskResponse::Always(rule) => {
+                                grants.push(rule);
+                                true
+                            }
+                            AskResponse::Deny(reason) => {
+                                results.insert(
+                                    i,
+                                    (
+                                        call.id.clone(),
+                                        call.name.clone(),
+                                        ToolResultBody::Denied { reason },
+                                        Duration::ZERO,
+                                    ),
+                                );
+                                false
+                            }
                         }
-                        AskResponse::Deny(reason) => {
-                            results.insert(
-                                i,
-                                (
-                                    call.id.clone(),
-                                    call.name.clone(),
-                                    ToolResultBody::Denied { reason },
-                                    Duration::ZERO,
-                                ),
-                            );
-                            false
-                        }
-                    },
+                    }
                 };
                 if !allowed {
                     continue;
@@ -543,7 +595,11 @@ async fn execute_batch(
                     }
                 }
             }
-            ExecItem::ParseError { call_id, tool_name, error } => {
+            ExecItem::ParseError {
+                call_id,
+                tool_name,
+                error,
+            } => {
                 results.insert(
                     i,
                     (
@@ -625,7 +681,10 @@ async fn run_one(
     let input: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let outcome = match tool.call(input, &ctx).await {
         Ok(o) => o,
-        Err(e) => ToolOutcome::Error { message: e.to_string(), retryable: false },
+        Err(e) => ToolOutcome::Error {
+            message: e.to_string(),
+            retryable: false,
+        },
     };
     let dur = start.elapsed().unwrap_or(Duration::ZERO);
     (call.id, call.name, outcome.into(), dur)

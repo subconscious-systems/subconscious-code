@@ -41,14 +41,20 @@ pub struct Caps {
 impl Caps {
     /// No truncation at all — the shipped default.
     pub const fn unlimited() -> Self {
-        Self { inline_file: 0, tool_result: 0 }
+        Self {
+            inline_file: 0,
+            tool_result: 0,
+        }
     }
 
     /// The historical M6 caps (8 KB mentions, 16 KB tool results). Kept as a
     /// named preset for small-context models and for the regression tests that
     /// pin the truncation behaviour.
     pub const fn bounded() -> Self {
-        Self { inline_file: 8 * 1024, tool_result: 16 * 1024 }
+        Self {
+            inline_file: 8 * 1024,
+            tool_result: 16 * 1024,
+        }
     }
 }
 
@@ -91,7 +97,12 @@ impl Environment {
             other => other.to_string(),
         };
         let git_branch = read_git_branch(cwd);
-        Self { cwd: cwd.to_path_buf(), platform, date, git_branch }
+        Self {
+            cwd: cwd.to_path_buf(),
+            platform,
+            date,
+            git_branch,
+        }
     }
 
     /// Convenience: detect the environment from `cwd` with today's date
@@ -121,7 +132,8 @@ impl Environment {
 fn read_git_branch(cwd: &Path) -> Option<String> {
     let head = std::fs::read_to_string(cwd.join(".git").join("HEAD")).ok()?;
     let line = head.trim();
-    line.strip_prefix("ref: refs/heads/").map(|name| name.to_string())
+    line.strip_prefix("ref: refs/heads/")
+        .map(|name| name.to_string())
 }
 
 /// Today's date as "Weekday Mon D, YYYY" (UTC), e.g. "Monday Jul 28, 2026".
@@ -171,11 +183,15 @@ fn load_memory(path: &Path, label: &str) -> Option<Memory> {
     if contents.trim().is_empty() {
         return None;
     }
-    Some(Memory { path: label.to_string(), contents })
+    Some(Memory {
+        path: label.to_string(),
+        contents,
+    })
 }
 
 /// The identity line that opens the §4.6 system prompt.
-const IDENTITY: &str = "You are `sc` (Subconscious Code), a terminal agent that helps with software engineering \
+const IDENTITY: &str =
+    "You are `sc` (Subconscious Code), a terminal agent that helps with software engineering \
 tasks in the user's repository. Use the provided tools to inspect and edit files. Be concise and \
 direct. When you have enough information, answer in plain text.";
 
@@ -222,14 +238,22 @@ impl ContextAssembler {
     pub fn new(env: Environment) -> Self {
         let memories = Memory::load_chain(&env.cwd);
         let system_prompt = build_system_prompt(&env, &memories);
-        Self { env, system_prompt, caps: Caps::unlimited() }
+        Self {
+            env,
+            system_prompt,
+            caps: Caps::unlimited(),
+        }
     }
 
     /// Build an assembler with an explicit system prompt (e.g. for tests, or a
     /// caller that assembles its own memory chain). The environment is still
     /// carried for mention-expansion root resolution.
     pub fn with_system_prompt(env: Environment, system_prompt: String) -> Self {
-        Self { env, system_prompt, caps: Caps::unlimited() }
+        Self {
+            env,
+            system_prompt,
+            caps: Caps::unlimited(),
+        }
     }
 
     /// Set the per-item truncation caps. `0` in any field means unlimited.
@@ -291,7 +315,10 @@ fn prepare_turns(turns: &[Turn], root: &Path, caps: Caps) -> Vec<Turn> {
         match turn {
             Turn::User { content, ts } => {
                 let expanded = expand_mentions(content, root, caps.inline_file);
-                out.push(Turn::User { content: Arc::from(expanded), ts: *ts });
+                out.push(Turn::User {
+                    content: Arc::from(expanded),
+                    ts: *ts,
+                });
             }
             other => out.push(other.clone()),
         }
@@ -403,7 +430,12 @@ fn truncate_tool_results(turns: &[Turn], cap: usize) -> Vec<Turn> {
     turns
         .iter()
         .map(|t| match t {
-            Turn::ToolResult { call_id, tool, result, duration } => {
+            Turn::ToolResult {
+                call_id,
+                tool,
+                result,
+                duration,
+            } => {
                 let result = result.truncate_body(cap);
                 Turn::ToolResult {
                     call_id: call_id.clone(),
@@ -442,14 +474,20 @@ mod tests {
     const TOOL_RESULT_CAP: usize = Caps::bounded().tool_result;
 
     fn user(content: &str) -> Turn {
-        Turn::User { content: content.into(), ts: SystemTime::now() }
+        Turn::User {
+            content: content.into(),
+            ts: SystemTime::now(),
+        }
     }
 
     fn tool_ok(call_id: &str, content: &str) -> Turn {
         Turn::ToolResult {
             call_id: call_id.into(),
             tool: "Read".into(),
-            result: ToolResultBody::Ok { content: content.into(), truncated: false },
+            result: ToolResultBody::Ok {
+                content: content.into(),
+                truncated: false,
+            },
             duration: Default::default(),
         }
     }
@@ -480,8 +518,14 @@ mod tests {
             git_branch: None,
         };
         let mem = vec![
-            Memory { path: "~/.sc/AGENTS.md".into(), contents: "global rule".into() },
-            Memory { path: "AGENTS.md".into(), contents: "repo rule".into() },
+            Memory {
+                path: "~/.sc/AGENTS.md".into(),
+                contents: "global rule".into(),
+            },
+            Memory {
+                path: "AGENTS.md".into(),
+                contents: "repo rule".into(),
+            },
         ];
         let prompt = build_system_prompt(&env, &mem);
         assert!(prompt.contains("# Memory"));
@@ -513,7 +557,9 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "repo memory\n").unwrap();
         let chain = Memory::load_chain(dir.path());
-        assert!(chain.iter().any(|m| m.path == "AGENTS.md" && m.contents.contains("repo memory")));
+        assert!(chain
+            .iter()
+            .any(|m| m.path == "AGENTS.md" && m.contents.contains("repo memory")));
     }
 
     #[test]
@@ -593,7 +639,10 @@ mod tests {
             head.len(),
             INLINE_FILE_CAP
         );
-        assert!(head.is_char_boundary(head.len()), "head ends on a char boundary");
+        assert!(
+            head.is_char_boundary(head.len()),
+            "head ends on a char boundary"
+        );
     }
 
     /// The product thesis, at the mention layer: with the shipped default an
@@ -604,7 +653,10 @@ mod tests {
         let big = "x".repeat(INLINE_FILE_CAP * 4);
         std::fs::write(dir.path().join("big.txt"), &big).unwrap();
         let out = expand_mentions("@big.txt", dir.path(), Caps::unlimited().inline_file);
-        assert!(!out.contains("more bytes truncated"), "must not truncate at cap 0");
+        assert!(
+            !out.contains("more bytes truncated"),
+            "must not truncate at cap 0"
+        );
         assert!(out.contains(&big), "the whole file is inlined");
     }
 
@@ -617,7 +669,9 @@ mod tests {
         let out = truncate_tool_results(&turns, Caps::unlimited().tool_result);
         match &out[1] {
             Turn::ToolResult { result, .. } => {
-                let ToolResultBody::Ok { content, truncated } = result else { panic!() };
+                let ToolResultBody::Ok { content, truncated } = result else {
+                    panic!()
+                };
                 assert!(!*truncated, "must not be flagged truncated at cap 0");
                 assert_eq!(content.len(), big.len(), "body kept whole");
             }
@@ -648,7 +702,10 @@ mod tests {
 
     #[test]
     fn expand_mentions_with_no_at_returns_input_unchanged() {
-        assert_eq!(expand_mentions("no mentions here", Path::new("/"), 0), "no mentions here");
+        assert_eq!(
+            expand_mentions("no mentions here", Path::new("/"), 0),
+            "no mentions here"
+        );
     }
 
     #[test]
@@ -658,9 +715,15 @@ mod tests {
         let out = truncate_tool_results(&turns, TOOL_RESULT_CAP);
         match &out[1] {
             Turn::ToolResult { result, .. } => {
-                let ToolResultBody::Ok { content, truncated } = result else { panic!() };
+                let ToolResultBody::Ok { content, truncated } = result else {
+                    panic!()
+                };
                 assert!(*truncated, "must be flagged truncated");
-                assert!(content.len() <= TOOL_RESULT_CAP + 64, "cap+sentinel: {}", content.len());
+                assert!(
+                    content.len() <= TOOL_RESULT_CAP + 64,
+                    "cap+sentinel: {}",
+                    content.len()
+                );
                 assert!(content.contains("truncated"), "sentinel present: {content}");
             }
             other => panic!("expected tool result, got {other:?}"),
@@ -712,11 +775,16 @@ mod tests {
             .iter()
             .rev()
             .find_map(|m| match m {
-                WireMessage::User { content: rc_proto::wire::UserContent::Text(t) } => Some(t.clone()),
+                WireMessage::User {
+                    content: rc_proto::wire::UserContent::Text(t),
+                } => Some(t.clone()),
                 _ => None,
             })
             .unwrap();
-        assert!(last_user_content.contains("BBB"), "last user inlined: {last_user_content}");
+        assert!(
+            last_user_content.contains("BBB"),
+            "last user inlined: {last_user_content}"
+        );
         assert!(last_user_content.contains("@b.txt"));
     }
 }

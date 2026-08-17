@@ -74,7 +74,13 @@ pub fn toolchain_dirs_for(home: &Path, conda_prefix: Option<&Path>) -> Vec<PathB
 
     // nvm: resolve the default alias to a version's bin dir.
     if let Some(default) = read_trim(home.join(".nvm").join("alias").join("default")) {
-        push(home.join(".nvm").join("versions").join("node").join(default).join("bin"));
+        push(
+            home.join(".nvm")
+                .join("versions")
+                .join("node")
+                .join(default)
+                .join("bin"),
+        );
     }
     push(home.join(".pyenv").join("shims"));
     if let Some(cp) = conda_prefix {
@@ -198,10 +204,7 @@ mod tests {
         mkdir(&conda.path().join("bin"));
         mkdir(&h.join(".local/bin"));
         let dirs = toolchain_dirs_for(h, Some(conda.path()));
-        assert_eq!(
-            dirs,
-            vec![conda.path().join("bin"), h.join(".local/bin")]
-        );
+        assert_eq!(dirs, vec![conda.path().join("bin"), h.join(".local/bin")]);
     }
 
     #[test]

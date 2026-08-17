@@ -22,10 +22,19 @@ pub enum AgentEvent {
     /// A tool call finished — one per batch item, including denied /
     /// parse-error / unknown-tool results, so the host always observes a
     /// terminal state for every announced call.
-    ToolEnd { call_id: String, tool: String, result: ToolResultBody },
+    ToolEnd {
+        call_id: String,
+        tool: String,
+        result: ToolResultBody,
+    },
     /// A tool call escalated to Ask; the async prompter is awaiting an answer
     /// (a `UserAction::PermissionAnswer` with this `id`).
-    PermissionAsk { id: u64, tool: String, input: Value, reason: String },
+    PermissionAsk {
+        id: u64,
+        tool: String,
+        input: Value,
+        reason: String,
+    },
     /// The prompter got an answer (or the ask was cancelled → `Deny`).
     PermissionDecision { id: u64, response: AskResponse },
     /// Top of a loop iteration.

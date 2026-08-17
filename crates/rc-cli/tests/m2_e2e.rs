@@ -6,9 +6,9 @@
 use async_trait::async_trait;
 use rc_core::tool::Tool;
 use rc_core::{
-    AgentLoop, AllowAllChecker, EventSink, FinalizedToolCall, FinishReason, Model, ModelError,
-    ModelRequest, ModelResponse, NullPrompter, NullSink, PermissionChecker, Session, ToolCall,
-    ToolRegistry, Turn, project, verify_invariant,
+    project, verify_invariant, AgentLoop, AllowAllChecker, EventSink, FinalizedToolCall,
+    FinishReason, Model, ModelError, ModelRequest, ModelResponse, NullPrompter, NullSink,
+    PermissionChecker, Session, ToolCall, ToolRegistry, Turn,
 };
 use rc_tools::{Bash, Edit, Read};
 use std::collections::VecDeque;
@@ -21,13 +21,24 @@ struct MockModel {
 }
 impl MockModel {
     fn new(responses: Vec<ModelResponse>) -> Self {
-        Self { responses: Mutex::new(responses.into_iter().collect()) }
+        Self {
+            responses: Mutex::new(responses.into_iter().collect()),
+        }
     }
 }
 #[async_trait]
 impl Model for MockModel {
-    async fn complete(&self, _req: ModelRequest, _sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
-        Ok(self.responses.lock().unwrap().pop_front().expect("scripted responses exhausted"))
+    async fn complete(
+        &self,
+        _req: ModelRequest,
+        _sink: &dyn EventSink,
+    ) -> Result<ModelResponse, ModelError> {
+        Ok(self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted responses exhausted"))
     }
 }
 
@@ -100,11 +111,21 @@ async fn add_verbose_flag_and_compile() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s".into(), dir.path().to_path_buf(), "mock".into());
     agent
-        .run(&mut session, "add a --verbose flag and make it compile".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "add a --verbose flag and make it compile".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 

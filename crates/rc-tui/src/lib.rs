@@ -13,14 +13,19 @@
 mod app;
 mod complete;
 mod diff;
+#[cfg(test)]
+mod logo3d;
 mod markdown;
+mod menu;
 mod theme;
 mod view;
 
 use std::io::Stdout;
 use std::path::PathBuf;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -28,6 +33,8 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use rc_rt::Runtime;
+
+pub use menu::Outcome;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -37,18 +44,50 @@ pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 ///
 /// `cwd` is the session's working directory, used by the M4c composer
 /// autocomplete to resolve `@file` mentions.
-pub fn run(runtime: Runtime, model_name: String, cwd: PathBuf) -> anyhow::Result<()> {
+/// `history` is the already-persisted turn log for a resumed session; it is
+/// rendered before the first frame while the same turns live in the runtime's
+/// model context.
+///
+/// Returns `Some(`[`Outcome`]`)` when the user picked another session (or a
+/// fresh one) from `/menu`. The TUI can't perform that switch itself — a
+/// different session means a different cwd, tool set, and permission roots,
+/// all constructed above this crate — so the caller is expected to rebuild
+/// against the returned target and call `run` again.
+pub fn run(
+    runtime: Runtime,
+    model_name: String,
+    cwd: PathBuf,
+    initial_mode: rc_core::AgentMode,
+    history: Vec<rc_core::Turn>,
+) -> anyhow::Result<Option<Outcome>> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = app::run(&mut terminal, runtime, model_name, cwd);
+    let result = app::run(
+        &mut terminal,
+        runtime,
+        model_name,
+        cwd,
+        initial_mode,
+        history,
+    );
 
     // Restore the terminal whatever happened above.
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     let _ = terminal.show_cursor();
     result
 }

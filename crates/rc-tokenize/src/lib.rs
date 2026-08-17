@@ -59,7 +59,9 @@ impl Default for Estimator {
 impl Estimator {
     /// A fresh estimator starting from the default prior (~4 chars/token).
     pub fn new() -> Self {
-        Self { factor: std::sync::Arc::new(Mutex::new(PRIOR_CHARS_PER_TOKEN)) }
+        Self {
+            factor: std::sync::Arc::new(Mutex::new(PRIOR_CHARS_PER_TOKEN)),
+        }
     }
 
     /// The current chars-per-token factor (the EWMA). Exposed for display and
@@ -171,7 +173,11 @@ mod tests {
             e.observe(1000, 5000); // steady 5.0 chars/token
         }
         // The EWMA converges toward 5.0; assert it's within 1%.
-        assert!((e.factor() - 5.0).abs() < 0.05, "converged to {}", e.factor());
+        assert!(
+            (e.factor() - 5.0).abs() < 0.05,
+            "converged to {}",
+            e.factor()
+        );
     }
 
     #[test]
@@ -180,7 +186,11 @@ mod tests {
         let before = e.factor();
         e.observe(0, 5000);
         e.observe(1000, 0);
-        assert_eq!(e.factor(), before, "degenerate samples must not move the EWMA");
+        assert_eq!(
+            e.factor(),
+            before,
+            "degenerate samples must not move the EWMA"
+        );
     }
 
     #[test]

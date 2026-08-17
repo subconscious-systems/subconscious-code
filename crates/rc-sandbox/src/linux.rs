@@ -63,10 +63,11 @@ fn ioerr(e: impl std::fmt::Display) -> io::Error {
 /// Returns a non-`CLOEXEC` dup of the ruleset fd, or `None` if Landlock is not
 /// supported by this kernel (graceful degrade to seccomp-only).
 fn build_landlock(roots: &[PathBuf]) -> Option<OwnedFd> {
-    build_landlock_inner(roots).map_err(|e| {
-        tracing::debug!("rc-sandbox: Landlock unavailable, degrading to seccomp-only: {e}");
-    })
-    .ok()
+    build_landlock_inner(roots)
+        .map_err(|e| {
+            tracing::debug!("rc-sandbox: Landlock unavailable, degrading to seccomp-only: {e}");
+        })
+        .ok()
 }
 
 fn build_landlock_inner(roots: &[PathBuf]) -> io::Result<OwnedFd> {
@@ -87,13 +88,17 @@ fn build_landlock_inner(roots: &[PathBuf]) -> io::Result<OwnedFd> {
             continue; // a missing root contributes no allow-rule
         }
         let fd = PathFd::new(root).map_err(ioerr)?;
-        created = created.add_rule(PathBeneath::new(fd, access_all)).map_err(ioerr)?;
+        created = created
+            .add_rule(PathBeneath::new(fd, access_all))
+            .map_err(ioerr)?;
     }
     // Read-only system dirs: exec + reads (binaries, libs, configs).
     for dir in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
         if Path::new(dir).is_dir() {
             if let Ok(fd) = PathFd::new(dir) {
-                created = created.add_rule(PathBeneath::new(fd, access_read)).map_err(ioerr)?;
+                created = created
+                    .add_rule(PathBeneath::new(fd, access_read))
+                    .map_err(ioerr)?;
             }
         }
     }
@@ -131,7 +136,10 @@ fn build_seccomp() -> Vec<libc::sock_filter> {
 
     let mut prog: Vec<libc::sock_filter> = Vec::with_capacity(2 + 2 * denied.len());
     // Load seccomp_data.nr (offset 0 within `struct seccomp_data`).
-    prog.push(bpf_stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0));
+    prog.push(bpf_stmt(
+        (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        0,
+    ));
     for nr in denied {
         // match → fall through to the RET ERRNO on the next line;
         // no match → skip that RET (jf=1) to the next JEQ / the final ALLOW.
@@ -146,13 +154,21 @@ fn build_seccomp() -> Vec<libc::sock_filter> {
             libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
         ));
     }
-    prog.push(bpf_stmt((libc::BPF_RET | libc::BPF_K) as u16, libc::SECCOMP_RET_ALLOW));
+    prog.push(bpf_stmt(
+        (libc::BPF_RET | libc::BPF_K) as u16,
+        libc::SECCOMP_RET_ALLOW,
+    ));
     prog
 }
 
 #[inline]
 fn bpf_stmt(code: u16, k: u32) -> libc::sock_filter {
-    libc::sock_filter { code, jt: 0, jf: 0, k }
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 
 #[inline]

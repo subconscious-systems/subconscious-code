@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 rc-rt = { path = "../rc-rt" }
 rc-core = { path = "../rc-core" }
+rc-session = { path = "../rc-session" }
+rc-config = { path = "../rc-config" }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 similar = { version = "0.5", features = ["unicode"] }

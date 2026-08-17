@@ -67,7 +67,10 @@ pub fn rewind_session(session: &mut Session, n: usize) -> Result<RewindReport> {
         journal.rewind(n)
     };
     if records.is_empty() {
-        return Ok(RewindReport { restored: Vec::new(), turns: n });
+        return Ok(RewindReport {
+            restored: Vec::new(),
+            turns: n,
+        });
     }
     let restored = restore_files(&records);
     Ok(RewindReport { restored, turns: n })
@@ -125,7 +128,10 @@ mod tests {
 
         let report = rewind_session(&mut session, 1).unwrap();
         assert_eq!(report.restored, vec![path.clone()]);
-        assert!(!path.exists(), "agent-created file should be removed on rewind");
+        assert!(
+            !path.exists(),
+            "agent-created file should be removed on rewind"
+        );
     }
 
     #[test]
@@ -139,12 +145,20 @@ mod tests {
 
         // Turn 1: change a.
         session.change_journal.lock().unwrap().advance_turn();
-        session.change_journal.lock().unwrap().record(a.clone(), Some(b"a0".to_vec()));
+        session
+            .change_journal
+            .lock()
+            .unwrap()
+            .record(a.clone(), Some(b"a0".to_vec()));
         fs::write(&a, "a1").unwrap();
 
         // Turn 2: change b.
         session.change_journal.lock().unwrap().advance_turn();
-        session.change_journal.lock().unwrap().record(b.clone(), Some(b"b0".to_vec()));
+        session
+            .change_journal
+            .lock()
+            .unwrap()
+            .record(b.clone(), Some(b"b0".to_vec()));
         fs::write(&b, "b1").unwrap();
 
         // Rewind only the last 1 turn → b restored, a stays changed.
@@ -176,8 +190,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("c.txt");
         let records = vec![
-            ChangeRecord { path: path.clone(), prior: Some(b"created".to_vec()), turn: 1 },
-            ChangeRecord { path: path.clone(), prior: None, turn: 1 },
+            ChangeRecord {
+                path: path.clone(),
+                prior: Some(b"created".to_vec()),
+                turn: 1,
+            },
+            ChangeRecord {
+                path: path.clone(),
+                prior: None,
+                turn: 1,
+            },
         ];
         fs::write(&path, "edited").unwrap();
         let restored = restore_files(&records);

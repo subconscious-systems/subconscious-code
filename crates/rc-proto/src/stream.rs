@@ -127,9 +127,7 @@ pub enum AgentStreamEvent {
         error: String,
     },
     /// The model finished. Emitted exactly once per stream.
-    Finish {
-        reason: FinishReason,
-    },
+    Finish { reason: FinishReason },
     /// Token usage (the trailing chunk, §3.6).
     Usage(Usage),
 }
@@ -210,7 +208,11 @@ impl ToolCallAccumulator {
         for (i, s) in self.slots.into_iter().enumerate() {
             let id = s.id.unwrap_or_else(|| format!("call_{}", i));
             let name = s.name.unwrap_or_default();
-            let raw = if s.args.is_empty() { "{}".to_string() } else { s.args };
+            let raw = if s.args.is_empty() {
+                "{}".to_string()
+            } else {
+                s.args
+            };
             out.push(finalize_one(i, id, name, raw, confirmed));
         }
         out
@@ -224,25 +226,40 @@ impl ToolCallAccumulator {
     }
 }
 
-fn finalize_one(index: usize, id: String, name: String, raw: String, confirmed: bool) -> FinalizedToolCall {
+fn finalize_one(
+    index: usize,
+    id: String,
+    name: String,
+    raw: String,
+    confirmed: bool,
+) -> FinalizedToolCall {
     // Fast path: already valid → preserve the model's exact bytes. Holds even
     // when unconfirmed: a dropped finish_reason chunk after a complete call must
     // not be a false negative.
     if serde_json::from_str::<serde_json::Value>(&raw).is_ok() {
-        return FinalizedToolCall::Ok { id, name, arguments: raw };
+        return FinalizedToolCall::Ok {
+            id,
+            name,
+            arguments: raw,
+        };
     }
     // Repair and retry. Only trust the repaired bytes when the model signalled
     // completion (`tool_calls`); otherwise the args were likely truncated by a
     // cut stream — refuse to run on repair-fabricated values (§3.3 / F1).
     let repaired = repair(&raw);
     match serde_json::from_str::<serde_json::Value>(&repaired) {
-        Ok(_) if confirmed => FinalizedToolCall::Ok { id, name, arguments: repaired },
+        Ok(_) if confirmed => FinalizedToolCall::Ok {
+            id,
+            name,
+            arguments: repaired,
+        },
         Ok(_) => FinalizedToolCall::ParseError {
             index,
             id: Some(id),
             name: Some(name),
             raw_arguments: raw,
-            error: "arguments incomplete (stream ended before tool_calls finish_reason)".to_string(),
+            error: "arguments incomplete (stream ended before tool_calls finish_reason)"
+                .to_string(),
         },
         Err(e) => FinalizedToolCall::ParseError {
             index,
@@ -422,7 +439,10 @@ pub struct StreamFuser {
 
 impl StreamFuser {
     pub fn new() -> Self {
-        Self { acc: ToolCallAccumulator::new(), finished: false }
+        Self {
+            acc: ToolCallAccumulator::new(),
+            finished: false,
+        }
     }
 
     /// Apply a chunk; return any events it produced.
@@ -474,18 +494,28 @@ impl StreamFuser {
         let confirmed = reason == Some("tool_calls");
         for fc in acc.finish_confirmed(confirmed) {
             match fc {
-                FinalizedToolCall::Ok { id, name, arguments } => {
-                    out.push(AgentStreamEvent::ToolCallReady { id, name, arguments })
-                }
-                FinalizedToolCall::ParseError { index, id, name, raw_arguments, error } => {
-                    out.push(AgentStreamEvent::ToolCallFailed {
-                        index,
-                        id,
-                        name,
-                        raw_arguments,
-                        error,
-                    })
-                }
+                FinalizedToolCall::Ok {
+                    id,
+                    name,
+                    arguments,
+                } => out.push(AgentStreamEvent::ToolCallReady {
+                    id,
+                    name,
+                    arguments,
+                }),
+                FinalizedToolCall::ParseError {
+                    index,
+                    id,
+                    name,
+                    raw_arguments,
+                    error,
+                } => out.push(AgentStreamEvent::ToolCallFailed {
+                    index,
+                    id,
+                    name,
+                    raw_arguments,
+                    error,
+                }),
             }
         }
         out.push(AgentStreamEvent::Finish {
@@ -513,18 +543,28 @@ mod tests {
             r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi","tool_calls":null}}]}"#,
         )
         .expect("null tool_calls must deserialize to empty");
-        assert!(chunk.choices[0].delta.tool_calls.is_empty(), "null -> empty");
+        assert!(
+            chunk.choices[0].delta.tool_calls.is_empty(),
+            "null -> empty"
+        );
 
         let no_field: ChatCompletionChunk =
             serde_json::from_str(r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#).unwrap();
-        assert!(no_field.choices[0].delta.tool_calls.is_empty(), "absent -> empty");
+        assert!(
+            no_field.choices[0].delta.tool_calls.is_empty(),
+            "absent -> empty"
+        );
 
         let with_call: ChatCompletionChunk = serde_json::from_str(
             r#"{"choices":[{"index":0,"delta":{"tool_calls":[
                 {"index":0,"id":"c1","function":{"name":"f","arguments":"{}"}}]}}]}"#,
         )
         .unwrap();
-        assert_eq!(with_call.choices[0].delta.tool_calls.len(), 1, "a real call still parses");
+        assert_eq!(
+            with_call.choices[0].delta.tool_calls.len(),
+            1,
+            "a real call still parses"
+        );
     }
 
     struct XorShift(u64);
@@ -541,7 +581,11 @@ mod tests {
             x
         }
         fn range(&mut self, n: u64) -> u64 {
-            if n == 0 { 0 } else { self.next() % n }
+            if n == 0 {
+                0
+            } else {
+                self.next() % n
+            }
         }
         fn bool(&mut self) -> bool {
             self.next() & 1 == 1
@@ -560,7 +604,13 @@ mod tests {
             let v = match rng.range(3) {
                 0 => format!("\"v{}\"", rng.range(50)),
                 1 => format!("{}", rng.range(1000)),
-                _ => if rng.bool() { "true".into() } else { "false".into() },
+                _ => {
+                    if rng.bool() {
+                        "true".into()
+                    } else {
+                        "false".into()
+                    }
+                }
             };
             s.push_str(&format!("\"{k}\":{v}"));
         }
@@ -609,7 +659,10 @@ mod tests {
             acc.apply(&ToolCallDelta {
                 index: 0,
                 id: if id_at_start { Some(id.clone()) } else { None },
-                function: Some(FunctionDelta { name: Some(name.to_string()), arguments: None }),
+                function: Some(FunctionDelta {
+                    name: Some(name.to_string()),
+                    arguments: None,
+                }),
             });
             let last = fragments.len().saturating_sub(1);
             for (i, frag) in fragments.iter().enumerate() {
@@ -617,14 +670,21 @@ mod tests {
                 acc.apply(&ToolCallDelta {
                     index: 0,
                     id: if carry_id { Some(id.clone()) } else { None },
-                    function: Some(FunctionDelta { name: None, arguments: Some(frag.clone()) }),
+                    function: Some(FunctionDelta {
+                        name: None,
+                        arguments: Some(frag.clone()),
+                    }),
                 });
             }
 
             let finalized = acc.finish();
             assert_eq!(finalized.len(), 1, "one call in, one out");
             match &finalized[0] {
-                FinalizedToolCall::Ok { id: got_id, name: got_name, arguments } => {
+                FinalizedToolCall::Ok {
+                    id: got_id,
+                    name: got_name,
+                    arguments,
+                } => {
                     assert_eq!(got_id, &id, "id reassembled (late/dup tolerated)");
                     assert_eq!(got_name, name, "name reassembled");
                     assert_eq!(arguments, &args, "argument bytes preserved exactly");
@@ -642,7 +702,10 @@ mod tests {
         acc.apply(&ToolCallDelta {
             index: 0,
             id: Some("c".into()),
-            function: Some(FunctionDelta { name: Some("Read".into()), arguments: None }),
+            function: Some(FunctionDelta {
+                name: Some("Read".into()),
+                arguments: None,
+            }),
         });
         let f = acc.finish();
         match &f[0] {
@@ -764,7 +827,8 @@ mod tests {
             "truncated + no finish → ToolCallFailed, got {evs:?}"
         );
         assert!(
-            !evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { .. })),
+            !evs.iter()
+                .any(|e| matches!(e, AgentStreamEvent::ToolCallReady { .. })),
             "must not surface repair-fabricated args as ready, got {evs:?}"
         );
     }
@@ -777,7 +841,8 @@ mod tests {
         for _ in f.apply(call_chunk("c1", "Read", r#"{"file":"/tmp/foo"}"#)) {}
         let evs = f.finish();
         assert!(
-            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
+            evs.iter()
+                .any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
             "valid args + no finish → ToolCallReady, got {evs:?}"
         );
     }
@@ -805,7 +870,8 @@ mod tests {
         evs.extend(f.apply(finish_chunk("tool_calls")));
         evs.extend(f.finish());
         assert!(
-            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
+            evs.iter()
+                .any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
             "tool_calls + malformed-but-complete → ToolCallReady (repaired), got {evs:?}"
         );
     }
@@ -824,7 +890,8 @@ mod tests {
         evs.extend(f.apply(finish_chunk("tool_calls")));
         evs.extend(f.finish());
         assert!(
-            evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
+            evs.iter()
+                .any(|e| matches!(e, AgentStreamEvent::ToolCallReady { id, .. } if id == "c1")),
             "structurally-valid truncation is NOT caught (residual): {evs:?}"
         );
     }

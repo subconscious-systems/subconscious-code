@@ -26,7 +26,9 @@ impl EventSink for RuntimeSink {
         let _ = self.events.send(AgentEvent::Reasoning(delta.to_string()));
     }
     fn on_tool_start(&self, call: &ToolCall) {
-        let _ = self.events.send(AgentEvent::ToolStart { call: call.clone() });
+        let _ = self
+            .events
+            .send(AgentEvent::ToolStart { call: call.clone() });
     }
     fn on_tool_end(&self, call_id: &str, tool: &str, result: &ToolResultBody) {
         let _ = self.events.send(AgentEvent::ToolEnd {

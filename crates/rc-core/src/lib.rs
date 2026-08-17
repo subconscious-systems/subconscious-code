@@ -26,18 +26,21 @@ pub mod turn;
 pub use agent::{AgentLoop, LoopError, LoopOutcome};
 pub use context::{ContextAssembler, LegacyAssembler};
 pub use model::{
-    ChatModel, EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse, NullSink,
+    ChatModel, EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse,
+    NullSink,
+};
+pub use project::{project, project_with, verify_invariant};
+pub use prompt::{AskResponse, NullPrompter, Prompter};
+pub use rc_perm::{
+    resolve_within, resolve_within_loose, AllowAllChecker, BypassChecker, Decision, Mode,
+    PermissionChecker, PermissionEngine,
 };
 pub use rc_proto::FinishReason;
 pub use rc_proto::Usage;
-pub use prompt::{AskResponse, NullPrompter, Prompter};
-pub use project::{project, project_with, verify_invariant};
-pub use rc_perm::{
-    AllowAllChecker, BypassChecker, Decision, Mode, PermissionChecker, PermissionEngine,
-    resolve_within, resolve_within_loose,
-};
 pub use registry::ToolRegistry;
 pub use state::ReadRegistry;
-pub use state::{BgShell, ChangeJournal, ChangeRecord, SharedChangeJournal, SharedShellState, ShellState};
+pub use state::{
+    BgShell, ChangeJournal, ChangeRecord, SharedChangeJournal, SharedShellState, ShellState,
+};
 pub use tool::{Artifact, Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 pub use turn::{AgentMode, NoteKind, Session, ToolCall, ToolResultBody, Turn};

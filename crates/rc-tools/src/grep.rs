@@ -126,13 +126,21 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
         let root = match inp.path.as_deref() {
             Some(p) => match resolve_within(&ctx.allowed_roots, &ctx.cwd, p) {
                 Ok(c) => c,
-                Err(msg) => return Ok(ToolOutcome::Error { message: msg, retryable: false }),
+                Err(msg) => {
+                    return Ok(ToolOutcome::Error {
+                        message: msg,
+                        retryable: false,
+                    })
+                }
             },
             None => std::fs::canonicalize(&ctx.cwd).unwrap_or_else(|_| ctx.cwd.clone()),
         };
 
         let glob_matcher = match inp.glob.as_deref() {
-            Some(g) => match globset::GlobBuilder::new(g).literal_separator(false).build() {
+            Some(g) => match globset::GlobBuilder::new(g)
+                .literal_separator(false)
+                .build()
+            {
                 Ok(gb) => Some(gb.compile_matcher()),
                 Err(e) => {
                     return Ok(ToolOutcome::Error {
@@ -153,7 +161,9 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
 
         for entry in ignore::WalkBuilder::new(&root).build() {
             let Ok(entry) = entry else { continue };
-            let Some(ft) = entry.file_type() else { continue };
+            let Some(ft) = entry.file_type() else {
+                continue;
+            };
             if !ft.is_file() {
                 continue;
             }
@@ -172,7 +182,11 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
                 Err(_) => continue,
             };
             // Binary skip: NUL in the first 8KB (§6.5).
-            if bytes.iter().take(BINARY_SCAN.min(bytes.len())).any(|&b| b == 0) {
+            if bytes
+                .iter()
+                .take(BINARY_SCAN.min(bytes.len()))
+                .any(|&b| b == 0)
+            {
                 continue;
             }
             let text = match std::str::from_utf8(&bytes) {
@@ -216,7 +230,12 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
                                     out.push_str("--\n");
                                 }
                             }
-                            out.push_str(&format!("{}:{}:{}\n", path.to_string_lossy(), i + 1, lines[i]));
+                            out.push_str(&format!(
+                                "{}:{}:{}\n",
+                                path.to_string_lossy(),
+                                i + 1,
+                                lines[i]
+                            ));
                             prev = Some(i);
                         }
                         out.push('\n');
@@ -240,7 +259,11 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
 
         let head = self.cap / 3;
         let (truncated, content) = cap_output(&out, self.cap, head, self.cap - head);
-        Ok(ToolOutcome::Ok { content, truncated, artifacts: Vec::new() })
+        Ok(ToolOutcome::Ok {
+            content,
+            truncated,
+            artifacts: Vec::new(),
+        })
     }
 }
 

@@ -65,7 +65,12 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
 
         let canon = match resolve_within(&ctx.allowed_roots, &ctx.cwd, &inp.file_path) {
             Ok(p) => p,
-            Err(msg) => return Ok(ToolOutcome::Error { message: msg, retryable: false }),
+            Err(msg) => {
+                return Ok(ToolOutcome::Error {
+                    message: msg,
+                    retryable: false,
+                })
+            }
         };
         if let Some(err) = require_current_read(ctx, &canon) {
             return Ok(err);
@@ -137,7 +142,11 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
             journal.record(canon.clone(), prior);
         }
 
-        Ok(ToolOutcome::ok(snippet_around(&new_content, &inp.new_string, 5)))
+        Ok(ToolOutcome::ok(snippet_around(
+            &new_content,
+            &inp.new_string,
+            5,
+        )))
     }
 }
 
@@ -202,7 +211,10 @@ mod tests {
 
     async fn read_first(ctx: &rc_core::ToolCtx, path: &std::path::Path) {
         Read::new()
-            .call(json!({"file_path": path.to_string_lossy().to_string()}), ctx)
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                ctx,
+            )
             .await
             .unwrap();
     }
@@ -222,7 +234,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out, ToolOutcome::Ok { .. }), "{out:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nBETA\ngamma\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
     }
 
     #[tokio::test]
@@ -258,7 +273,9 @@ mod tests {
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => assert!(message.contains("closest match"), "{message}"),
+            ToolOutcome::Error { message, .. } => {
+                assert!(message.contains("closest match"), "{message}")
+            }
             o => panic!("expected a fuzzy hint, got {o:?}"),
         }
     }
@@ -316,7 +333,9 @@ mod tests {
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => assert!(message.contains("identical"), "{message}"),
+            ToolOutcome::Error { message, .. } => {
+                assert!(message.contains("identical"), "{message}")
+            }
             o => panic!("expected identical error, got {o:?}"),
         }
     }

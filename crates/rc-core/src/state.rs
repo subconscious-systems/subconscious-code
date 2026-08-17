@@ -80,7 +80,12 @@ pub struct ShellState {
 
 impl ShellState {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd, bg_dir: None, bg: Vec::new(), next_bg: 0 }
+        Self {
+            cwd,
+            bg_dir: None,
+            bg: Vec::new(),
+            next_bg: 0,
+        }
     }
 
     /// Kill every background shell. Called on session/runtime shutdown so
@@ -139,7 +144,11 @@ impl ChangeJournal {
     /// Record a pre-mutation snapshot of `path` for the current turn. `prior`
     /// is the file's contents before the change, or `None` if it didn't exist.
     pub fn record(&mut self, path: PathBuf, prior: Option<Vec<u8>>) {
-        self.records.push(ChangeRecord { path, prior, turn: self.turn });
+        self.records.push(ChangeRecord {
+            path,
+            prior,
+            turn: self.turn,
+        });
     }
 
     /// Pop and return every record from the last `n` turns (most-recent turn
