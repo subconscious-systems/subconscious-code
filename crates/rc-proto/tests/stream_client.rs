@@ -47,7 +47,7 @@ async fn streams_text_finish_and_usage() {
         session_id: Some("session-stream-123".into()),
         ..CompleteOpts::default()
     };
-    let mut stream = client
+    let (mut stream, _retries) = client
         .stream(
             &[WireMessage::User {
                 content: "hi".into(),
@@ -106,7 +106,7 @@ async fn stream_assembles_tool_call_args_across_fragments() {
         Some(Duration::from_secs(600)),
     )
     .unwrap();
-    let mut stream = client
+    let (mut stream, _retries) = client
         .stream(
             &[WireMessage::User {
                 content: "read it".into(),
@@ -188,7 +188,7 @@ async fn stream_retries_on_429_then_streams() {
         session_id: Some("session-retry-123".into()),
         ..CompleteOpts::default()
     };
-    let mut stream = client
+    let (mut stream, retries) = client
         .stream(
             &[WireMessage::User {
                 content: "hi".into(),
@@ -205,6 +205,7 @@ async fn stream_retries_on_429_then_streams() {
         }
     }
     assert_eq!(text, "hi");
+    assert_eq!(retries, 1, "1 wire retry after the initial 429");
     assert_eq!(
         server
             .received_requests()

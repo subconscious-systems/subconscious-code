@@ -9,6 +9,8 @@
 //! weighing down the core.
 
 use crate::turn::Turn;
+use rc_algebra::multiset::ContextKey;
+use rc_algebra::seqhash::PrefixFingerprint;
 use rc_proto::WireMessage;
 
 /// Assemble the wire messages for the next model request (§4.1 + §4.6).
@@ -25,6 +27,29 @@ pub trait ContextAssembler: Send + Sync {
     /// Exposed for display (the TUI status line) and debugging; the loop does
     /// not require it. `None` for assemblers that defer to the legacy path.
     fn system_prompt(&self) -> Option<&str> {
+        None
+    }
+
+    /// The content-addressed key of the assembled context as a *multiset* of
+    /// blocks — an abelian-group hash (LtHash in `(ℤ/2¹⁶)^1024`). This is the
+    /// "sets upstairs" algebra: order-independent (two agents that assembled
+    /// the same block set in different orders produce the same key) and
+    /// O(1) add/evict via the group operation and its inverse.
+    ///
+    /// This is the seam for the content-addressed context protocol: a future
+    /// cache/eviction layer keys on it. `None` for assemblers that don't
+    /// content-address (the legacy path).
+    fn context_key(&self, _turns: &[Turn]) -> Option<ContextKey> {
+        None
+    }
+
+    /// The non-commutative fingerprint of the assembled message *sequence* —
+    /// a polynomial hash in `ℤ/p` with positional weighting. This is the
+    /// "sequences downstairs" algebra, deliberately opposite to
+    /// [`Self::context_key`]: `[A, B]` and `[B, A]` are different KV-cache
+    /// states, so the prefix hash must *not* commute. The seam for a future
+    /// KV-cache-state cache key.
+    fn prefix_fingerprint(&self, _turns: &[Turn]) -> Option<PrefixFingerprint> {
         None
     }
 }

@@ -298,6 +298,35 @@ impl rc_core::ContextAssembler for ContextAssembler {
     fn system_prompt(&self) -> Option<&str> {
         Some(&self.system_prompt)
     }
+
+    /// Content-addressed multiset key of the assembled context (abelian-group
+    /// hash, order-independent). Each wire message is canonicalized to
+    /// byte-stable form, hashed to a block, and folded into the multiset. The
+    /// seam for the content-addressed context protocol + O(1) eviction.
+    fn context_key(&self, turns: &[Turn]) -> Option<rc_algebra::multiset::ContextKey> {
+        let msgs = ContextAssembler::assemble(self, turns);
+        let mut set = rc_algebra::multiset::ContextSet::new();
+        for m in &msgs {
+            if let Ok(bytes) = rc_proto::canonical::to_bytes(m) {
+                set.add(&bytes);
+            }
+        }
+        Some(set.context_key())
+    }
+
+    /// Non-commutative prefix fingerprint of the assembled message sequence
+    /// (polynomial hash with positional weighting). The KV-cache-state key:
+    /// `[A, B]` and `[B, A]` deliberately diverge, opposite to
+    /// [`context_key`](Self::context_key).
+    fn prefix_fingerprint(&self, turns: &[Turn]) -> Option<rc_algebra::seqhash::PrefixFingerprint> {
+        let msgs = ContextAssembler::assemble(self, turns);
+        let blocks: Vec<rc_algebra::multiset::BlockId> = msgs
+            .iter()
+            .filter_map(|m| rc_proto::canonical::to_bytes(m).ok())
+            .map(|b| rc_algebra::multiset::BlockId::from_bytes(&b))
+            .collect();
+        Some(rc_algebra::seqhash::PrefixFingerprint::from_blocks(&blocks))
+    }
 }
 
 /// Produce a turn list with the last user turn's `@file` mentions expanded and
@@ -464,6 +493,7 @@ fn floor_char_boundary(s: &str, cap: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_core::ContextAssembler as _;
     use rc_core::ToolResultBody;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -786,5 +816,95 @@ mod tests {
             "last user inlined: {last_user_content}"
         );
         assert!(last_user_content.contains("@b.txt"));
+    }
+
+    // --- content-addressed seams (rc-algebra integration) ---
+
+    fn assistant(call_ids: &[&str]) -> Turn {
+        Turn::Assistant {
+            text: "".into(),
+            reasoning: None,
+            calls: call_ids
+                .iter()
+                .map(|id| rc_core::ToolCall {
+                    id: (*id).into(),
+                    name: "Read".into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+            usage: None,
+            cost: None,
+        }
+    }
+
+    #[test]
+    fn context_key_seam_is_deterministic_and_content_sensitive() {
+        let dir = tempdir().unwrap();
+        let env = Environment::detect(dir.path(), "today".into());
+        let asm = ContextAssembler::with_system_prompt(env, "P".into());
+        let turns = vec![user("hello")];
+        // Deterministic: the same turns yield the same multiset key.
+        assert_eq!(asm.context_key(&turns), asm.context_key(&turns));
+        // Content-sensitive: a different prompt yields a different key.
+        let asm2 = ContextAssembler::with_system_prompt(
+            Environment::detect(dir.path(), "today".into()),
+            "Q".into(),
+        );
+        assert_ne!(asm.context_key(&turns), asm2.context_key(&turns));
+    }
+
+    #[test]
+    fn prefix_fingerprint_seam_is_deterministic_and_content_sensitive() {
+        let dir = tempdir().unwrap();
+        let env = Environment::detect(dir.path(), "today".into());
+        let asm = ContextAssembler::with_system_prompt(env, "P".into());
+        let turns = vec![user("hello")];
+        assert_eq!(
+            asm.prefix_fingerprint(&turns),
+            asm.prefix_fingerprint(&turns)
+        );
+        let more = vec![user("hello"), user("more")];
+        assert_ne!(asm.prefix_fingerprint(&turns), asm.prefix_fingerprint(&more));
+    }
+
+    #[test]
+    fn context_key_is_order_independent_while_prefix_is_not() {
+        // The load-bearing contrast: the same set of context blocks in two
+        // valid orderings collapses to one multiset key (sets upstairs) but
+        // yields two distinct prefix fingerprints (sequences downstairs).
+        let dir = tempdir().unwrap();
+        let env = Environment::detect(dir.path(), "today".into());
+        let asm = ContextAssembler::with_system_prompt(env, "P".into());
+        // Both orderings satisfy the contiguity invariant: the two tool results
+        // are contiguous after the assistant call that produced them.
+        let order_a = vec![
+            assistant(&["c1", "c2"]),
+            tool_ok("c1", "x"),
+            tool_ok("c2", "y"),
+        ];
+        let order_b = vec![
+            assistant(&["c1", "c2"]),
+            tool_ok("c2", "y"),
+            tool_ok("c1", "x"),
+        ];
+        let key_a = asm.context_key(&order_a).unwrap();
+        let key_b = asm.context_key(&order_b).unwrap();
+        let pf_a = asm.prefix_fingerprint(&order_a).unwrap();
+        let pf_b = asm.prefix_fingerprint(&order_b).unwrap();
+        // Sets upstairs: same multiset of blocks → same key, despite reordering.
+        assert_eq!(key_a, key_b, "multiset context key must be order-independent");
+        // Sequences downstairs: different order → different KV-state fingerprint.
+        assert_ne!(
+            pf_a, pf_b,
+            "prefix fingerprint must be order-sensitive (non-commutative)"
+        );
+    }
+
+    #[test]
+    fn legacy_assembler_seams_return_none() {
+        let legacy = rc_core::LegacyAssembler;
+        let turns = vec![user("hi")];
+        assert!(legacy.context_key(&turns).is_none());
+        assert!(legacy.prefix_fingerprint(&turns).is_none());
     }
 }

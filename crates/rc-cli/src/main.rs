@@ -616,6 +616,13 @@ fn print_result(session: &Session, outcome: LoopOutcome) {
             "tokens: {} total · {} completion · {cache_rate} cache hit",
             u.total_tokens, u.completion_tokens,
         );
+        // Integer micro-USD cost (the accounting monoid); shown only when a
+        // pricing sheet was configured, so the default zero-cost case stays
+        // silent. Displayed in USD with 6 decimals (micro-USD resolution).
+        let c = session.total_cost.as_micro_usd();
+        if c > 0 {
+            eprintln!("cost: ${:.6} ({} µUSD)", session.total_cost.as_usd(), c);
+        }
     }
 }
 

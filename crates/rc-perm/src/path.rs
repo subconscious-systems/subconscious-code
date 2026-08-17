@@ -14,6 +14,22 @@ fn under_root(canon: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|r| canon.starts_with(root_canon(r)))
 }
 
+/// The "path outside allowed roots" error, naming the allowed roots so the
+/// model can self-correct in one turn instead of guessing (the rejected path
+/// alone tells it nothing about where it *is* allowed to write).
+fn outside_err(canon: &Path, roots: &[PathBuf]) -> String {
+    let allowed = roots
+        .iter()
+        .map(|r| root_canon(r).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "path outside allowed roots: {} (allowed: {})",
+        canon.display(),
+        allowed
+    )
+}
+
 /// Resolve a path that must already exist (Read/Edit/Grep/Glob): canonicalize
 /// physically and require the result under an allowed root.
 pub fn resolve_within(roots: &[PathBuf], cwd: &Path, candidate: &str) -> Result<PathBuf, String> {
@@ -27,7 +43,7 @@ pub fn resolve_within(roots: &[PathBuf], cwd: &Path, candidate: &str) -> Result<
     if under_root(&canon, roots) {
         Ok(canon)
     } else {
-        Err(format!("path outside allowed roots: {}", canon.display()))
+        Err(outside_err(&canon, roots))
     }
 }
 
@@ -48,7 +64,7 @@ pub fn resolve_within_loose(
         return if under_root(&canon, roots) {
             Ok(canon)
         } else {
-            Err(format!("path outside allowed roots: {}", canon.display()))
+            Err(outside_err(&canon, roots))
         };
     }
     let parent = abs.parent().unwrap_or(Path::new("."));
@@ -68,6 +84,6 @@ pub fn resolve_within_loose(
     if under_root(&canon, roots) {
         Ok(canon)
     } else {
-        Err(format!("path outside allowed roots: {}", canon.display()))
+        Err(outside_err(&canon, roots))
     }
 }

@@ -238,8 +238,8 @@ async fn probe_streaming(client: &ChatClient) -> Status {
     };
     let t = Instant::now();
     let mut stream = match client.stream(&msgs, &opts, &[]).await {
-        Ok(s) => s,
-        Err(e) => return Status::Fail(describe(&e)),
+        Ok((s, _retries)) => s,
+        Err((e, _)) => return Status::Fail(describe(&e)),
     };
     let mut first_chunk_ms = None;
     let mut chunks = 0usize;
@@ -299,8 +299,8 @@ async fn probe_tool_calls(client: &ChatClient) -> Status {
         .stream(&msgs, &opts, std::slice::from_ref(&tool))
         .await
     {
-        Ok(s) => s,
-        Err(e) => return Status::Fail(describe(&e)),
+        Ok((s, _retries)) => s,
+        Err((e, _)) => return Status::Fail(describe(&e)),
     };
     let mut saw_tool_call = false;
     let mut names = Vec::new();

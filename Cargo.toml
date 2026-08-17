@@ -31,6 +31,10 @@ bytes = "1"
 flate2 = "1"
 wiremock = "0.6"
 insta = "1"
+# Content-addressing for the multiset/sequence hashes (rc-algebra). SHA-256 is
+# the boring production-grade choice; we expand a 32-byte digest to a 2048-byte
+# group element via CTR mode rather than pulling a full XOF crate.
+sha2 = "0.10"
 
 [profile.release]
 # Static, self-contained binary; no dynamic loader surprises.

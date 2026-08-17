@@ -3,6 +3,7 @@
 //! permission checks (§7) — Allow→run, Deny→a denied tool result, Ask→prompter.
 
 use crate::context::ContextAssembler;
+use crate::cost::Pricing;
 use crate::model::{EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse};
 use crate::project::{project, verify_invariant};
 use crate::prompt::{AskResponse, Prompter};
@@ -10,7 +11,7 @@ use crate::registry::ToolRegistry;
 use crate::tool::{Concurrency, SandboxPolicy, Tool, ToolCtx, ToolOutcome};
 use crate::turn::{Session, ToolCall, ToolResultBody, Turn};
 use rc_perm::{Decision, PermissionChecker};
-use rc_proto::{CompleteOpts, FinishReason, ToolChoiceValue, WireMessage};
+use rc_proto::{CompleteOpts, FinishReason, ProtoError, ToolChoiceValue, WireMessage};
 use rc_tokenize::Estimator;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -33,6 +34,13 @@ pub enum LoopOutcome {
     ItersExceeded,
     /// T3: the turn exceeded its wall-clock budget (`turn_timeout`).
     TimeUp,
+    /// The user cancelled the turn (Esc). The request was interrupted —
+    /// typically surfacing as `ProtoError::Idle` from a mid-stream stall —
+    /// and a `Turn::Cancelled` record was appended so the interruption is
+    /// visible in the session transcript instead of being lost as a bare
+    /// `LoopError::Model`. Distinct from `TimeUp` (an automatic budget) and
+    /// from `Stop` (a clean model finish).
+    Cancelled,
 }
 
 /// Default tool-loop iterations per turn. Not a context limit — a runaway
@@ -61,6 +69,24 @@ fn message_len(m: &WireMessage) -> usize {
                     .sum::<usize>()
         }
         WireMessage::Tool { content, .. } => content.chars().count(),
+    }
+}
+
+/// Whether a request failure is worth retrying — recorded on `Turn::Error` so a
+/// resumed session (or an operator reading the trace) can tell a transient
+/// failure (429/5xx, transport drop, mid-stream stall) from a permanent one
+/// (no API key, bad session id, malformed body). Conservative: transport and
+/// idle errors are retryable; auth/config/validation errors are not.
+fn is_retryable(e: &ModelError) -> bool {
+    let ModelError::Proto { error, .. } = e;
+    match error {
+        ProtoError::Status { status, .. } => *status == 429 || (500..=599).contains(status),
+        ProtoError::Http(_) | ProtoError::Idle(_) => true,
+        ProtoError::EmptyChoices
+        | ProtoError::Json(_)
+        | ProtoError::NoApiKey
+        | ProtoError::InvalidSessionId
+        | ProtoError::Gzip(_) => false,
     }
 }
 
@@ -99,6 +125,11 @@ pub struct AgentLoop {
     /// the context has grown. Subconscious Code deliberately has no window
     /// threshold for this to trip.
     pub estimator: Estimator,
+    /// Token pricing for cost accounting (`rc_core::cost`), in integer
+    /// micro-USD per million tokens. Defaults to [`Pricing::ZERO`] — cost
+    /// accounting then runs but every response costs zero, a no-op until a
+    /// real price sheet is supplied via [`AgentLoop::with_pricing`].
+    pub pricing: Pricing,
     /// Hard per-tool-result backstop (bytes). Distinct from the user-facing
     /// per-tool caps (which default to unlimited and are a product choice). A
     /// runaway `Bash`/`Read` can pour gigabytes into the context; `max_iters`
@@ -134,6 +165,7 @@ impl AgentLoop {
             temperature: None,
             sandbox: None,
             estimator: Estimator::new(),
+            pricing: Pricing::ZERO,
             hard_tool_result_cap: HARD_TOOL_RESULT_CAP,
         }
     }
@@ -210,6 +242,16 @@ impl AgentLoop {
         self
     }
 
+    /// Token pricing for cost accounting, in integer micro-USD per million
+    /// tokens (see [`crate::cost::Pricing`]). Integer per-million pricing keeps
+    /// the running cost a true monoid — shard/reduce in any order, get the same
+    /// number. Defaults to [`Pricing::ZERO`] (a no-op). Builder.
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: Pricing) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
     /// Run a full turn for `user_input`. Mutates `session` (pushes turns).
     pub async fn run(
         &self,
@@ -235,6 +277,10 @@ impl AgentLoop {
             journal.advance_turn();
         }
 
+        // `cancel` is moved into `ToolCtx` below; keep a cheap clone (an `Arc`
+        // bump) so the request-failure path can still test whether the user
+        // interrupted, to distinguish `Turn::Cancelled` from `Turn::Error`.
+        let cancel_check = cancel.clone();
         let ctx = ToolCtx {
             cwd: session.cwd.clone(),
             allowed_roots: allowed_roots(session),
@@ -300,14 +346,51 @@ impl AgentLoop {
                 tool_calls,
                 finish_reason,
                 usage,
-            } = self.model.complete(req, sink).await?;
+                // `retries` was already surfaced to the host via `sink.on_retry`
+                // inside `ChatModel::complete`; the agent loop doesn't need it
+                // again on the success path.
+                retries: _,
+            } = match self.model.complete(req, sink).await {
+                Ok(r) => r,
+                // A request failure is the "lack of errors" blind spot: before,
+                // it propagated as a bare `LoopError::Model` and left *no* mark
+                // in the transcript — a resumed session had no record that a
+                // request was attempted and failed. Record a `Turn::Error`
+                // (or `Turn::Cancelled` if the user interrupted) so the trace is
+                // honest about what happened. The error still propagates.
+                Err(e) => {
+                    let retries = match &e {
+                        ModelError::Proto { retries, .. } => *retries,
+                    };
+                    if cancel_check.is_cancelled() {
+                        session.messages.push(Turn::Cancelled {
+                            ts: SystemTime::now(),
+                        });
+                        return Ok(LoopOutcome::Cancelled);
+                    }
+                    session.messages.push(Turn::Error {
+                        message: Arc::<str>::from(format!("{e}")),
+                        retryable: Some(is_retryable(&e)),
+                        retries: (retries > 0).then_some(retries),
+                        ts: SystemTime::now(),
+                    });
+                    return Err(LoopError::Model(e));
+                }
+            };
             // Wrap the response text once; the assistant turn (and any re-sends of
             // it on later turns) then share this allocation via refcount bumps.
             let text = Arc::<str>::from(text);
             let reasoning = reasoning.map(Arc::<str>::from);
+            // Integer micro-USD cost of this response — the accounting monoid.
+            // Computed once here (Copy) and attached to the assistant turn so a
+            // resumed session reconstructs `total_cost` exactly from the records.
+            let turn_cost = usage.as_ref().map(|u| self.pricing.cost_of(u));
             if let Some(u) = &usage {
                 sink.on_usage(u);
                 session.total_usage.add(u);
+                if let Some(c) = turn_cost {
+                    session.total_cost.add(&c);
+                }
                 // Calibrate against the authoritative count (§4.7 #1) so the
                 // next pre-flight estimate is closer for this model.
                 self.estimator.observe(u.prompt_tokens, context_chars);
@@ -358,6 +441,7 @@ impl AgentLoop {
                         reasoning,
                         calls: assistant_calls,
                         usage,
+                        cost: turn_cost,
                     });
                 }
                 FinishReason::Stop => {
@@ -366,6 +450,7 @@ impl AgentLoop {
                         reasoning,
                         calls: assistant_calls.clone(),
                         usage,
+                        cost: turn_cost,
                     });
                     synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Stop);
@@ -385,6 +470,7 @@ impl AgentLoop {
                             reasoning,
                             calls: Vec::new(),
                             usage,
+                            cost: turn_cost,
                         });
                         let continued = session.messages.len();
                         session.messages.push(Turn::User {
@@ -403,6 +489,7 @@ impl AgentLoop {
                         reasoning,
                         calls: assistant_calls.clone(),
                         usage,
+                        cost: turn_cost,
                     });
                     synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Length);
@@ -413,6 +500,7 @@ impl AgentLoop {
                         reasoning,
                         calls: assistant_calls.clone(),
                         usage,
+                        cost: turn_cost,
                     });
                     synthesize_interrupted(&mut session.messages, &assistant_calls, sink);
                     return Ok(LoopOutcome::Stop);

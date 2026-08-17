@@ -815,6 +815,9 @@ mod tests {
             res.is_err(),
             "expected an outside-roots refusal, got {res:?}"
         );
+        // The error names the allowed roots so the model can self-correct.
+        let err = res.unwrap_err();
+        assert!(err.contains("allowed:"), "missing allowed-roots hint: {err}");
     }
 
     /// Switching the engine to `auto` must stop it asking — including for the

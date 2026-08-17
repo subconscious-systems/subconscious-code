@@ -34,6 +34,11 @@ pub struct ModelResponse {
     pub tool_calls: Vec<FinalizedToolCall>,
     pub finish_reason: FinishReason,
     pub usage: Option<Usage>,
+    /// How many wire-layer retries (429/5xx) the request survived before
+    /// succeeding. `0` for a clean first attempt. Surfaced to the host via
+    /// [`EventSink::on_retry`] and persisted on a `Turn::Error` when the request
+    /// ultimately fails after retrying (the "lack of errors" fix).
+    pub retries: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -51,8 +56,20 @@ pub enum FinalizedToolCall {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ModelError {
-    #[error("proto: {0}")]
-    Proto(#[from] rc_proto::ProtoError),
+    /// A request that failed at the protocol layer. `retries` is the number of
+    /// wire-layer retries (429/5xx) that happened before the final failure, so a
+    /// persisted `Turn::Error` can record how hard the harness tried. Stream
+    /// events (`ev?` in `consume_stream`) carry `retries: 0` — they are not
+    /// retried at the wire layer.
+    #[error("proto: {error}")]
+    Proto { error: ProtoError, retries: u32 },
+}
+
+impl From<ProtoError> for ModelError {
+    /// Stream-event errors are not wire retried, so they carry `retries: 0`.
+    fn from(error: ProtoError) -> Self {
+        ModelError::Proto { error, retries: 0 }
+    }
 }
 
 /// A sink for live agent events (the TUI seam, M4). M1 uses [`NullSink`].
@@ -74,6 +91,10 @@ pub trait EventSink: Send + Sync {
     fn on_tool_end(&self, _call_id: &str, _tool: &str, _result: &ToolResultBody) {}
     fn on_iter(&self, _count: u32, _max: u32) {}
     fn on_usage(&self, _usage: &Usage) {}
+    /// The request succeeded after `retries` wire-layer retries (429/5xx).
+    /// Fired once at the start of `ChatModel::complete` when `retries > 0`, so
+    /// the host can surface "retried N×" live. Wire retries are otherwise silent.
+    fn on_retry(&self, _retries: u32) {}
     /// M8: the size of the context about to be sent — its char length and the
     /// calibrated token estimate. Purely informational (there is no window to
     /// exceed); a UI shows it so the operator can watch the context grow.
@@ -119,14 +140,19 @@ impl Model for ChatModel {
         req: ModelRequest,
         sink: &dyn EventSink,
     ) -> Result<ModelResponse, ModelError> {
-        let stream = self
+        let (stream, retries) = self
             .client
             .stream(&req.messages, &req.opts, &req.tools)
-            .await?;
+            .await
+            .map_err(|(error, retries)| ModelError::Proto { error, retries })?;
+        if retries > 0 {
+            sink.on_retry(retries);
+        }
         consume_stream(
             stream,
             req.opts.idle_timeout,
             self.reasoning_tag.as_deref(),
+            retries,
             sink,
         )
         .await
@@ -143,6 +169,7 @@ async fn consume_stream(
     mut stream: Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>>,
     idle: Option<Duration>,
     reasoning_tag: Option<&str>,
+    retries: u32,
     sink: &dyn EventSink,
 ) -> Result<ModelResponse, ModelError> {
     let mut text = String::new();
@@ -158,7 +185,9 @@ async fn consume_stream(
         let next = match idle {
             Some(d) => match tokio::time::timeout(d, stream.next()).await {
                 Ok(inner) => inner,
-                Err(_) => return Err(ModelError::Proto(ProtoError::Idle(d))),
+                Err(_) => {
+                    return Err(ModelError::from(ProtoError::Idle(d)));
+                }
             },
             None => stream.next().await,
         };
@@ -242,6 +271,7 @@ async fn consume_stream(
         tool_calls,
         finish_reason,
         usage,
+        retries,
     })
 }
 
@@ -323,11 +353,11 @@ mod tests {
             .unwrap();
 
         let start = SystemTime::now();
-        let res = consume_stream(stream, Some(Duration::from_millis(50)), None, &NullSink).await;
+        let res = consume_stream(stream, Some(Duration::from_millis(50)), None, 0, &NullSink).await;
         let elapsed = start.elapsed().unwrap_or_default();
         drop(tx); // held open through the await above
         assert!(
-            matches!(res, Err(ModelError::Proto(ProtoError::Idle(_)))),
+            matches!(res, Err(ModelError::Proto { error: ProtoError::Idle(_), .. })),
             "stalled stream should hit Idle, got {res:?}"
         );
         assert!(
@@ -344,7 +374,7 @@ mod tests {
                 reason: FinishReason::Stop,
             }),
         ]);
-        let res = consume_stream(stream, Some(Duration::from_millis(50)), None, &NullSink).await;
+        let res = consume_stream(stream, Some(Duration::from_millis(50)), None, 0, &NullSink).await;
         let resp = res.expect("normal stream completes");
         assert_eq!(resp.text, "hi");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
@@ -353,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn no_idle_bound_completes_a_normal_stream() {
         let stream = boxed(vec![Ok(AgentStreamEvent::Text("ok".into()))]);
-        let res = consume_stream(stream, None, None, &NullSink).await;
+        let res = consume_stream(stream, None, None, 0, &NullSink).await;
         assert_eq!(res.unwrap().text, "ok");
     }
 }

@@ -4,8 +4,8 @@
 //! file must be re-read.
 
 use crate::util::{
-    atomic_write, params_schema, preserve_line_endings, record_read, require_current_read,
-    resolve_within_loose,
+    atomic_write, params_schema, preserve_line_endings, record_read, current_read_state,
+    stale_read_error, resolve_within_loose, ReadState,
 };
 use async_trait::async_trait;
 use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
@@ -65,10 +65,17 @@ use `Write` only for new files or complete rewrites."
             }
         };
 
+        let mut auto_read = false;
         if canon.exists() {
-            // Existing file: must have been read and be unchanged (§6.2).
-            if let Some(err) = require_current_read(ctx, &canon) {
-                return Ok(err);
+            // Existing file: "changed since read" is a hard error; "never read"
+            // auto-reads and proceeds (§6.2), avoiding two wasted round-trips.
+            match current_read_state(ctx, &canon) {
+                ReadState::Unread => {
+                    record_read(ctx, &canon);
+                    auto_read = true;
+                }
+                ReadState::Stale => return Ok(stale_read_error(&canon)),
+                ReadState::Current => {}
             }
         }
         // For a new file, a missing parent dir is already refused by
@@ -88,11 +95,14 @@ use `Write` only for new files or complete rewrites."
                 if let Ok(mut journal) = ctx.change_journal.lock() {
                     journal.record(canon.clone(), prior);
                 }
-                Ok(ToolOutcome::ok(format!(
-                    "wrote {} ({} bytes)",
-                    canon.display(),
-                    content.len()
-                )))
+                let mut msg = format!("wrote {} ({} bytes)", canon.display(), content.len());
+                if auto_read {
+                    msg.push_str(&format!(
+                        "\n\n(auto-read {} — read files before editing next time)",
+                        canon.display()
+                    ));
+                }
+                Ok(ToolOutcome::ok(msg))
             }
             Err(e) => Ok(ToolOutcome::Error {
                 message: format!("write failed: {e}"),
@@ -125,23 +135,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_to_overwrite_without_prior_read() {
+    async fn auto_reads_and_overwrites_without_prior_read() {
+        // A Write to a never-read existing file now auto-reads and proceeds
+        // (full content is explicit intent) instead of rejecting and costing
+        // two round-trips. The result carries an auto-read note.
         let dir = tempdir().unwrap();
         let path = dir.path().join("exists.txt");
         std::fs::write(&path, "old").unwrap();
+        let ctx = test_ctx(dir.path());
         let out = Write::new()
             .call(
                 json!({"file_path": path.to_string_lossy().to_string(), "content": "new"}),
-                &test_ctx(dir.path()),
+                &ctx,
             )
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => assert!(message.contains("Read"), "{message}"),
-            o => panic!("expected a read-first refusal, got {o:?}"),
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("auto-read"), "{content}");
+            }
+            o => panic!("expected auto-read-and-proceed, got {o:?}"),
         }
-        // The original is untouched.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let canon = std::fs::canonicalize(&path).unwrap();
+        assert!(ctx.read_registry.lock().unwrap().has_read(&canon));
     }
 
     #[tokio::test]

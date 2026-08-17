@@ -145,11 +145,18 @@ pub fn load(path: &Path) -> Result<Session> {
                         session.mode = mode;
                     }
                 }
-                if let Turn::Assistant {
-                    usage: Some(usage), ..
-                } = &turn
-                {
-                    session.total_usage.add(usage);
+                if let Turn::Assistant { usage, cost, .. } = &turn {
+                    // Accumulate independently: a persisted turn may carry usage
+                    // without cost (e.g. records written before cost accounting,
+                    // or a `cost: None` placeholder), and the cost monoid's
+                    // identity is `Cost::ZERO` — so a missing cost contributes
+                    // nothing and must not suppress usage accumulation.
+                    if let Some(usage) = usage {
+                        session.total_usage.add(usage);
+                    }
+                    if let Some(cost) = cost {
+                        session.total_cost.add(cost);
+                    }
                 }
                 session.messages.push(turn);
             }
@@ -347,6 +354,7 @@ mod tests {
                     total_tokens: 43,
                     prompt_tokens_details: None,
                 }),
+                cost: None,
             },
             Turn::ToolResult {
                 call_id: "c1".into(),

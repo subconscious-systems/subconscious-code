@@ -66,7 +66,7 @@ async fn add_verbose_flag_and_compile() {
     ]));
     let responses = vec![
         // 1) Read the file first (Edit requires a prior read).
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![call("c1", "Read", serde_json::json!({ "file_path": path }))],
@@ -74,7 +74,7 @@ async fn add_verbose_flag_and_compile() {
             usage: None,
         },
         // 2) Edit in the --verbose handling.
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![call(
@@ -90,7 +90,7 @@ async fn add_verbose_flag_and_compile() {
             usage: None,
         },
         // 3) Compile-check with rustc.
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![call(
@@ -102,7 +102,7 @@ async fn add_verbose_flag_and_compile() {
             usage: None,
         },
         // 4) Final answer.
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "Added the --verbose flag; it compiles.".into(),
             reasoning: None,
             tool_calls: vec![],

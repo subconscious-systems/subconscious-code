@@ -1450,6 +1450,7 @@ fn restore_history(view: &mut ViewState, history: &[Turn]) {
                 reasoning,
                 calls: announced,
                 usage,
+                ..
             } => {
                 view.restore_assistant_turn(reasoning.as_deref(), text);
                 for call in announced {
@@ -1500,6 +1501,19 @@ fn restore_history(view: &mut ViewState, history: &[Turn]) {
                     view.transcript
                         .push(Line::styled(format!("· {text}"), dim_style()));
                 }
+            }
+            // A failed model request (transport error, non-2xx after retries,
+            // context-length rejection, …). Persisted so the session record shows
+            // the failure; replayed here as the same red `✗` block the live
+            // `AgentEvent::Error` path renders.
+            Turn::Error { message, .. } => {
+                view.transcript.extend(error_block(message));
+            }
+            // The user cancelled the turn mid-flight (Esc). Shown as a dim note so
+            // a `--continue` resume makes the interruption visible in the scrollback.
+            Turn::Cancelled { .. } => {
+                view.transcript
+                    .push(Line::styled("· cancelled".to_string(), dim_style()));
             }
         }
     }
@@ -1938,6 +1952,7 @@ mod tests {
                     total_tokens: 330,
                     prompt_tokens_details: None,
                 }),
+                cost: None,
             },
             Turn::ToolResult {
                 call_id: "call-1".into(),

@@ -149,8 +149,11 @@ impl ChatClient {
     /// a status of 429/5xx, or a *connection* error (DNS/TCP-refused/TLS) that
     /// isn't a timeout. Timeouts are NOT retried — a retry would multiply
     /// worst-case latency (`max_retries × total timeout`) for a merely-slow
-    /// server. Returns the 2xx `Response`; a non-transient error (or an
-    /// exhausted retry budget) returns the final error.
+    /// server. Returns `(2xx Response, retries_used)` on success — `retries_used`
+    /// is the number of retries before the successful response (0 for a clean
+    /// first attempt), surfaced to the host so a `Turn::Error` can record how
+    /// hard the harness tried. On failure returns `(error, retries_used)` so
+    /// the final error still carries the retry count.
     /// `body` is a refcounted `Bytes`, so each attempt clones a handle rather
     /// than the payload — a retry on a 200 MB request costs nothing extra.
     async fn send_with_retry(
@@ -158,7 +161,7 @@ impl ChatClient {
         url: &str,
         body: &Bytes,
         session_id: Option<&str>,
-    ) -> Result<reqwest::Response, ProtoError> {
+    ) -> Result<(reqwest::Response, u32), (ProtoError, u32)> {
         if session_id.is_some_and(|id| {
             id.is_empty()
                 || id.len() > MAX_SESSION_ID_LEN
@@ -166,7 +169,7 @@ impl ChatClient {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
         }) {
-            return Err(ProtoError::InvalidSessionId);
+            return Err((ProtoError::InvalidSessionId, 0));
         }
         let mut attempt = 0u32;
         loop {
@@ -192,12 +195,12 @@ impl ChatClient {
                         attempt += 1;
                         continue;
                     }
-                    return Err(ProtoError::Http(e));
+                    return Err((ProtoError::Http(e), attempt));
                 }
             };
             let status = resp.status();
             if status.is_success() {
-                return Ok(resp);
+                return Ok((resp, attempt));
             }
             let transient = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
             if transient && attempt < self.retry.max_retries {
@@ -217,10 +220,10 @@ impl ChatClient {
             }
             let text = resp.text().await.unwrap_or_default();
             tracing::debug!("← {status}\n{text}");
-            return Err(ProtoError::Status {
+            return Err((ProtoError::Status {
                 status: status.as_u16(),
                 body: text,
-            });
+            }, attempt));
         }
     }
 
@@ -332,9 +335,13 @@ impl ChatClient {
         let body = self.encode_body(&req)?;
         let url = format!("{}/chat/completions", self.base_url);
         self.log_request(&url, &body, false);
-        let resp = self
+        // `complete` is the non-streaming path (doctor / tests); it discards the
+        // wire retry count. The agent loop uses `stream` (via `ChatModel`), which
+        // surfaces retries to the host.
+        let (resp, _retries) = self
             .send_with_retry(&url, &body, opts.session_id.as_deref())
-            .await?;
+            .await
+            .map_err(|(e, _)| e)?;
         let status = resp.status();
         let parsed: ChatCompletionResponse = resp.json().await?;
         tracing::debug!(
@@ -348,8 +355,11 @@ impl ChatClient {
         Ok(parsed)
     }
 
-    /// One streaming round trip. Returns an [`AgentStreamEvent`] stream. The
-    /// request body is canonical (§4.6); tool calls are reassembled by the
+    /// One streaming round trip. Returns an [`AgentStreamEvent`] stream and the
+    /// number of wire-layer retries (429/5xx) the request survived (0 for a clean
+    /// first attempt), surfaced to the host via `EventSink::on_retry` and
+    /// persisted on a `Turn::Error` if the request ultimately fails. The request
+    /// body is canonical (§4.6); tool calls are reassembled by the
     /// [`crate::stream::ToolCallAccumulator`] and emitted (parsed, or as a
     /// parse error for the loop to feed back, §3.3). `stream_options` requests
     /// the trailing usage chunk (§3.6).
@@ -358,8 +368,13 @@ impl ChatClient {
         messages: &[WireMessage],
         opts: &CompleteOpts,
         tools: &[ToolDefinition],
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>>, ProtoError>
-    {
+    ) -> Result<
+        (
+            Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>>,
+            u32,
+        ),
+        (ProtoError, u32),
+    > {
         let req = ChatCompletionRequest {
             model: self.model.clone(),
             messages: messages.to_vec(),
@@ -377,17 +392,17 @@ impl ChatClient {
                 include_usage: true,
             }),
         };
-        let body = self.encode_body(&req)?;
+        let body = self.encode_body(&req).map_err(|e| (e, 0))?;
         let url = format!("{}/chat/completions", self.base_url);
         self.log_request(&url, &body, true);
-        let resp = self
+        let (resp, retries) = self
             .send_with_retry(&url, &body, opts.session_id.as_deref())
             .await?;
         let status = resp.status();
-        tracing::debug!("← {status} streaming");
+        tracing::debug!("← {status} streaming (retries={retries})");
         let body: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
             Box::pin(resp.bytes_stream());
-        Ok(Box::pin(EventStream::new(body)))
+        Ok((Box::pin(EventStream::new(body)), retries))
     }
 }
 

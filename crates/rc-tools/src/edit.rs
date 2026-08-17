@@ -2,8 +2,8 @@
 //! `replace_all`, a CRLF retry, and a helpful fuzzy hint on no match.
 
 use crate::util::{
-    atomic_write, params_schema, preserve_line_endings, record_read, require_current_read,
-    resolve_within,
+    atomic_write, params_schema, preserve_line_endings, record_read, current_read_state,
+    stale_read_error, resolve_within, ReadState,
 };
 use async_trait::async_trait;
 use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
@@ -72,8 +72,17 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
                 })
             }
         };
-        if let Some(err) = require_current_read(ctx, &canon) {
-            return Ok(err);
+        // Read-before-mutate (§6.3): "changed since read" is a hard error; "never
+        // read" auto-reads and proceeds (the old_string match is the real gate),
+        // avoiding two wasted round-trips when the model skips the `Read`.
+        let mut auto_read = false;
+        match current_read_state(ctx, &canon) {
+            ReadState::Unread => {
+                record_read(ctx, &canon);
+                auto_read = true;
+            }
+            ReadState::Stale => return Ok(stale_read_error(&canon)),
+            ReadState::Current => {}
         }
 
         let old_content = match std::fs::read_to_string(&canon) {
@@ -142,11 +151,14 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
             journal.record(canon.clone(), prior);
         }
 
-        Ok(ToolOutcome::ok(snippet_around(
-            &new_content,
-            &inp.new_string,
-            5,
-        )))
+        let mut msg = snippet_around(&new_content, &inp.new_string, 5);
+        if auto_read {
+            msg.push_str(&format!(
+                "\n\n(auto-read {} — read files before editing next time)",
+                canon.display()
+            ));
+        }
+        Ok(ToolOutcome::ok(msg))
     }
 }
 
@@ -241,20 +253,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_without_read() {
+    async fn auto_reads_without_read() {
+        // An Edit on a never-read existing file now auto-reads and proceeds
+        // (the old_string match is the real gate) instead of rejecting and
+        // costing two round-trips. The result carries an auto-read note.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("e.txt");
+        std::fs::write(&path, "alpha\n").unwrap();
+        let ctx = test_ctx(dir.path());
+        let out = Edit::new()
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string(), "old_string": "alpha", "new_string": "beta"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("auto-read"), "{content}");
+                assert!(content.contains("read files before editing"), "{content}");
+            }
+            o => panic!("expected auto-read-and-proceed, got {o:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "beta\n");
+        // The auto-read recorded into the shared registry.
+        let canon = std::fs::canonicalize(&path).unwrap();
+        assert!(ctx.read_registry.lock().unwrap().has_read(&canon));
+    }
+
+    #[tokio::test]
+    async fn auto_read_still_fails_on_no_match() {
+        // Auto-read is not a free pass: a wrong old_string still fails (the
+        // real safety gate), with the usual fuzzy hint.
         let dir = tempdir().unwrap();
         let path = dir.path().join("e.txt");
         std::fs::write(&path, "alpha\n").unwrap();
         let out = Edit::new()
             .call(
-                json!({"file_path": path.to_string_lossy().to_string(), "old_string": "alpha", "new_string": "beta"}),
+                json!({"file_path": path.to_string_lossy().to_string(), "old_string": "zzz", "new_string": "beta"}),
                 &test_ctx(dir.path()),
             )
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => assert!(message.contains("Read"), "{message}"),
-            o => panic!("expected read-first refusal, got {o:?}"),
+            ToolOutcome::Error { message, .. } => {
+                assert!(message.contains("not found"), "{message}")
+            }
+            o => panic!("expected a no-match error, got {o:?}"),
         }
     }
 

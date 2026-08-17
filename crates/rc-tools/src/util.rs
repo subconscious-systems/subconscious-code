@@ -38,38 +38,50 @@ pub fn record_read(ctx: &ToolCtx, canon: &Path) {
     }
 }
 
-/// Enforce "read before mutate" (§6.2/§6.3): the file must have been read, and
-/// must be unchanged since (mtime **and** content hash). Returns `Some(error)`
-/// to surface to the model when the check fails.
-pub fn require_current_read(ctx: &ToolCtx, canon: &Path) -> Option<ToolOutcome> {
-    let recorded = ctx
+/// State of the read-before-mutate check (§6.2/§6.3). The safety value is the
+/// *changed-since-read* check (mtime **and** content hash): an externally-changed
+/// file must be re-read. The *never-read* branch is only a nudge — so on `Unread`
+/// the Edit/Write tools auto-read the file into the registry and proceed (the
+/// `old_string`-must-match gate, or the explicit full content, is the real
+/// safety check), instead of rejecting the call and costing two round-trips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadState {
+    /// Never read this session: auto-read and proceed.
+    Unread,
+    /// Read, but changed since (mtime or content hash differs): re-read first.
+    Stale,
+    /// Read and unchanged: proceed.
+    Current,
+}
+
+/// Classify the read state of `canon` against the shared registry.
+pub fn current_read_state(ctx: &ToolCtx, canon: &Path) -> ReadState {
+    let Some((reg_mtime, reg_hash)) = ctx
         .read_registry
         .lock()
         .ok()
-        .and_then(|reg| reg.get(canon).cloned());
-    let Some((reg_mtime, reg_hash)) = recorded else {
-        return Some(ToolOutcome::Error {
-            message: format!(
-                "{} — read it with `Read` before mutating it",
-                canon.display()
-            ),
-            retryable: false,
-        });
+        .and_then(|reg| reg.get(canon).cloned())
+    else {
+        return ReadState::Unread;
     };
     let cur_mtime = mtime_of(canon);
     let cur_hash = blake3::hash(&std::fs::read(canon).unwrap_or_default())
         .to_hex()
         .to_string();
     if cur_mtime != Some(reg_mtime) || cur_hash != reg_hash {
-        return Some(ToolOutcome::Error {
-            message: format!(
-                "{} changed since the last `Read` — re-read it first",
-                canon.display()
-            ),
-            retryable: false,
-        });
+        ReadState::Stale
+    } else {
+        ReadState::Current
     }
-    None
+}
+
+/// The "changed since the last `Read` — re-read it first" error for the `Stale`
+/// case. (`Unread` is now handled by auto-reading in the caller, not by erroring.)
+pub fn stale_read_error(canon: &Path) -> ToolOutcome {
+    ToolOutcome::Error {
+        message: format!("{} changed since the last `Read` — re-read it first", canon.display()),
+        retryable: false,
+    }
 }
 
 // Path containment lives in rc-perm now (§7.5 — one function, used everywhere).

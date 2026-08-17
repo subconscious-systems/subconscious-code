@@ -115,6 +115,10 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
                 .into();
                 push_user(&mut out, &rendered);
             }
+            // A failed or cancelled request leaves no wire message — there is no
+            // assistant turn to re-send. They're recorded in the transcript for
+            // honesty (the "lack of errors" fix) but are invisible to the model.
+            Turn::Error { .. } | Turn::Cancelled { .. } => {}
         }
     }
     out
@@ -264,6 +268,7 @@ mod tests {
                 reasoning: None,
                 calls: vec![call("c1")],
                 usage: None,
+                cost: None,
             },
             toolresult("c1"),
         ];
@@ -278,6 +283,7 @@ mod tests {
                 reasoning: None,
                 calls: vec![call("c1")],
                 usage: None,
+                cost: None,
             },
             toolresult("c2"),
         ];
@@ -293,6 +299,7 @@ mod tests {
                 reasoning: None,
                 calls: vec![call("c1")],
                 usage: None,
+                cost: None,
             },
             Turn::User {
                 content: "hi".into(),
@@ -314,6 +321,7 @@ mod tests {
                 reasoning: None,
                 calls: vec![call("c1"), call("c2")],
                 usage: None,
+                cost: None,
             },
             toolresult("c1"),
         ];
@@ -541,6 +549,7 @@ mod tests {
                 reasoning: None,
                 calls: vec![call("c1")],
                 usage: None,
+                cost: None,
             },
             Turn::ToolResult {
                 call_id: "c1".into(),

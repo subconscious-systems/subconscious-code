@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod context;
+pub mod cost;
 pub mod model;
 pub mod project;
 pub mod prompt;
@@ -25,6 +26,7 @@ pub mod turn;
 
 pub use agent::{AgentLoop, LoopError, LoopOutcome};
 pub use context::{ContextAssembler, LegacyAssembler};
+pub use cost::{Cost, Pricing};
 pub use model::{
     ChatModel, EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse,
     NullSink,

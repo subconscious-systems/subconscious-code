@@ -69,7 +69,7 @@ impl Tool for Echo {
 async fn loop_runs_tool_then_answers() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -80,7 +80,7 @@ async fn loop_runs_tool_then_answers() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -131,7 +131,7 @@ async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
     // synthesize a `role:tool` error result (§3.3) so the model can retry.
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::ParseError {
@@ -143,7 +143,7 @@ async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "recovered".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -194,7 +194,7 @@ async fn ask_escalation_denied_by_null_prompter_becomes_a_denied_result() {
     let engine = Arc::new(PermissionEngine::new(Mode::Default, vec![], vec![], vec![]))
         as Arc<dyn PermissionChecker>;
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -205,7 +205,7 @@ async fn ask_escalation_denied_by_null_prompter_becomes_a_denied_result() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "ok".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -274,7 +274,7 @@ impl EventSink for RecordingSink {
 async fn loop_emits_iter_tool_end_and_usage() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -285,7 +285,7 @@ async fn loop_emits_iter_tool_end_and_usage() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -342,7 +342,7 @@ impl Prompter for MockPrompter {
 }
 
 fn edit_call(id: &str) -> ModelResponse {
-    ModelResponse {
+    ModelResponse { retries: 0,
         text: String::new(),
         reasoning: None,
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -356,7 +356,7 @@ fn edit_call(id: &str) -> ModelResponse {
 }
 
 fn stop_response(text: &str) -> ModelResponse {
-    ModelResponse {
+    ModelResponse { retries: 0,
         text: text.into(),
         reasoning: None,
         tool_calls: vec![],
@@ -455,7 +455,7 @@ async fn turn_timeout_ends_a_long_loop() {
                 *c
             };
             tokio::time::sleep(self.delay).await;
-            Ok(ModelResponse {
+            Ok(ModelResponse { retries: 0,
                 text: String::new(),
                 reasoning: None,
                 tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -522,7 +522,7 @@ async fn accumulates_usage_across_iterations() {
     }
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -533,7 +533,7 @@ async fn accumulates_usage_across_iterations() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: Some(usage(10, 2)),
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -578,7 +578,7 @@ async fn accumulates_usage_across_iterations() {
 #[tokio::test]
 async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
-    let responses = vec![ModelResponse {
+    let responses = vec![ModelResponse { retries: 0,
         text: String::new(),
         reasoning: None,
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -629,7 +629,7 @@ async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
 #[tokio::test]
 async fn length_with_outstanding_call_synthesizes_an_interrupted_result() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
-    let responses = vec![ModelResponse {
+    let responses = vec![ModelResponse { retries: 0,
         text: "partial".into(),
         reasoning: None,
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -681,14 +681,14 @@ async fn length_without_tool_calls_auto_continues() {
     // finishes the answer instead of stopping with a warning.
     let registry = Arc::new(ToolRegistry::new(vec![]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "partial answer".into(),
             reasoning: None,
             tool_calls: vec![],
             finish_reason: rc_proto::FinishReason::Length,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: " done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -739,7 +739,7 @@ async fn length_with_outstanding_call_stops_and_synthesizes() {
     // auto-continue (the assistant message has outstanding calls); it
     // synthesizes Interrupted results and stops with LoopOutcome::Length.
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
-    let responses = vec![ModelResponse {
+    let responses = vec![ModelResponse { retries: 0,
         text: "partial".into(),
         reasoning: None,
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -821,7 +821,7 @@ async fn loop_uses_the_wired_context_assembler() {
     // With an assembler set, the loop must send its system prompt, not the
     // legacy default. We capture the request and inspect message[0].
     let captured = Arc::new(Mutex::new(None));
-    let response = ModelResponse {
+    let response = ModelResponse { retries: 0,
         text: "done".into(),
         reasoning: None,
         tool_calls: vec![],
@@ -882,7 +882,7 @@ async fn loop_without_assembler_uses_legacy_default_prompt() {
     // With no assembler set, the loop falls back to the legacy `project` path
     // (M1–M5 behavior) — the system message is the default identity prompt.
     let captured = Arc::new(Mutex::new(None));
-    let response = ModelResponse {
+    let response = ModelResponse { retries: 0,
         text: "done".into(),
         reasoning: None,
         tool_calls: vec![],
@@ -965,7 +965,7 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
         vec![Arc::new(PanicTool) as Arc<dyn Tool>],
     ));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -976,7 +976,7 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "recovered".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -1076,7 +1076,7 @@ async fn large_tool_results_reach_the_wire_uncapped() {
                 r.len() == 1
             };
             Ok(if first {
-                ModelResponse {
+                ModelResponse { retries: 0,
                     text: String::new(),
                     reasoning: None,
                     tool_calls: vec![rc_core::model::FinalizedToolCall::Call(rc_core::ToolCall {
@@ -1088,7 +1088,7 @@ async fn large_tool_results_reach_the_wire_uncapped() {
                     usage: None,
                 }
             } else {
-                ModelResponse {
+                ModelResponse { retries: 0,
                     text: "done".into(),
                     reasoning: None,
                     tool_calls: vec![],
@@ -1172,7 +1172,7 @@ async fn hard_tool_result_cap_clips_a_runaway_output() {
 
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Huge) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -1183,7 +1183,7 @@ async fn hard_tool_result_cap_clips_a_runaway_output() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -1254,7 +1254,7 @@ async fn hard_tool_result_cap_zero_disables_it() {
 
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Big) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -1265,7 +1265,7 @@ async fn hard_tool_result_cap_zero_disables_it() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],

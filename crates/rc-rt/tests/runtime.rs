@@ -80,7 +80,7 @@ impl Tool for Echo {
 }
 
 fn resp_with_call(id: &str, name: &str, args: Value) -> ModelResponse {
-    ModelResponse {
+    ModelResponse { retries: 0,
         text: String::new(),
         reasoning: None,
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -93,7 +93,7 @@ fn resp_with_call(id: &str, name: &str, args: Value) -> ModelResponse {
     }
 }
 fn resp_stop(text: &str) -> ModelResponse {
-    ModelResponse {
+    ModelResponse { retries: 0,
         text: text.to_string(),
         reasoning: None,
         tool_calls: vec![],

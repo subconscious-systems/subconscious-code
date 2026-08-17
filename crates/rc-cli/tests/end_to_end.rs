@@ -52,7 +52,7 @@ async fn read_tool_runs_through_the_loop() {
         Arc::new(Read::new()) as Arc<dyn Tool>
     ]));
     let responses = vec![
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -63,7 +63,7 @@ async fn read_tool_runs_through_the_loop() {
             finish_reason: FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse {
+        ModelResponse { retries: 0,
             text: "the file says the answer is 42".into(),
             reasoning: None,
             tool_calls: vec![],

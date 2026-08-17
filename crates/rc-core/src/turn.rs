@@ -3,6 +3,7 @@
 //! `Turn` is the internal representation; the wire form is a fresh projection
 //! per request ([`crate::project`]), never stored as state.
 
+use crate::cost::Cost;
 use crate::state::{
     ChangeJournal, ReadRegistry, SharedChangeJournal, SharedReadRegistry, SharedShellState,
     ShellState,
@@ -45,6 +46,12 @@ pub enum Turn {
         calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
+        /// Integer micro-USD cost of this response (the accounting monoid,
+        /// `rc_core::cost`). Persisted so a resumed session reconstructs the
+        /// running total exactly, without needing the price sheet at load
+        /// time. `#[serde(default)]` keeps old session files readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<Cost>,
     },
     ToolResult {
         call_id: String,
@@ -56,6 +63,32 @@ pub enum Turn {
     /// Compaction markers, mode changes, notices — never injected into the
     /// system prompt (it's already sent); rendered as a user-side block.
     SystemNote { kind: NoteKind, text: String },
+    /// A model request *failed* (transport error, HTTP non-2xx after retries
+    /// exhausted, context-length rejection, …). Persisted so the session
+    /// record shows the failure — previously a failed request vanished from the
+    /// JSONL with no trace (the "lack of errors" blind spot). Like `SystemNote`
+    /// it is NOT injected into the next request's messages: a failed request
+    /// leaves no assistant message to re-send, so the projection skips it.
+    Error {
+        message: Arc<str>,
+        /// `Some(true)` for transient errors the loop could retry, `Some(false)`
+        /// for permanent ones; `None` when unknown. Mirrors `ToolResultBody::Error`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retryable: Option<bool>,
+        /// How many wire-layer retries (429/5xx) happened before this failure.
+        /// `None` when the failure wasn't retried / the count is unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retries: Option<u32>,
+        #[serde(with = "epoch_millis", default = "epoch_millis::zero")]
+        ts: SystemTime,
+    },
+    /// The user cancelled the turn mid-flight (Esc). Persisted so a `--continue`
+    /// resume shows the interruption in the scrollback and the loop knows no
+    /// assistant turn completed. Not injected into the next request's messages.
+    Cancelled {
+        #[serde(with = "epoch_millis", default = "epoch_millis::zero")]
+        ts: SystemTime,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +247,11 @@ pub struct Session {
     /// prompt re-sends the prefix, so `total_tokens` is an upper bound;
     /// `completion_tokens` is the true cumulative output.
     pub total_usage: Usage,
+    /// Cumulative cost across all turns in integer micro-USD — the accounting
+    /// monoid (`rc_core::cost`). Integer (not float) so a sharded/parallel
+    /// reduction is order-independent and reproducible. Defaults to zero;
+    /// reconstructed exactly on resume from the per-turn `cost` records.
+    pub total_cost: Cost,
 }
 
 impl Session {
@@ -232,6 +270,7 @@ impl Session {
             shell_state,
             change_journal,
             total_usage: Usage::default(),
+            total_cost: Cost::ZERO,
         }
     }
 }
@@ -303,6 +342,7 @@ mod tests {
                     arguments: r#"{"file_path":"/a"}"#.into(),
                 }],
                 usage: Some(Usage::default()),
+                cost: None,
             },
             Turn::ToolResult {
                 call_id: "c1".into(),

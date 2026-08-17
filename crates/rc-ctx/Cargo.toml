@@ -9,6 +9,7 @@ license.workspace = true
 rc-core = { path = "../rc-core" }
 rc-proto = { path = "../rc-proto" }
 rc-tokenize = { path = "../rc-tokenize" }
+rc-algebra = { path = "../rc-algebra" }
 serde.workspace = true
 serde_json.workspace = true
 

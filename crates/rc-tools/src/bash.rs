@@ -31,6 +31,7 @@ use std::os::unix::process::CommandExt as StdCommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
+use tokio::io::AsyncReadExt;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -160,61 +161,102 @@ impl Tool for Bash {
             Err(outcome) => return Ok(outcome), // fail-closed
         };
 
-        let output = match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
+        // Spawn the child and drain stdout+stderr concurrently, racing the drain
+        // against the timeout. On a timeout we kill the child and surface the
+        // partial output captured so far (`read_to_end` appends incrementally,
+        // so the buffers survive the dropped drain future) — otherwise a hung
+        // command's output is discarded and the model must re-run to find where
+        // it stopped.
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
                 return Ok(ToolOutcome::Error {
                     message: format!("spawn failed: {e}"),
                     retryable: false,
                 })
             }
+        };
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let mut out_buf: Vec<u8> = Vec::new();
+        let mut err_buf: Vec<u8> = Vec::new();
+
+        let drain = async {
+            let (o, e) = tokio::join!(
+                stdout.read_to_end(&mut out_buf),
+                stderr.read_to_end(&mut err_buf),
+            );
+            let _ = (o, e);
+            child.wait().await
+        };
+
+        match tokio::time::timeout(timeout, drain).await {
+            Ok(Ok(status)) => {
+                let stdout = strip_ansi(&String::from_utf8_lossy(&out_buf));
+                let stderr = strip_ansi(&String::from_utf8_lossy(&err_buf));
+                let mut combined = stdout;
+                if !stderr.is_empty() {
+                    combined.push_str("\n--- stderr ---\n");
+                    combined.push_str(&stderr);
+                }
+                let (head, tail) = self.head_tail();
+                let (truncated, body) = cap_output(&combined, self.cap, head, tail);
+                let exit = status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "<signal>".to_string());
+
+                // M7: persist a successful, in-workspace `cd` into the live shell state.
+                // The agent loop syncs this back into ctx.cwd/session.cwd for later calls.
+                if exit == "0" {
+                    if let Some(new_cwd) = infer_cwd(&inp.command, &ctx.cwd) {
+                        if let Ok(canon) =
+                            resolve_within(&ctx.allowed_roots, &ctx.cwd, &new_cwd.to_string_lossy())
+                        {
+                            if let Ok(mut shell_state) = ctx.shell_state.lock() {
+                                shell_state.cwd = canon;
+                            }
+                        }
+                        // A cd outside the allowed roots ran (transient, in the subshell)
+                        // but is not persisted — the agent can't `cd` out of the workspace.
+                    }
+                }
+
+                Ok(ToolOutcome::Ok {
+                    content: format!("exit: {exit}\n{body}"),
+                    truncated,
+                    artifacts: Vec::new(),
+                })
+            }
+            Ok(Err(e)) => Ok(ToolOutcome::Error {
+                message: format!("spawn failed: {e}"),
+                retryable: false,
+            }),
             Err(_) => {
-                return Ok(ToolOutcome::Error {
+                // Timed out: kill the child (closing its pipes) and reap it, then
+                // surface the partial output captured before the timeout so the
+                // model can see where the command hung without re-running it.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let stdout = strip_ansi(&String::from_utf8_lossy(&out_buf));
+                let stderr = strip_ansi(&String::from_utf8_lossy(&err_buf));
+                let mut combined = stdout;
+                if !stderr.is_empty() {
+                    combined.push_str("\n--- stderr ---\n");
+                    combined.push_str(&stderr);
+                }
+                let (head, tail) = self.head_tail();
+                let (_, body) = cap_output(&combined, self.cap, head, tail);
+                Ok(ToolOutcome::Error {
                     message: format!(
-                        "command timed out after {} ms (killed)",
-                        timeout.as_millis()
+                        "command timed out after {} ms (killed); partial output below:\n{}",
+                        timeout.as_millis(),
+                        body
                     ),
                     retryable: false,
                 })
             }
-        };
-
-        let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
-        let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
-        let mut combined = stdout;
-        if !stderr.is_empty() {
-            combined.push_str("\n--- stderr ---\n");
-            combined.push_str(&stderr);
         }
-        let (head, tail) = self.head_tail();
-        let (truncated, body) = cap_output(&combined, self.cap, head, tail);
-        let exit = output
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "<signal>".to_string());
-
-        // M7: persist a successful, in-workspace `cd` into the live shell state.
-        // The agent loop syncs this back into ctx.cwd/session.cwd for later calls.
-        if exit == "0" {
-            if let Some(new_cwd) = infer_cwd(&inp.command, &ctx.cwd) {
-                if let Ok(canon) =
-                    resolve_within(&ctx.allowed_roots, &ctx.cwd, &new_cwd.to_string_lossy())
-                {
-                    if let Ok(mut shell_state) = ctx.shell_state.lock() {
-                        shell_state.cwd = canon;
-                    }
-                }
-                // A cd outside the allowed roots ran (transient, in the subshell)
-                // but is not persisted — the agent can't `cd` out of the workspace.
-            }
-        }
-
-        Ok(ToolOutcome::Ok {
-            content: format!("exit: {exit}\n{body}"),
-            truncated,
-            artifacts: Vec::new(),
-        })
     }
 }
 
@@ -571,6 +613,28 @@ mod tests {
         match out {
             ToolOutcome::Error { message, .. } => {
                 assert!(message.contains("timed out"), "{message}")
+            }
+            o => panic!("expected a timeout error, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_surfaces_partial_output() {
+        // A command that prints before hanging: the partial output must reach
+        // the model so it can see where the command hung without re-running it.
+        let dir = tempdir().unwrap();
+        let out = Bash::new()
+            .call(
+                // print "partial" to stderr, then hang past the 150 ms timeout.
+                json!({"command": "printf 'partial\\n' >&2; sleep 5", "timeout_ms": 150}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Error { message, .. } => {
+                assert!(message.contains("timed out"), "{message}");
+                assert!(message.contains("partial"), "partial output missing: {message}");
             }
             o => panic!("expected a timeout error, got {o:?}"),
         }
