@@ -53,11 +53,11 @@ impl Status {
 /// 32 MB is on the ladder deliberately: it's the cap Claude Code imposes, and
 /// the point of this project is to be able to say concretely whether we clear it.
 const LADDER: &[usize] = &[
-    1 << 20,        // 1 MB
-    10 << 20,       // 10 MB — AWS API Gateway's hard ceiling
-    32 << 20,       // 32 MB — Claude Code's request cap
-    100 << 20,      // 100 MB
-    500 << 20,      // 500 MB
+    1 << 20,   // 1 MB
+    10 << 20,  // 10 MB — AWS API Gateway's hard ceiling
+    32 << 20,  // 32 MB — Claude Code's request cap
+    100 << 20, // 100 MB
+    500 << 20, // 500 MB
 ];
 
 /// Run the doctor. Returns `Ok(false)` if any check failed, so the caller can
@@ -138,9 +138,27 @@ pub async fn run(settings: &Settings, body_ladder: bool) -> Result<bool> {
 /// The resolved configuration, with the caps spelled out — a silent 16 KB
 /// tool-result cap is exactly the kind of thing this should surface.
 fn config_lines(s: &Settings) -> Vec<String> {
-    let cap = |n: usize| if n == 0 { "unlimited".to_string() } else { human(n) };
-    let lines = |n: u32| if n == 0 { "whole file".to_string() } else { format!("{n} lines") };
-    let ms = |n: u64| if n == 0 { "off".to_string() } else { format!("{n} ms") };
+    let cap = |n: usize| {
+        if n == 0 {
+            "unlimited".to_string()
+        } else {
+            human(n)
+        }
+    };
+    let lines = |n: u32| {
+        if n == 0 {
+            "whole file".to_string()
+        } else {
+            format!("{n} lines")
+        }
+    };
+    let ms = |n: u64| {
+        if n == 0 {
+            "off".to_string()
+        } else {
+            format!("{n} ms")
+        }
+    };
     vec![
         format!("  base_url            {}", s.base_url),
         format!("  model               {}", s.model),
@@ -155,43 +173,69 @@ fn config_lines(s: &Settings) -> Vec<String> {
         format!("  idle timeout        {}", ms(s.idle_timeout_ms)),
         format!("  max retries         {}", s.max_retries),
         format!("  request gzip        {}", s.request_gzip),
-        format!("  permission mode     {}", if s.permissions.default_mode.is_empty() {
-            "default".to_string()
-        } else {
-            s.permissions.default_mode.clone()
-        }),
-        format!("  sandbox             {}", if s.sandbox.enabled {
-            format!("on (net: {})", s.sandbox.allow_net)
-        } else {
-            "off".to_string()
-        }),
+        format!(
+            "  permission mode     {}",
+            if s.permissions.default_mode.is_empty() {
+                "default".to_string()
+            } else {
+                s.permissions.default_mode.clone()
+            }
+        ),
+        format!(
+            "  sandbox             {}",
+            if s.sandbox.enabled {
+                format!("on (net: {})", s.sandbox.allow_net)
+            } else {
+                "off".to_string()
+            }
+        ),
         format!("  cap: tool result    {}", cap(s.context.tool_result_cap)),
         format!("  cap: @file inline   {}", cap(s.context.inline_file_cap)),
         format!("  cap: bash output    {}", cap(s.context.bash_output_cap)),
         format!("  cap: grep output    {}", cap(s.context.grep_output_cap)),
-        format!("  cap: read default   {}", lines(s.context.read_default_limit)),
+        format!(
+            "  cap: read default   {}",
+            lines(s.context.read_default_limit)
+        ),
         format!("  cap: glob results   {}", cap(s.context.glob_cap)),
         format!("  max iterations      {}", s.context.max_iters),
     ]
 }
 
 async fn probe_non_streaming(client: &ChatClient) -> Status {
-    let msgs = vec![WireMessage::User { content: "Reply with the single word: ok".into() }];
-    let opts = CompleteOpts { max_tokens: Some(16), ..Default::default() };
+    let msgs = vec![WireMessage::User {
+        content: "Reply with the single word: ok".into(),
+    }];
+    let opts = CompleteOpts {
+        max_tokens: Some(16),
+        ..Default::default()
+    };
     let t = Instant::now();
     match client.complete(&msgs, &opts).await {
         Ok(resp) => {
             let ms = t.elapsed().as_millis();
-            let usage = if resp.usage.is_some() { "usage present" } else { "no usage field" };
-            Status::Pass(format!("{ms} ms, {} choice(s), {usage}", resp.choices.len()))
+            let usage = if resp.usage.is_some() {
+                "usage present"
+            } else {
+                "no usage field"
+            };
+            Status::Pass(format!(
+                "{ms} ms, {} choice(s), {usage}",
+                resp.choices.len()
+            ))
         }
         Err(e) => Status::Fail(describe(&e)),
     }
 }
 
 async fn probe_streaming(client: &ChatClient) -> Status {
-    let msgs = vec![WireMessage::User { content: "Count: 1 2 3".into() }];
-    let opts = CompleteOpts { max_tokens: Some(32), ..Default::default() };
+    let msgs = vec![WireMessage::User {
+        content: "Count: 1 2 3".into(),
+    }];
+    let opts = CompleteOpts {
+        max_tokens: Some(32),
+        ..Default::default()
+    };
     let t = Instant::now();
     let mut stream = match client.stream(&msgs, &opts, &[]).await {
         Ok(s) => s,
@@ -217,7 +261,9 @@ async fn probe_streaming(client: &ChatClient) -> Status {
     }
     let ttfb = first_chunk_ms.unwrap_or(0);
     if saw_usage {
-        Status::Pass(format!("{chunks} events, first at {ttfb} ms, usage reported"))
+        Status::Pass(format!(
+            "{chunks} events, first at {ttfb} ms, usage reported"
+        ))
     } else {
         // Not fatal: only metering and estimator calibration degrade.
         Status::Warn(format!(
@@ -245,8 +291,14 @@ async fn probe_tool_calls(client: &ChatClient) -> Status {
     let msgs = vec![WireMessage::User {
         content: "What time is it in Tokyo? Use the get_time tool.".into(),
     }];
-    let opts = CompleteOpts { max_tokens: Some(128), ..Default::default() };
-    let mut stream = match client.stream(&msgs, &opts, std::slice::from_ref(&tool)).await {
+    let opts = CompleteOpts {
+        max_tokens: Some(128),
+        ..Default::default()
+    };
+    let mut stream = match client
+        .stream(&msgs, &opts, std::slice::from_ref(&tool))
+        .await
+    {
         Ok(s) => s,
         Err(e) => return Status::Fail(describe(&e)),
     };
@@ -267,11 +319,10 @@ async fn probe_tool_calls(client: &ChatClient) -> Status {
         }
     }
     if saw_tool_call {
-        Status::Pass(format!("model emitted a tool call{}", if names.is_empty() {
-            ""
-        } else {
-            " (get_time)"
-        }))
+        Status::Pass(format!(
+            "model emitted a tool call{}",
+            if names.is_empty() { "" } else { " (get_time)" }
+        ))
     } else {
         // The agent loop cannot function without this, so it's a hard failure
         // even though the endpoint is technically responding.
@@ -291,7 +342,10 @@ async fn probe_body_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
         let msgs = vec![WireMessage::User {
             content: format!("Ignore this padding and reply with 'ok'.\n{pad}").into(),
         }];
-        let opts = CompleteOpts { max_tokens: Some(16), ..Default::default() };
+        let opts = CompleteOpts {
+            max_tokens: Some(16),
+            ..Default::default()
+        };
         let t = Instant::now();
         let status = match client.complete(&msgs, &opts).await {
             Ok(_) => {
@@ -327,7 +381,9 @@ async fn probe_chunked_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
         let mut msgs = Vec::with_capacity(n);
         for i in 0..n {
             if i % 2 == 0 {
-                msgs.push(WireMessage::User { content: pad.clone().into() });
+                msgs.push(WireMessage::User {
+                    content: pad.clone().into(),
+                });
             } else {
                 msgs.push(WireMessage::Assistant {
                     content: Some(Arc::from(pad.as_str())),
@@ -335,7 +391,10 @@ async fn probe_chunked_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
                 });
             }
         }
-        let opts = CompleteOpts { max_tokens: Some(16), ..Default::default() };
+        let opts = CompleteOpts {
+            max_tokens: Some(16),
+            ..Default::default()
+        };
         let t = Instant::now();
         let status = match client.complete(&msgs, &opts).await {
             Ok(_) => {
@@ -356,7 +415,11 @@ async fn probe_chunked_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
 
 /// Largest rung the gateway accepted, or `None` if even the first was refused.
 fn largest_accepted(results: &[(usize, Status)]) -> Option<usize> {
-    results.iter().rev().find(|(_, s)| !s.is_fail()).map(|(n, _)| *n)
+    results
+        .iter()
+        .rev()
+        .find(|(_, s)| !s.is_fail())
+        .map(|(n, _)| *n)
 }
 
 /// The first rung the gateway rejected, with its byte size and error message —
@@ -410,7 +473,10 @@ fn summarize_ceilings(single: &[(usize, Status)], chunked: &[(usize, Status)]) {
         Some(x) => human(x),
         None => "rejected at 1 MB".to_string(),
     };
-    println!("per-string  ceiling: {}  (one message or tool result)", fmt(per_string));
+    println!(
+        "per-string  ceiling: {}  (one message or tool result)",
+        fmt(per_string)
+    );
     // A chunked failure that mentions tokens/context-length is the route's
     // context window (a token budget), not a byte/payload cap — label it as such
     // so nobody chases a proxy setting that isn't the constraint.
@@ -420,14 +486,23 @@ fn summarize_ceilings(single: &[(usize, Status)], chunked: &[(usize, Status)]) {
     if token_limited {
         println!("per-request ceiling: TOKEN/context-length limit  (the route's context window)");
     } else {
-        println!("per-request ceiling: {}  (total body, chunked across messages)", fmt(per_request));
+        println!(
+            "per-request ceiling: {}  (total body, chunked across messages)",
+            fmt(per_request)
+        );
     }
     println!();
     match per_request {
         Some(r) if r >= 32 << 20 => {
             println!("Total requests clear 32 MB — Claude Code's cap. The per-string limit");
-            println!("({}) only means a single message or tool result must be split; the", fmt(per_string));
-            println!("whole context is bounded by {} at the proxy, not by this client.", human(r));
+            println!(
+                "({}) only means a single message or tool result must be split; the",
+                fmt(per_string)
+            );
+            println!(
+                "whole context is bounded by {} at the proxy, not by this client.",
+                human(r)
+            );
         }
         Some(r) if r > per_string.unwrap_or(0) && token_limited => {
             // The total can grow past the per-string limit by chunking, but the
@@ -435,10 +510,21 @@ fn summarize_ceilings(single: &[(usize, Status)], chunked: &[(usize, Status)]) {
             // model/route property, not a proxy byte limit. Say so plainly.
             let (rej_bytes, msg) = first_failure(chunked).expect("token_limited implies a failure");
             let single = human(per_string.unwrap_or(1 << 20));
-            println!("Chunking helps: a chunked total of {} passes where a single {}", human(r), single);
-            println!("{} message is rejected. But the *total* is bounded by the route's", single);
+            println!(
+                "Chunking helps: a chunked total of {} passes where a single {}",
+                human(r),
+                single
+            );
+            println!(
+                "{} message is rejected. But the *total* is bounded by the route's",
+                single
+            );
             println!("configured context length — a TOKEN limit, not a byte/payload limit.");
-            println!("{} was accepted; {} was rejected as \"exceeding the selected", human(r), human(rej_bytes));
+            println!(
+                "{} was accepted; {} was rejected as \"exceeding the selected",
+                human(r),
+                human(rej_bytes)
+            );
             match rejected_token_count(msg) {
                 Some(t) => {
                     let passed = (t as f64 * (r as f64 / rej_bytes as f64)) as u64;
@@ -453,12 +539,19 @@ fn summarize_ceilings(single: &[(usize, Status)], chunked: &[(usize, Status)]) {
             println!("the route's context length must be configured higher on the model side.");
         }
         Some(r) if r > per_string.unwrap_or(0) => {
-            println!("Chunking helps: total {} exceeds the single-message {}.", human(r), fmt(per_string));
+            println!(
+                "Chunking helps: total {} exceeds the single-message {}.",
+                human(r),
+                fmt(per_string)
+            );
             println!("Large contexts survive by spreading across messages, but the total is");
             print_proxy_culprit(r);
         }
         Some(r) => {
-            println!("Chunking does NOT help — the total is capped at {} just like a", human(r));
+            println!(
+                "Chunking does NOT help — the total is capped at {} just like a",
+                human(r)
+            );
             println!("single string. The model server itself bounds the context; no");
             println!("client-side change can lift it.");
         }
@@ -479,13 +572,22 @@ fn print_proxy_culprit(n: usize) {
         println!("go larger; no client-side change lifts it. Note this is *below*");
         println!("Claude Code's 32 MB cap, so on this route we'd be more limited.");
     } else if n >= 32 << 20 {
-        println!("capped at {} — past API Gateway and at/above Claude Code's 32 MB.", human(n));
+        println!(
+            "capped at {} — past API Gateway and at/above Claude Code's 32 MB.",
+            human(n)
+        );
     } else if n <= 1 << 20 {
-        println!("capped at {} — usually nginx's default `client_max_body_size`,", human(n));
+        println!(
+            "capped at {} — usually nginx's default `client_max_body_size`,",
+            human(n)
+        );
         println!("which can be raised. Whatever sits in front of the model server is");
         println!("what needs changing — this client imposes no cap of its own.");
     } else {
-        println!("capped at {} — between 1 and 10 MB. Find what imposes this limit;", human(n));
+        println!(
+            "capped at {} — between 1 and 10 MB. Find what imposes this limit;",
+            human(n)
+        );
         println!("it's in the proxy path, not this client.");
     }
 }
@@ -555,7 +657,10 @@ mod tests {
         let s = Settings::load(std::path::Path::new("/nonexistent"));
         let joined = config_lines(&s).join("\n");
         assert!(joined.contains("cap: tool result    unlimited"), "{joined}");
-        assert!(joined.contains("cap: read default   whole file"), "{joined}");
+        assert!(
+            joined.contains("cap: read default   whole file"),
+            "{joined}"
+        );
         assert!(joined.contains("total timeout       off"), "{joined}");
     }
 
@@ -597,7 +702,10 @@ mod tests {
             (10 << 20, Status::Fail("HTTP 400 — too big".into())),
             (32 << 20, Status::Fail("HTTP 400 — also too big".into())),
         ];
-        assert_eq!(first_failure(&ladder), Some((10 << 20, "HTTP 400 — too big")));
+        assert_eq!(
+            first_failure(&ladder),
+            Some((10 << 20, "HTTP 400 — too big"))
+        );
         // Largest accepted skips the failures and finds the rung before them.
         assert_eq!(largest_accepted(&ladder), Some(1 << 20));
     }

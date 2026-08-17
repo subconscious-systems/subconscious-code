@@ -87,7 +87,11 @@ impl EventSink for NullSink {}
 /// The model abstraction (§13 MockModel for tests).
 #[async_trait]
 pub trait Model: Send + Sync {
-    async fn complete(&self, req: ModelRequest, sink: &dyn EventSink) -> Result<ModelResponse, ModelError>;
+    async fn complete(
+        &self,
+        req: ModelRequest,
+        sink: &dyn EventSink,
+    ) -> Result<ModelResponse, ModelError>;
 }
 
 /// A `Model` backed by an `rc_proto::ChatClient`. Streams internally, accumulates
@@ -101,15 +105,31 @@ pub struct ChatModel {
 
 impl ChatModel {
     pub fn new(client: std::sync::Arc<ChatClient>) -> Self {
-        Self { client, reasoning_tag: Some("think".to_string()) }
+        Self {
+            client,
+            reasoning_tag: Some("think".to_string()),
+        }
     }
 }
 
 #[async_trait]
 impl Model for ChatModel {
-    async fn complete(&self, req: ModelRequest, sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
-        let stream = self.client.stream(&req.messages, &req.opts, &req.tools).await?;
-        consume_stream(stream, req.opts.idle_timeout, self.reasoning_tag.as_deref(), sink).await
+    async fn complete(
+        &self,
+        req: ModelRequest,
+        sink: &dyn EventSink,
+    ) -> Result<ModelResponse, ModelError> {
+        let stream = self
+            .client
+            .stream(&req.messages, &req.opts, &req.tools)
+            .await?;
+        consume_stream(
+            stream,
+            req.opts.idle_timeout,
+            self.reasoning_tag.as_deref(),
+            sink,
+        )
+        .await
     }
 }
 
@@ -142,7 +162,9 @@ async fn consume_stream(
             },
             None => stream.next().await,
         };
-        let Some(ev) = next else { break; };
+        let Some(ev) = next else {
+            break;
+        };
         match ev? {
             AgentStreamEvent::Text(t) => {
                 sink.on_text(&t);
@@ -152,15 +174,29 @@ async fn consume_stream(
                 sink.on_reasoning(&r);
                 reasoning.push_str(&r);
             }
-            AgentStreamEvent::ToolCallReady { id, name, arguments } => {
+            AgentStreamEvent::ToolCallReady {
+                id,
+                name,
+                arguments,
+            } => {
                 // `arguments` arrives as an owned `String` from the stream parser;
                 // wrap it once here so every later re-send of this call is a
                 // refcount bump, not a copy.
-                let call = ToolCall { id, name, arguments: Arc::from(arguments) };
+                let call = ToolCall {
+                    id,
+                    name,
+                    arguments: Arc::from(arguments),
+                };
                 sink.on_tool_start(&call);
                 tool_calls.push(FinalizedToolCall::Call(call));
             }
-            AgentStreamEvent::ToolCallFailed { id, name, raw_arguments, error, .. } => {
+            AgentStreamEvent::ToolCallFailed {
+                id,
+                name,
+                raw_arguments,
+                error,
+                ..
+            } => {
                 tool_calls.push(FinalizedToolCall::ParseError {
                     id,
                     name,
@@ -178,7 +214,11 @@ async fn consume_stream(
 
     // Tag-mode reasoning (§3.4): split `<think>…</think>` out of text. No-op
     // when absent, so it's safe to always run.
-    let field_reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
+    let field_reasoning = if reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    };
     let (text, tag_reasoning) = strip_reasoning_tag(&text, reasoning_tag);
     let reasoning = match (field_reasoning, tag_reasoning) {
         (Some(r), Some(t)) => Some(format!("{r}\n{t}")),
@@ -196,7 +236,13 @@ async fn consume_stream(
         usage,
     );
 
-    Ok(ModelResponse { text, reasoning, tool_calls, finish_reason, usage })
+    Ok(ModelResponse {
+        text,
+        reasoning,
+        tool_calls,
+        finish_reason,
+        usage,
+    })
 }
 
 /// Split `<tag>…</tag>` out of `text`, returning (clean_text, reasoning).
@@ -225,7 +271,14 @@ fn strip_reasoning_tag(text: &str, tag: Option<&str>) -> (String, Option<String>
         }
     }
     clean.push_str(rest);
-    (clean, if reasoning.trim().is_empty() { None } else { Some(reasoning) })
+    (
+        clean,
+        if reasoning.trim().is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -265,7 +318,9 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentStreamEvent, ProtoError>>(8);
         let stream: Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>> =
             Box::pin(ReceiverStream::new(rx));
-        tx.send(Ok(AgentStreamEvent::Text("first".into()))).await.unwrap();
+        tx.send(Ok(AgentStreamEvent::Text("first".into())))
+            .await
+            .unwrap();
 
         let start = SystemTime::now();
         let res = consume_stream(stream, Some(Duration::from_millis(50)), None, &NullSink).await;
@@ -275,14 +330,19 @@ mod tests {
             matches!(res, Err(ModelError::Proto(ProtoError::Idle(_)))),
             "stalled stream should hit Idle, got {res:?}"
         );
-        assert!(elapsed < Duration::from_secs(2), "should fail fast, took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should fail fast, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
     async fn idle_timeout_allows_a_normal_stream() {
         let stream = boxed(vec![
             Ok(AgentStreamEvent::Text("hi".into())),
-            Ok(AgentStreamEvent::Finish { reason: FinishReason::Stop }),
+            Ok(AgentStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }),
         ]);
         let res = consume_stream(stream, Some(Duration::from_millis(50)), None, &NullSink).await;
         let resp = res.expect("normal stream completes");

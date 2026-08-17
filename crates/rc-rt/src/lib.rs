@@ -24,8 +24,8 @@
 mod action;
 mod driver;
 mod event;
-mod pump;
 mod prompter;
+mod pump;
 mod runtime;
 mod sink;
 

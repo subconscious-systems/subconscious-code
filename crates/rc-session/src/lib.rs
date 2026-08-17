@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 pub mod rewind;
 
 use anyhow::{Context, Result};
-use rc_core::{AgentMode, Session, Turn};
+use rc_core::{AgentMode, NoteKind, Session, Turn};
 use serde::{Deserialize, Serialize};
 
 /// The first line of a session file: enough to reconstruct a fresh [`Session`]
@@ -69,8 +69,7 @@ impl SessionStore {
             mode: session.mode,
             extra_dirs: session.extra_dirs.clone(),
         };
-        let line = serde_json::to_string(&header)
-            .context("serializing session header")?;
+        let line = serde_json::to_string(&header).context("serializing session header")?;
         writeln!(writer, "{line}")?;
         writer.flush()?;
         Ok(Self { writer, path })
@@ -100,7 +99,10 @@ impl SessionStore {
             .append(true)
             .open(&path)
             .with_context(|| format!("opening session file for append: {}", path.display()))?;
-        Ok(Self { writer: BufWriter::new(file), path })
+        Ok(Self {
+            writer: BufWriter::new(file),
+            path,
+        })
     }
 }
 
@@ -108,15 +110,16 @@ impl SessionStore {
 /// into a [`Session`], and skip any truncated/garbled trailing line (the
 /// crash-recovery contract — a killed process may leave a partial last line).
 pub fn load(path: &Path) -> Result<Session> {
-    let file = File::open(path).with_context(|| format!("opening session file {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("opening session file {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
     let header_line = lines
         .next()
         .ok_or_else(|| anyhow::anyhow!("session file {} is empty", path.display()))??;
-    let header: SessionHeader = serde_json::from_str(&header_line)
-        .context("parsing session header (first line)")?;
+    let header: SessionHeader =
+        serde_json::from_str(&header_line).context("parsing session header (first line)")?;
 
     let mut session = Session::new(header.id, header.cwd, header.model);
     session.mode = header.mode;
@@ -132,7 +135,24 @@ pub fn load(path: &Path) -> Result<Session> {
             }
         };
         match serde_json::from_str::<Turn>(&line) {
-            Ok(turn) => session.messages.push(turn),
+            Ok(turn) => {
+                if let Turn::SystemNote {
+                    kind: NoteKind::ModeChange,
+                    text,
+                } = &turn
+                {
+                    if let Some(mode) = mode_from_note(text) {
+                        session.mode = mode;
+                    }
+                }
+                if let Turn::Assistant {
+                    usage: Some(usage), ..
+                } = &turn
+                {
+                    session.total_usage.add(usage);
+                }
+                session.messages.push(turn);
+            }
             Err(_) => {
                 // A truncated/garbled final line (crash mid-write): skip it.
                 skipped += 1;
@@ -143,6 +163,112 @@ pub fn load(path: &Path) -> Result<Session> {
         tracing::debug!("session load: skipped {skipped} malformed trailing line(s)");
     }
     Ok(session)
+}
+
+/// Decode append-only mode metadata written after the immutable header.
+fn mode_from_note(text: &str) -> Option<AgentMode> {
+    match text {
+        "default" => Some(AgentMode::Default),
+        "accept_edits" | "acceptEdits" => Some(AgentMode::AcceptEdits),
+        "plan" => Some(AgentMode::Plan),
+        "ask" => Some(AgentMode::Ask),
+        "auto" | "bypass_permissions" => Some(AgentMode::Auto),
+        _ => None,
+    }
+}
+
+/// A session file's metadata, for a picker UI (`/menu`): the header fields
+/// plus a human label taken from the first user prompt.
+///
+/// Deliberately **does not** carry a turn count. Building this for every file
+/// in the sessions directory has to stay cheap, and this project's whole point
+/// is that a session may be enormous — counting turns would mean reading every
+/// byte of every session just to draw a menu. Everything here comes from the
+/// first few lines ([`HEAD_SCAN_LINES`]).
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub id: String,
+    pub cwd: PathBuf,
+    pub model: String,
+    /// File mtime — "how recently was this worked on", for sorting/display.
+    pub modified: std::time::SystemTime,
+    /// The session's first user prompt, collapsed to a single line. `None` for
+    /// a session whose opening turn isn't a user message (or is unreadable).
+    pub first_prompt: Option<String>,
+}
+
+/// How many lines into a session file [`list`] looks for the first user turn.
+/// The opening turn is line 1 in practice; this is a bound against a
+/// pathological file, not a real search depth.
+const HEAD_SCAN_LINES: usize = 32;
+
+/// Every readable session in `dir`, newest first.
+///
+/// Header-only files are skipped for the same reason [`latest`] skips them: a
+/// session that died at startup has nothing to resume, and showing it in a
+/// picker is an invitation to resume nothing. Unparseable files are skipped
+/// rather than failing the whole listing — one corrupt file must not take the
+/// menu down.
+pub fn list(dir: &Path) -> Vec<SessionInfo> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SessionInfo> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|e| {
+            let path = e.path();
+            let modified = e.metadata().ok()?.modified().ok()?;
+            read_info(&path, modified)
+        })
+        .collect();
+    // Newest first: the session you want is nearly always the one you just left.
+    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out
+}
+
+/// Read one session's [`SessionInfo`] from its first few lines. `None` if the
+/// header is missing/unparseable or the file holds no turns.
+fn read_info(path: &Path, modified: std::time::SystemTime) -> Option<SessionInfo> {
+    let file = File::open(path).ok()?;
+    let mut lines = BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty());
+
+    let header: SessionHeader = serde_json::from_str(&lines.next()?).ok()?;
+
+    // The first user turn is the label. Taking it also proves the file has at
+    // least one turn beyond the header (the `latest` "no orphans" rule).
+    let mut first_prompt = None;
+    let mut has_turn = false;
+    for line in lines.take(HEAD_SCAN_LINES) {
+        has_turn = true;
+        if let Ok(Turn::User { content, .. }) = serde_json::from_str::<Turn>(&line) {
+            first_prompt = Some(one_line(&content));
+            break;
+        }
+    }
+    if !has_turn {
+        return None;
+    }
+
+    Some(SessionInfo {
+        path: path.to_path_buf(),
+        id: header.id,
+        cwd: header.cwd,
+        model: header.model,
+        modified,
+        first_prompt,
+    })
+}
+
+/// Collapse a prompt to a single display line: newlines and runs of whitespace
+/// become single spaces, so a pasted multi-line prompt can't break the menu's
+/// row layout. Length is the caller's business (it knows the column width).
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Find the most recently modified `.jsonl` session file in `dir`, for
@@ -174,7 +300,9 @@ pub fn latest(dir: &Path) -> Option<PathBuf> {
 /// Does this session file hold at least one turn line beyond the header? Cheap:
 /// stops at the second line rather than parsing the file.
 fn has_turns(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else { return false };
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
     BufReader::new(file)
         .lines()
         .map_while(Result::ok)
@@ -201,7 +329,10 @@ mod tests {
 
     fn sample_turns() -> Vec<Turn> {
         vec![
-            Turn::User { content: "hello".into(), ts: UNIX_EPOCH + Duration::from_secs(1000) },
+            Turn::User {
+                content: "hello".into(),
+                ts: UNIX_EPOCH + Duration::from_secs(1000),
+            },
             Turn::Assistant {
                 text: "hi there".into(),
                 reasoning: None,
@@ -210,15 +341,26 @@ mod tests {
                     name: "Read".into(),
                     arguments: r#"{"file_path":"a"}"#.into(),
                 }],
-                usage: None,
+                usage: Some(rc_core::Usage {
+                    prompt_tokens: 40,
+                    completion_tokens: 3,
+                    total_tokens: 43,
+                    prompt_tokens_details: None,
+                }),
             },
             Turn::ToolResult {
                 call_id: "c1".into(),
                 tool: "Read".into(),
-                result: ToolResultBody::Ok { content: "body".into(), truncated: false },
+                result: ToolResultBody::Ok {
+                    content: "body".into(),
+                    truncated: false,
+                },
                 duration: Duration::from_millis(42),
             },
-            Turn::SystemNote { kind: NoteKind::Notice, text: "note".into() },
+            Turn::SystemNote {
+                kind: NoteKind::Notice,
+                text: "note".into(),
+            },
         ]
     }
 
@@ -242,9 +384,42 @@ mod tests {
         assert_eq!(loaded.mode, AgentMode::AcceptEdits);
         assert_eq!(loaded.extra_dirs, vec![PathBuf::from("/tmp/extra")]);
         assert_eq!(loaded.messages.len(), turns.len());
+        assert_eq!(loaded.total_usage.prompt_tokens, 40);
+        assert_eq!(loaded.total_usage.total_tokens, 43);
         // Spot-check a couple of turns survive structurally.
-        assert!(matches!(&loaded.messages[0], Turn::User { content, .. } if content.as_ref() == "hello"));
+        assert!(
+            matches!(&loaded.messages[0], Turn::User { content, .. } if content.as_ref() == "hello")
+        );
         assert!(matches!(&loaded.messages[2], Turn::ToolResult { tool, .. } if tool == "Read"));
+    }
+
+    #[test]
+    fn latest_mode_change_note_overrides_the_immutable_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mode-resume.jsonl");
+        let session = sample_session(dir.path());
+        let mut store = SessionStore::create(path.clone(), &session).unwrap();
+        store
+            .append_turn(&Turn::SystemNote {
+                kind: NoteKind::ModeChange,
+                text: "plan".into(),
+            })
+            .unwrap();
+        store
+            .append_turn(&Turn::SystemNote {
+                kind: NoteKind::ModeChange,
+                text: "auto".into(),
+            })
+            .unwrap();
+        drop(store);
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.mode, AgentMode::Auto);
+        assert_eq!(
+            loaded.messages.len(),
+            2,
+            "metadata remains append-only history"
+        );
     }
 
     #[test]
@@ -267,7 +442,8 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        f.write_all(b"{\"type\":\"user\",\"content\":\"par").unwrap();
+        f.write_all(b"{\"type\":\"user\",\"content\":\"par")
+            .unwrap();
         f.flush().unwrap();
         drop(f);
 
@@ -368,7 +544,9 @@ mod tests {
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.messages.len(), turns.len() + 1);
-        assert!(matches!(loaded.messages.last(), Some(Turn::User { content, .. }) if content.as_ref() == "after resume"));
+        assert!(
+            matches!(loaded.messages.last(), Some(Turn::User { content, .. }) if content.as_ref() == "after resume")
+        );
     }
 
     #[test]
@@ -376,5 +554,93 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nope.jsonl");
         assert!(SessionStore::open_append(missing).is_err());
+    }
+
+    /// Write a session file with `id`/`cwd` and one user turn, for the
+    /// `list`/project-grouping tests.
+    fn write_session(dir: &Path, id: &str, cwd: &Path, prompt: &str) -> PathBuf {
+        let path = dir.join(format!("{id}.jsonl"));
+        let mut session = Session::new(id.into(), cwd.to_path_buf(), "mock-model".into());
+        session.mode = AgentMode::Default;
+        let mut store = SessionStore::create(path.clone(), &session).unwrap();
+        store
+            .append_turn(&Turn::User {
+                content: prompt.into(),
+                ts: UNIX_EPOCH + Duration::from_secs(1000),
+            })
+            .unwrap();
+        path
+    }
+
+    /// `list` reports each session's header plus a first-prompt label, which is
+    /// what the `/menu` picker shows for a row.
+    #[test]
+    fn list_reports_header_and_first_prompt() {
+        let dir = tempdir().unwrap();
+        let proj = PathBuf::from("/tmp/project-a");
+        write_session(dir.path(), "s1", &proj, "add a rotating logo");
+
+        let infos = list(dir.path());
+        assert_eq!(infos.len(), 1, "one session: {infos:?}");
+        assert_eq!(infos[0].id, "s1");
+        assert_eq!(infos[0].cwd, proj);
+        assert_eq!(
+            infos[0].first_prompt.as_deref(),
+            Some("add a rotating logo")
+        );
+    }
+
+    /// A multi-line prompt collapses to one display line — a pasted block must
+    /// not break the picker's row layout.
+    #[test]
+    fn list_collapses_a_multiline_prompt_to_one_line() {
+        let dir = tempdir().unwrap();
+        write_session(
+            dir.path(),
+            "s1",
+            Path::new("/tmp/p"),
+            "first line\n\nsecond   line",
+        );
+
+        let infos = list(dir.path());
+        assert_eq!(
+            infos[0].first_prompt.as_deref(),
+            Some("first line second line")
+        );
+    }
+
+    /// Header-only sessions (died at startup) are skipped, exactly as `latest`
+    /// skips them — offering one in a picker resumes nothing.
+    #[test]
+    fn list_skips_sessions_with_no_turns() {
+        let dir = tempdir().unwrap();
+        let session = sample_session(dir.path());
+        SessionStore::create(dir.path().join("orphan.jsonl"), &session).unwrap();
+        write_session(dir.path(), "real", Path::new("/tmp/p"), "hi");
+
+        let infos = list(dir.path());
+        assert_eq!(infos.len(), 1, "only the session with turns: {infos:?}");
+        assert_eq!(infos[0].id, "real");
+    }
+
+    /// One corrupt file must not take the whole listing down — the menu still
+    /// shows every session it can read.
+    #[test]
+    fn list_skips_unreadable_files_without_failing() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("garbage.jsonl"), "not json\nnor this\n").unwrap();
+        write_session(dir.path(), "good", Path::new("/tmp/p"), "hi");
+
+        let infos = list(dir.path());
+        assert_eq!(infos.len(), 1, "the readable one survives: {infos:?}");
+        assert_eq!(infos[0].id, "good");
+    }
+
+    /// An absent sessions directory lists empty rather than erroring — a
+    /// first run has no `~/.sc/sessions` yet and must still open the menu.
+    #[test]
+    fn list_of_a_missing_dir_is_empty() {
+        let dir = tempdir().unwrap();
+        assert!(list(&dir.path().join("nope")).is_empty());
     }
 }

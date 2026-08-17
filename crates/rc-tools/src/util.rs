@@ -49,7 +49,10 @@ pub fn require_current_read(ctx: &ToolCtx, canon: &Path) -> Option<ToolOutcome> 
         .and_then(|reg| reg.get(canon).cloned());
     let Some((reg_mtime, reg_hash)) = recorded else {
         return Some(ToolOutcome::Error {
-            message: format!("{} — read it with `Read` before mutating it", canon.display()),
+            message: format!(
+                "{} — read it with `Read` before mutating it",
+                canon.display()
+            ),
             retryable: false,
         });
     };
@@ -59,7 +62,10 @@ pub fn require_current_read(ctx: &ToolCtx, canon: &Path) -> Option<ToolOutcome> 
         .to_string();
     if cur_mtime != Some(reg_mtime) || cur_hash != reg_hash {
         return Some(ToolOutcome::Error {
-            message: format!("{} changed since the last `Read` — re-read it first", canon.display()),
+            message: format!(
+                "{} changed since the last `Read` — re-read it first",
+                canon.display()
+            ),
             retryable: false,
         });
     }
@@ -71,7 +77,10 @@ pub use rc_perm::{resolve_within, resolve_within_loose};
 
 /// Atomic write: temp file in the same dir -> fsync -> rename (§6.2).
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     std::io::Write::write_all(&mut tmp, content.as_bytes())?;
     tmp.as_file().sync_all()?;
@@ -122,7 +131,10 @@ pub fn cap_output(s: &str, cap: usize, head: usize, tail: usize) -> (bool, Strin
     }
     let h: String = s.chars().take(head).collect();
     let t: String = s.chars().skip(n - tail).collect();
-    (true, format!("{h}\n… [{} chars elided] …\n{t}", n - head - tail))
+    (
+        true,
+        format!("{h}\n… [{} chars elided] …\n{t}", n - head - tail),
+    )
 }
 
 /// Strip ANSI CSI escape sequences (SGR colors, cursors, etc.) — pure token
@@ -169,7 +181,7 @@ pub fn dangerous_command(cmd: &str) -> Option<&'static str> {
 #[cfg(test)]
 pub(crate) fn test_ctx(dir: &Path) -> ToolCtx {
     use rc_core::state::ReadRegistry;
-    use rc_core::{ShellState, ChangeJournal};
+    use rc_core::{ChangeJournal, ShellState};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
     ToolCtx {

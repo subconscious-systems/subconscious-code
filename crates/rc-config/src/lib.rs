@@ -19,12 +19,20 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod edit;
+
 /// Resolved settings ready to drive a chat client + the permission engine.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    /// Model names saved to switch between, from `settings.json`'s `models`
+    /// array. A roster for the UI, not a behavior setting: nothing in the
+    /// agent reads it, and [`Settings::model`] is always the one in use.
+    /// Guaranteed to contain [`Settings::model`] — the loader appends it if the
+    /// file's list omits it, so a picker always has a current entry.
+    pub models: Vec<String>,
     pub small_model: String,
     /// Total request timeout in ms (0 = **off**). Env `SC_TIMEOUT_MS`. Off by
     /// default: a total budget covers the upload, so on a huge request it can
@@ -139,6 +147,10 @@ impl Default for ContextConfig {
 struct SettingsFile {
     provider: Option<ProviderFile>,
     model: Option<String>,
+    /// Saved model names to switch between (the `/menu` settings page adds to
+    /// this list). Purely a convenience roster — the model actually used is
+    /// `model`.
+    models: Option<Vec<String>>,
     small_model: Option<String>,
     permissions: Option<PermissionsConfig>,
     sandbox: Option<SandboxConfig>,
@@ -157,9 +169,9 @@ struct ProviderFile {
 }
 
 // Defaults from §10.2. All overridable via env (§5.6 G3) or settings files.
-const DEFAULT_BASE_URL: &str = "https://awsgateway.orangelinelabs.com/v1";
-const DEFAULT_MODEL: &str = "gw-glm-5.2";
-const DEFAULT_SMALL_MODEL: &str = "gw-glm-5.2";
+const DEFAULT_BASE_URL: &str = "https://api-dev.subconscious.dev/v1";
+const DEFAULT_MODEL: &str = "subconscious/glm-5.2";
+const DEFAULT_SMALL_MODEL: &str = "subconscious/glm-5.2";
 /// Off: see [`Settings::timeout_ms`].
 const DEFAULT_TIMEOUT_MS: u64 = 0;
 /// The liveness backstop that replaces the total timeout. Two minutes with no
@@ -215,6 +227,7 @@ impl Settings {
         let mut max_tokens: u32 = 0;
         let mut temperature: Option<f32> = None;
         let mut model = DEFAULT_MODEL.to_string();
+        let mut models: Vec<String> = Vec::new();
         let mut small_model = DEFAULT_SMALL_MODEL.to_string();
         let mut permissions = PermissionsConfig::default();
         let mut sandbox = SandboxConfig::default();
@@ -233,56 +246,177 @@ impl Settings {
                         report.warnings.push(warning);
                     }
                     if let Some(p) = file.provider {
-                        if let Some(u) = p.base_url { base_url = u; }
-                        if let Some(e) = p.api_key_env { api_key_env = e; }
-                        if let Some(t) = p.timeout_ms { timeout_ms = t; }
-                        if let Some(t) = p.idle_timeout_ms { idle_timeout_ms = t; }
-                        if let Some(r) = p.max_retries { max_retries = r; }
-                        if let Some(g) = p.request_gzip { request_gzip = g; }
+                        if let Some(u) = p.base_url {
+                            base_url = u;
+                        }
+                        if let Some(e) = p.api_key_env {
+                            api_key_env = e;
+                        }
+                        if let Some(t) = p.timeout_ms {
+                            timeout_ms = t;
+                        }
+                        if let Some(t) = p.idle_timeout_ms {
+                            idle_timeout_ms = t;
+                        }
+                        if let Some(r) = p.max_retries {
+                            max_retries = r;
+                        }
+                        if let Some(g) = p.request_gzip {
+                            request_gzip = g;
+                        }
                     }
-                    if let Some(m) = file.model { model = m; }
-                    if let Some(s) = file.small_model { small_model = s; }
-                    if let Some(p) = file.permissions { permissions = p; }
-                    if let Some(s) = file.sandbox { sandbox = s; }
-                    if let Some(c) = file.context { context = c; }
+                    if let Some(m) = file.model {
+                        model = m;
+                    }
+                    if let Some(m) = file.models {
+                        models = m;
+                    }
+                    if let Some(s) = file.small_model {
+                        small_model = s;
+                    }
+                    if let Some(p) = file.permissions {
+                        permissions = p;
+                    }
+                    if let Some(s) = file.sandbox {
+                        sandbox = s;
+                    }
+                    if let Some(c) = file.context {
+                        context = c;
+                    }
                 }
                 Err(e) => report.warnings.push(e),
             }
         }
 
         // Env wins over files (§10.1).
-        if let Ok(v) = std::env::var("SC_BASE_URL") { if !v.is_empty() { base_url = v; } }
-        if let Ok(v) = std::env::var("SC_MODEL") { if !v.is_empty() { model = v; } }
-        if let Ok(v) = std::env::var("SC_SMALL_MODEL") { if !v.is_empty() { small_model = v; } }
-        if let Ok(v) = std::env::var("SC_TIMEOUT_MS") { if let Ok(t) = v.parse() { timeout_ms = t; } }
-        if let Ok(v) = std::env::var("SC_IDLE_TIMEOUT_MS") { if let Ok(t) = v.parse::<u64>() { idle_timeout_ms = t; } }
-        if let Ok(v) = std::env::var("SC_MAX_RETRIES") { if let Ok(t) = v.parse::<u32>() { max_retries = t; } }
-        if let Ok(v) = std::env::var("SC_RETRY_BASE_MS") { if let Ok(t) = v.parse::<u64>() { retry_base_ms = t; } }
-        if let Ok(v) = std::env::var("SC_RETRY_MAX_MS") { if let Ok(t) = v.parse::<u64>() { retry_max_ms = t; } }
-        if let Ok(v) = std::env::var("SC_TURN_TIMEOUT_MS") { if let Ok(t) = v.parse::<u64>() { turn_timeout_ms = t; } }
-        if let Ok(v) = std::env::var("SC_MAX_TOKENS") { if let Ok(t) = v.parse::<u32>() { max_tokens = t; } }
-        if let Ok(v) = std::env::var("SC_TEMPERATURE") { if let Ok(t) = v.parse::<f32>() { temperature = Some(t); } }
-        if let Ok(v) = std::env::var("SC_DEFAULT_MODE") { if !v.is_empty() { permissions.default_mode = v; } }
-        if let Some(b) = env_bool("SC_SANDBOX") { sandbox.enabled = b; }
-        if let Some(b) = env_bool("SC_SANDBOX_NET") { sandbox.allow_net = b; }
-        if let Some(b) = env_bool("SC_REQUEST_GZIP") { request_gzip = b; }
+        if let Ok(v) = std::env::var("SC_BASE_URL") {
+            if !v.is_empty() {
+                base_url = v;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_MODEL") {
+            if !v.is_empty() {
+                model = v;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_SMALL_MODEL") {
+            if !v.is_empty() {
+                small_model = v;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_TIMEOUT_MS") {
+            if let Ok(t) = v.parse() {
+                timeout_ms = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_IDLE_TIMEOUT_MS") {
+            if let Ok(t) = v.parse::<u64>() {
+                idle_timeout_ms = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_MAX_RETRIES") {
+            if let Ok(t) = v.parse::<u32>() {
+                max_retries = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_RETRY_BASE_MS") {
+            if let Ok(t) = v.parse::<u64>() {
+                retry_base_ms = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_RETRY_MAX_MS") {
+            if let Ok(t) = v.parse::<u64>() {
+                retry_max_ms = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_TURN_TIMEOUT_MS") {
+            if let Ok(t) = v.parse::<u64>() {
+                turn_timeout_ms = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_MAX_TOKENS") {
+            if let Ok(t) = v.parse::<u32>() {
+                max_tokens = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_TEMPERATURE") {
+            if let Ok(t) = v.parse::<f32>() {
+                temperature = Some(t);
+            }
+        }
+        if let Ok(v) = std::env::var("SC_DEFAULT_MODE") {
+            if !v.is_empty() {
+                permissions.default_mode = v;
+            }
+        }
+        if let Some(b) = env_bool("SC_SANDBOX") {
+            sandbox.enabled = b;
+        }
+        if let Some(b) = env_bool("SC_SANDBOX_NET") {
+            sandbox.allow_net = b;
+        }
+        if let Some(b) = env_bool("SC_REQUEST_GZIP") {
+            request_gzip = b;
+        }
         // Context caps: `0` = unlimited, so an explicit `SC_TOOL_RESULT_CAP=0`
         // is a meaningful value and parses like any other.
-        if let Ok(v) = std::env::var("SC_INLINE_FILE_CAP") { if let Ok(t) = v.parse::<usize>() { context.inline_file_cap = t; } }
-        if let Ok(v) = std::env::var("SC_TOOL_RESULT_CAP") { if let Ok(t) = v.parse::<usize>() { context.tool_result_cap = t; } }
-        if let Ok(v) = std::env::var("SC_BASH_OUTPUT_CAP") { if let Ok(t) = v.parse::<usize>() { context.bash_output_cap = t; } }
-        if let Ok(v) = std::env::var("SC_GREP_OUTPUT_CAP") { if let Ok(t) = v.parse::<usize>() { context.grep_output_cap = t; } }
-        if let Ok(v) = std::env::var("SC_READ_DEFAULT_LIMIT") { if let Ok(t) = v.parse::<u32>() { context.read_default_limit = t; } }
-        if let Ok(v) = std::env::var("SC_READ_MAX_LINE_CHARS") { if let Ok(t) = v.parse::<usize>() { context.read_max_line_chars = t; } }
-        if let Ok(v) = std::env::var("SC_GLOB_CAP") { if let Ok(t) = v.parse::<usize>() { context.glob_cap = t; } }
-        if let Ok(v) = std::env::var("SC_MAX_ITERS") { if let Ok(t) = v.parse::<u32>() { context.max_iters = t; } }
+        if let Ok(v) = std::env::var("SC_INLINE_FILE_CAP") {
+            if let Ok(t) = v.parse::<usize>() {
+                context.inline_file_cap = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_TOOL_RESULT_CAP") {
+            if let Ok(t) = v.parse::<usize>() {
+                context.tool_result_cap = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_BASH_OUTPUT_CAP") {
+            if let Ok(t) = v.parse::<usize>() {
+                context.bash_output_cap = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_GREP_OUTPUT_CAP") {
+            if let Ok(t) = v.parse::<usize>() {
+                context.grep_output_cap = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_READ_DEFAULT_LIMIT") {
+            if let Ok(t) = v.parse::<u32>() {
+                context.read_default_limit = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_READ_MAX_LINE_CHARS") {
+            if let Ok(t) = v.parse::<usize>() {
+                context.read_max_line_chars = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_GLOB_CAP") {
+            if let Ok(t) = v.parse::<usize>() {
+                context.glob_cap = t;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_MAX_ITERS") {
+            if let Ok(t) = v.parse::<u32>() {
+                context.max_iters = t;
+            }
+        }
 
-        let api_key = std::env::var(&api_key_env)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let api_key = std::env::var(&api_key_env).ok().filter(|s| !s.is_empty());
 
         Settings {
             base_url,
+            // The roster always contains the model in use, whatever set it
+            // (file, `SC_MODEL`, or `--model`). Otherwise the settings page
+            // would show a current model that isn't in the list it cycles
+            // through, and one press of ←/→ would jump somewhere unrelated.
+            models: {
+                models.retain(|m| !m.is_empty());
+                models.dedup();
+                if !models.contains(&model) {
+                    models.insert(0, model.clone());
+                }
+                models
+            },
             api_key,
             model,
             small_model,
@@ -331,8 +465,7 @@ fn project_settings_path(project: &Path) -> Option<PathBuf> {
 /// or `Err(message)` on a read/parse failure so the caller can surface it.
 pub(crate) fn read_settings(path: &Path) -> Result<SettingsFile, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_slice::<SettingsFile>(&bytes)
-        .map_err(|e| format!("{}: {e}", path.display()))
+    serde_json::from_slice::<SettingsFile>(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Scan a settings file's raw text for a key-shaped string. The API key must
@@ -420,5 +553,31 @@ mod tests {
         let json = r#"{"context": {"tool_result_cap": 42, "future_key": true}}"#;
         let f: SettingsFile = serde_json::from_str(json).unwrap();
         assert_eq!(f.context.unwrap().tool_result_cap, 42);
+    }
+
+    /// The `models` roster parses as a plain array of names.
+    #[test]
+    fn models_roster_parses_from_json() {
+        let json = r#"{"model": "a/one", "models": ["a/one", "b/two"]}"#;
+        let f: SettingsFile = serde_json::from_str(json).unwrap();
+        assert_eq!(f.model.as_deref(), Some("a/one"));
+        assert_eq!(
+            f.models.unwrap(),
+            vec!["a/one".to_string(), "b/two".to_string()]
+        );
+    }
+
+    /// A settings file with no `models` key still yields a usable roster: the
+    /// active model. The settings page's ←/→ would have nothing to stand on
+    /// otherwise, which is the state every existing install starts in.
+    #[test]
+    fn roster_always_contains_the_active_model() {
+        let s = Settings::load(Path::new("/nonexistent-project-dir"));
+        assert!(
+            s.models.contains(&s.model),
+            "roster {:?} must contain the active model {}",
+            s.models,
+            s.model
+        );
     }
 }

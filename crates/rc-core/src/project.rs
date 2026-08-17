@@ -5,8 +5,8 @@
 //! model switches (§4.1). Never store wire messages as state.
 
 use crate::turn::{NoteKind, Turn};
-use rc_proto::{FunctionCall, UserContent, WireMessage};
 use rc_proto::ToolCall as WireToolCall;
+use rc_proto::{FunctionCall, UserContent, WireMessage};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -27,7 +27,8 @@ const MAX_STRING_ESCAPED: usize = 1_000_000;
 /// environment block, memory chain, skill index) lands in M6 — see
 /// [`rc_ctx::ContextAssembler`], which builds the real system prompt and
 /// calls [`project_with`] with it.
-const SYSTEM_PROMPT: &str = "You are `sc` (Subconscious Code), an agent that helps with software engineering tasks in \
+const SYSTEM_PROMPT: &str =
+    "You are `sc` (Subconscious Code), an agent that helps with software engineering tasks in \
 the user's repository. Use the provided tools to inspect and edit files. Be concise and direct. \
 When you have enough information, answer in plain text.";
 
@@ -46,7 +47,9 @@ pub fn project(messages: &[Turn]) -> Vec<WireMessage> {
 /// system prompt (identity + environment + memory chain + skill index) and
 /// hands it here, then the turn projection stays identical to the legacy path.
 pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> {
-    let mut out = vec![WireMessage::System { content: Arc::from(system_prompt) }];
+    let mut out = vec![WireMessage::System {
+        content: Arc::from(system_prompt),
+    }];
     for turn in messages {
         match turn {
             Turn::User { content, .. } => push_user(&mut out, content),
@@ -56,7 +59,10 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
                     .map(|c| WireToolCall {
                         id: c.id.clone(),
                         kind: Default::default(),
-                        function: FunctionCall { name: c.name.clone(), arguments: c.arguments.clone() },
+                        function: FunctionCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        },
                     })
                     .collect();
                 // Assistant messages with tool calls often carry null content; some
@@ -71,9 +77,14 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
                 // tool_calls or reorder the turn. Such a turn is rare (it needs
                 // ~250k+ output tokens in one go); if it ever bites, chunking it
                 // needs a dedicated strategy, not the user/tool split below.
-                out.push(WireMessage::Assistant { content, tool_calls });
+                out.push(WireMessage::Assistant {
+                    content,
+                    tool_calls,
+                });
             }
-            Turn::ToolResult { call_id, result, .. } => {
+            Turn::ToolResult {
+                call_id, result, ..
+            } => {
                 // A tool result with a rendered body over the per-message limit
                 // is split into multiple `role:tool` messages sharing one
                 // `tool_call_id`. The gateway accepts this (verified against the
@@ -118,10 +129,14 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
 /// common path keeps the source allocation shared.
 fn push_user(out: &mut Vec<WireMessage>, content: &Arc<str>) {
     if escaped_len(content) <= MAX_STRING_ESCAPED {
-        out.push(WireMessage::User { content: UserContent::Text(content.clone()) });
+        out.push(WireMessage::User {
+            content: UserContent::Text(content.clone()),
+        });
     } else {
         for chunk in chunk_by_escaped_len(content, MAX_STRING_ESCAPED) {
-            out.push(WireMessage::User { content: UserContent::Text(chunk) });
+            out.push(WireMessage::User {
+                content: UserContent::Text(chunk),
+            });
         }
     }
 }
@@ -220,19 +235,36 @@ mod tests {
     use std::time::SystemTime;
 
     fn call(id: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: "X".into(), arguments: "{}".into() }
+        ToolCall {
+            id: id.into(),
+            name: "X".into(),
+            arguments: "{}".into(),
+        }
     }
     fn ok(content: &str) -> ToolResultBody {
-        ToolResultBody::Ok { content: content.into(), truncated: false }
+        ToolResultBody::Ok {
+            content: content.into(),
+            truncated: false,
+        }
     }
     fn toolresult(id: &str) -> Turn {
-        Turn::ToolResult { call_id: id.into(), tool: "X".into(), result: ok("r"), duration: Default::default() }
+        Turn::ToolResult {
+            call_id: id.into(),
+            tool: "X".into(),
+            result: ok("r"),
+            duration: Default::default(),
+        }
     }
 
     #[test]
     fn invariant_ok_for_matched_contiguous_answers() {
         let turns = vec![
-            Turn::Assistant { text: "".into(), reasoning: None, calls: vec![call("c1")], usage: None },
+            Turn::Assistant {
+                text: "".into(),
+                reasoning: None,
+                calls: vec![call("c1")],
+                usage: None,
+            },
             toolresult("c1"),
         ];
         assert!(verify_invariant(&project(&turns)).is_ok());
@@ -241,7 +273,12 @@ mod tests {
     #[test]
     fn invariant_detects_id_mismatch() {
         let turns = vec![
-            Turn::Assistant { text: "".into(), reasoning: None, calls: vec![call("c1")], usage: None },
+            Turn::Assistant {
+                text: "".into(),
+                reasoning: None,
+                calls: vec![call("c1")],
+                usage: None,
+            },
             toolresult("c2"),
         ];
         assert!(verify_invariant(&project(&turns)).is_err());
@@ -251,11 +288,22 @@ mod tests {
     fn invariant_detects_non_contiguous_answers() {
         // A user message between the assistant(tool_calls) and its tool result.
         let turns = vec![
-            Turn::Assistant { text: "".into(), reasoning: None, calls: vec![call("c1")], usage: None },
-            Turn::User { content: "hi".into(), ts: SystemTime::now() },
+            Turn::Assistant {
+                text: "".into(),
+                reasoning: None,
+                calls: vec![call("c1")],
+                usage: None,
+            },
+            Turn::User {
+                content: "hi".into(),
+                ts: SystemTime::now(),
+            },
             toolresult("c1"),
         ];
-        assert!(verify_invariant(&project(&turns)).is_err(), "contiguity must be enforced");
+        assert!(
+            verify_invariant(&project(&turns)).is_err(),
+            "contiguity must be enforced"
+        );
     }
 
     #[test]
@@ -276,7 +324,10 @@ mod tests {
     fn project_with_uses_the_supplied_system_prompt() {
         // A custom §4.6 system prompt must land as the leading message, and the
         // turn projection must be identical to the default path below it.
-        let turns = vec![Turn::User { content: "hi".into(), ts: SystemTime::now() }];
+        let turns = vec![Turn::User {
+            content: "hi".into(),
+            ts: SystemTime::now(),
+        }];
         let wire = project_with(&turns, "CUSTOM SYSTEM PROMPT");
         assert!(matches!(
             wire.first(),
@@ -306,25 +357,39 @@ mod tests {
         let big_body: Arc<str> = Arc::from("x".repeat(4096));
         let big_text: Arc<str> = Arc::from("y".repeat(4096));
         let turns = vec![
-            Turn::User { content: big_text.clone(), ts: SystemTime::now() },
+            Turn::User {
+                content: big_text.clone(),
+                ts: SystemTime::now(),
+            },
             Turn::ToolResult {
                 call_id: "c1".into(),
                 tool: "X".into(),
-                result: ToolResultBody::Ok { content: big_body.clone(), truncated: false },
+                result: ToolResultBody::Ok {
+                    content: big_body.clone(),
+                    truncated: false,
+                },
                 duration: Default::default(),
             },
         ];
         let wire = project_with(&turns, "sys");
         // wire[0] = System, wire[1] = User, wire[2] = Tool.
         match &wire[1] {
-            WireMessage::User { content: UserContent::Text(t) } => {
-                assert!(Arc::ptr_eq(t, &big_text), "user content must share the turn's allocation");
+            WireMessage::User {
+                content: UserContent::Text(t),
+            } => {
+                assert!(
+                    Arc::ptr_eq(t, &big_text),
+                    "user content must share the turn's allocation"
+                );
             }
             _ => panic!("expected user message at index 1"),
         }
         match &wire[2] {
             WireMessage::Tool { content, .. } => {
-                assert!(Arc::ptr_eq(content, &big_body), "tool body must share the turn's allocation");
+                assert!(
+                    Arc::ptr_eq(content, &big_body),
+                    "tool body must share the turn's allocation"
+                );
             }
             _ => panic!("expected tool message at index 2"),
         }
@@ -368,9 +433,17 @@ mod tests {
         big.push_str(&"x".repeat(max * 2 + 12345));
         big.push_str("\"end\" \\\\");
         let chunks = chunk_by_escaped_len(&big, max);
-        assert!(chunks.len() >= 3, "expected multiple chunks: {}", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "expected multiple chunks: {}",
+            chunks.len()
+        );
         for c in &chunks {
-            assert!(escaped_len(c) <= max, "chunk over limit: {}", escaped_len(c));
+            assert!(
+                escaped_len(c) <= max,
+                "chunk over limit: {}",
+                escaped_len(c)
+            );
         }
         let rejoined: String = chunks.iter().map(|c| c.as_ref()).collect();
         assert_eq!(rejoined, big, "chunks must reconstruct the original");
@@ -384,16 +457,26 @@ mod tests {
     #[test]
     fn oversized_user_message_projects_to_multiple_user_messages() {
         let big: Arc<str> = Arc::from("x".repeat(MAX_STRING_ESCAPED + 500_000));
-        let turns = vec![Turn::User { content: big.clone(), ts: SystemTime::now() }];
+        let turns = vec![Turn::User {
+            content: big.clone(),
+            ts: SystemTime::now(),
+        }];
         let wire = project(&turns);
         // wire[0] is the system message; the rest are the user chunks.
         let user_msgs: Vec<&WireMessage> = wire[1..]
             .iter()
             .filter(|m| matches!(m, WireMessage::User { .. }))
             .collect();
-        assert!(user_msgs.len() >= 2, "expected >=2 user messages: {}", user_msgs.len());
+        assert!(
+            user_msgs.len() >= 2,
+            "expected >=2 user messages: {}",
+            user_msgs.len()
+        );
         for m in &user_msgs {
-            let WireMessage::User { content: UserContent::Text(t) } = m else {
+            let WireMessage::User {
+                content: UserContent::Text(t),
+            } = m
+            else {
                 panic!("chunked user content must be bare Text: {m:?}");
             };
             assert!(escaped_len(t) <= MAX_STRING_ESCAPED, "chunk over limit");
@@ -401,11 +484,17 @@ mod tests {
         let rejoined: String = user_msgs
             .iter()
             .map(|m| match m {
-                WireMessage::User { content: UserContent::Text(t) } => t.as_ref(),
+                WireMessage::User {
+                    content: UserContent::Text(t),
+                } => t.as_ref(),
                 _ => unreachable!(),
             })
             .collect();
-        assert_eq!(rejoined.as_str(), big.as_ref(), "chunks must reconstruct the original");
+        assert_eq!(
+            rejoined.as_str(),
+            big.as_ref(),
+            "chunks must reconstruct the original"
+        );
     }
 
     /// Small user content stays a single bare `Text` message and shares the
@@ -413,18 +502,31 @@ mod tests {
     #[test]
     fn small_user_message_stays_text_and_shares_allocation() {
         let s: Arc<str> = Arc::from("hello".to_string());
-        let turns = vec![Turn::User { content: s.clone(), ts: SystemTime::now() }];
+        let turns = vec![Turn::User {
+            content: s.clone(),
+            ts: SystemTime::now(),
+        }];
         let wire = project(&turns);
         // Exactly one user message, and its content shares the source Arc.
         let user_msgs: Vec<&WireMessage> = wire[1..]
             .iter()
             .filter(|m| matches!(m, WireMessage::User { .. }))
             .collect();
-        assert_eq!(user_msgs.len(), 1, "small content is one message: {user_msgs:?}");
-        let WireMessage::User { content: UserContent::Text(t) } = user_msgs[0] else {
+        assert_eq!(
+            user_msgs.len(),
+            1,
+            "small content is one message: {user_msgs:?}"
+        );
+        let WireMessage::User {
+            content: UserContent::Text(t),
+        } = user_msgs[0]
+        else {
             panic!("small user content must stay Text");
         };
-        assert!(Arc::ptr_eq(t, &s), "small content must share the source Arc");
+        assert!(
+            Arc::ptr_eq(t, &s),
+            "small content must share the source Arc"
+        );
     }
 
     /// An oversized tool result projects to multiple `role:tool` messages
@@ -434,11 +536,19 @@ mod tests {
     fn oversized_tool_result_projects_to_multiple_same_id_tool_messages() {
         let big_body: Arc<str> = Arc::from("x".repeat(MAX_STRING_ESCAPED + 500_000));
         let turns = vec![
-            Turn::Assistant { text: "".into(), reasoning: None, calls: vec![call("c1")], usage: None },
+            Turn::Assistant {
+                text: "".into(),
+                reasoning: None,
+                calls: vec![call("c1")],
+                usage: None,
+            },
             Turn::ToolResult {
                 call_id: "c1".into(),
                 tool: "X".into(),
-                result: ToolResultBody::Ok { content: big_body.clone(), truncated: false },
+                result: ToolResultBody::Ok {
+                    content: big_body.clone(),
+                    truncated: false,
+                },
                 duration: Default::default(),
             },
         ];
@@ -447,11 +557,24 @@ mod tests {
             .iter()
             .filter(|m| matches!(m, WireMessage::Tool { .. }))
             .collect();
-        assert!(tool_msgs.len() >= 2, "expected >=2 tool messages: {}", tool_msgs.len());
+        assert!(
+            tool_msgs.len() >= 2,
+            "expected >=2 tool messages: {}",
+            tool_msgs.len()
+        );
         for m in &tool_msgs {
-            let WireMessage::Tool { tool_call_id, content } = m else { unreachable!() };
+            let WireMessage::Tool {
+                tool_call_id,
+                content,
+            } = m
+            else {
+                unreachable!()
+            };
             assert_eq!(tool_call_id, "c1", "all chunks share the call id");
-            assert!(escaped_len(content) <= MAX_STRING_ESCAPED, "chunk over limit");
+            assert!(
+                escaped_len(content) <= MAX_STRING_ESCAPED,
+                "chunk over limit"
+            );
         }
         let rejoined: String = tool_msgs
             .iter()

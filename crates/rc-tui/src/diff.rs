@@ -55,7 +55,10 @@ mod tests {
         // "the quick fox" -> "the slow fox": "quick" deleted, "slow" inserted.
         let l = word_diff_line("the quick fox", "the slow fox");
         let text = line_text(&l);
-        assert!(text.contains("quick"), "kept the deleted word (struck): {text}");
+        assert!(
+            text.contains("quick"),
+            "kept the deleted word (struck): {text}"
+        );
         assert!(text.contains("slow"), "kept the inserted word: {text}");
         // The deleted word is red+crossed, the inserted green+bold.
         let deleted = l.spans.iter().find(|s| s.content == "quick").unwrap();
@@ -74,6 +77,9 @@ mod tests {
     fn empty_old_treats_everything_as_inserted() {
         let l = word_diff_line("", "brand new text");
         assert_eq!(line_text(&l), "brand new text");
-        assert!(l.spans.iter().all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(l
+            .spans
+            .iter()
+            .all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
     }
 }

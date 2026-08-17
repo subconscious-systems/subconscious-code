@@ -71,7 +71,10 @@ impl Bash {
 
     /// A `Bash` that elides output beyond `cap` chars (`0` = unlimited).
     pub fn with_cap(cap: usize) -> Self {
-        Self { cap, description: bash_description(cap) }
+        Self {
+            cap,
+            description: bash_description(cap),
+        }
     }
 
     /// Head/tail split for the elision, preserving the historical 1:2 ratio.
@@ -126,10 +129,17 @@ impl Tool for Bash {
             return self.run_background(&inp, ctx);
         }
         if let Some(reason) = dangerous_command(&inp.command) {
-            return Ok(ToolOutcome::Error { message: reason.to_string(), retryable: false });
+            return Ok(ToolOutcome::Error {
+                message: reason.to_string(),
+                retryable: false,
+            });
         }
 
-        let timeout = Duration::from_millis(inp.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS));
+        let timeout = Duration::from_millis(
+            inp.timeout_ms
+                .unwrap_or(DEFAULT_TIMEOUT_MS)
+                .min(MAX_TIMEOUT_MS),
+        );
         let (shell, shell_args) = env_hygiene::resolve_shell();
 
         let mut cmd = tokio::process::Command::new(&shell);
@@ -160,7 +170,10 @@ impl Tool for Bash {
             }
             Err(_) => {
                 return Ok(ToolOutcome::Error {
-                    message: format!("command timed out after {} ms (killed)", timeout.as_millis()),
+                    message: format!(
+                        "command timed out after {} ms (killed)",
+                        timeout.as_millis()
+                    ),
                     retryable: false,
                 })
             }
@@ -185,7 +198,9 @@ impl Tool for Bash {
         // The agent loop syncs this back into ctx.cwd/session.cwd for later calls.
         if exit == "0" {
             if let Some(new_cwd) = infer_cwd(&inp.command, &ctx.cwd) {
-                if let Ok(canon) = resolve_within(&ctx.allowed_roots, &ctx.cwd, &new_cwd.to_string_lossy()) {
+                if let Ok(canon) =
+                    resolve_within(&ctx.allowed_roots, &ctx.cwd, &new_cwd.to_string_lossy())
+                {
                     if let Ok(mut shell_state) = ctx.shell_state.lock() {
                         shell_state.cwd = canon;
                     }
@@ -236,7 +251,10 @@ impl Bash {
         };
 
         if let Some(reason) = dangerous_command(&inp.command) {
-            return Ok(ToolOutcome::Error { message: reason.to_string(), retryable: false });
+            return Ok(ToolOutcome::Error {
+                message: reason.to_string(),
+                retryable: false,
+            });
         }
 
         if let Err(e) = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new("."))) {
@@ -385,7 +403,9 @@ fn install_sandbox(
     };
     // SAFETY: the closure only issues raw syscalls (async-signal-safe) and
     // does not allocate — see rc-sandbox::PreparedSandbox::install.
-    unsafe { cmd.pre_exec(pre_exec); }
+    unsafe {
+        cmd.pre_exec(pre_exec);
+    }
     Ok(Some(guard))
 }
 
@@ -397,7 +417,9 @@ fn install_sandbox_std(
         return Ok(None);
     };
     // SAFETY: as above — raw syscalls only, no allocation in the child.
-    unsafe { cmd.pre_exec(pre_exec); }
+    unsafe {
+        cmd.pre_exec(pre_exec);
+    }
     Ok(Some(guard))
 }
 
@@ -518,13 +540,19 @@ mod tests {
     async fn strips_ansi() {
         let dir = tempdir().unwrap();
         let out = Bash::new()
-            .call(json!({"command": "printf '\\033[31mred\\033[0m'"}), &test_ctx(dir.path()))
+            .call(
+                json!({"command": "printf '\\033[31mred\\033[0m'"}),
+                &test_ctx(dir.path()),
+            )
             .await
             .unwrap();
         match out {
             ToolOutcome::Ok { content, .. } => {
                 assert!(content.contains("red"), "{content}");
-                assert!(!content.contains('\u{1b}'), "ANSI escape not stripped: {content:?}");
+                assert!(
+                    !content.contains('\u{1b}'),
+                    "ANSI escape not stripped: {content:?}"
+                );
             }
             o => panic!("expected ok, got {o:?}"),
         }
@@ -534,11 +562,16 @@ mod tests {
     async fn times_out_and_kills() {
         let dir = tempdir().unwrap();
         let out = Bash::new()
-            .call(json!({"command": "sleep 5", "timeout_ms": 100}), &test_ctx(dir.path()))
+            .call(
+                json!({"command": "sleep 5", "timeout_ms": 100}),
+                &test_ctx(dir.path()),
+            )
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => assert!(message.contains("timed out"), "{message}"),
+            ToolOutcome::Error { message, .. } => {
+                assert!(message.contains("timed out"), "{message}")
+            }
             o => panic!("expected a timeout error, got {o:?}"),
         }
     }
@@ -546,7 +579,12 @@ mod tests {
     #[tokio::test]
     async fn runs_in_the_session_cwd() {
         let dir = tempdir().unwrap();
-        let basename = dir.path().file_name().unwrap().to_string_lossy().to_string();
+        let basename = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let out = Bash::new()
             .call(json!({"command": "pwd"}), &test_ctx(dir.path()))
             .await
@@ -588,7 +626,10 @@ mod tests {
     async fn sets_non_interactive_env() {
         let dir = tempdir().unwrap();
         let out = Bash::new()
-            .call(json!({"command": "test -n \"$NO_COLOR\" && test \"$CI\" = 1 && echo yes"}), &test_ctx(dir.path()))
+            .call(
+                json!({"command": "test -n \"$NO_COLOR\" && test \"$CI\" = 1 && echo yes"}),
+                &test_ctx(dir.path()),
+            )
             .await
             .unwrap();
         match out {
@@ -638,9 +679,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path());
         // /tmp (or its canonical form) is outside the tempdir root.
-        let _ = Bash::new()
-            .call(json!({"command": "cd /tmp"}), &ctx)
-            .await;
+        let _ = Bash::new().call(json!({"command": "cd /tmp"}), &ctx).await;
         let live_cwd = ctx.shell_state.lock().unwrap().cwd.clone();
         assert_eq!(live_cwd, dir.path(), "cd escaped the workspace root");
     }
@@ -663,9 +702,18 @@ mod tests {
     fn infer_cwd_handles_chained_relative_cds() {
         let root = Path::new("/repo");
         assert_eq!(infer_cwd("cd a", root), Some(PathBuf::from("/repo/a")));
-        assert_eq!(infer_cwd("cd a && cd b", root), Some(PathBuf::from("/repo/a/b")));
-        assert_eq!(infer_cwd("cd a && cd ..", root), Some(PathBuf::from("/repo/a/..")));
-        assert_eq!(infer_cwd("cd /abs/path", root), Some(PathBuf::from("/abs/path")));
+        assert_eq!(
+            infer_cwd("cd a && cd b", root),
+            Some(PathBuf::from("/repo/a/b"))
+        );
+        assert_eq!(
+            infer_cwd("cd a && cd ..", root),
+            Some(PathBuf::from("/repo/a/.."))
+        );
+        assert_eq!(
+            infer_cwd("cd /abs/path", root),
+            Some(PathBuf::from("/abs/path"))
+        );
         assert_eq!(infer_cwd("echo hi", root), None);
         assert_eq!(infer_cwd("cd $(x)", root), None); // unparseable
         assert_eq!(infer_cwd("cd -", root), None); // previous dir
@@ -687,11 +735,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let ctx = bg_ctx(dir.path());
         let out = Bash::new()
-            .call(json!({"command": "echo hi-from-bg", "run_in_background": true}), &ctx)
+            .call(
+                json!({"command": "echo hi-from-bg", "run_in_background": true}),
+                &ctx,
+            )
             .await
             .unwrap();
         match out {
-            ToolOutcome::Ok { content, .. } => assert!(content.contains("Background shell"), "{content}"),
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("Background shell"), "{content}")
+            }
             o => panic!("expected ok, got {o:?}"),
         }
         // The shell is held in the state; read its log path from there.
@@ -702,12 +755,16 @@ mod tests {
         };
         // Give the background shell a moment to write.
         for _ in 0..50 {
-            if log_path.exists() && fs::read_to_string(&log_path).is_ok_and(|s| s.contains("hi-from-bg")) {
+            if log_path.exists()
+                && fs::read_to_string(&log_path).is_ok_and(|s| s.contains("hi-from-bg"))
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(fs::read_to_string(&log_path).unwrap().contains("hi-from-bg"));
+        assert!(fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("hi-from-bg"));
         // shutdown kills it (and reaps so no zombie).
         ctx.shell_state.lock().unwrap().shutdown();
     }
@@ -717,11 +774,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path()); // no bg_dir
         let out = Bash::new()
-            .call(json!({"command": "echo x", "run_in_background": true}), &ctx)
+            .call(
+                json!({"command": "echo x", "run_in_background": true}),
+                &ctx,
+            )
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => assert!(message.contains("not configured"), "{message}"),
+            ToolOutcome::Error { message, .. } => {
+                assert!(message.contains("not configured"), "{message}")
+            }
             o => panic!("expected an error, got {o:?}"),
         }
     }

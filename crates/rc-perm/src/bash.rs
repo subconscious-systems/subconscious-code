@@ -70,7 +70,10 @@ fn split_subcommands(cmd: &str) -> Vec<String> {
 /// `exec`, `source`, or shlex failures → `unparseable` (escalate to Ask).
 pub fn parse_bash(cmd: &str) -> ParsedBash {
     if cmd.contains('$') || cmd.contains('`') {
-        return ParsedBash { subcommands: vec![], unparseable: true };
+        return ParsedBash {
+            subcommands: vec![],
+            unparseable: true,
+        };
     }
     let mut subs: Vec<Sub> = Vec::new();
     for raw in split_subcommands(cmd) {
@@ -84,17 +87,29 @@ pub fn parse_bash(cmd: &str) -> ParsedBash {
             || trimmed.starts_with("source ")
             || trimmed.starts_with(". ")
         {
-            return ParsedBash { subcommands: vec![], unparseable: true };
+            return ParsedBash {
+                subcommands: vec![],
+                unparseable: true,
+            };
         }
         let Some(tokens) = shlex::split(trimmed) else {
-            return ParsedBash { subcommands: vec![], unparseable: true };
+            return ParsedBash {
+                subcommands: vec![],
+                unparseable: true,
+            };
         };
         if tokens.is_empty() {
             continue;
         }
-        subs.push(Sub { raw: trimmed.to_string(), tokens });
+        subs.push(Sub {
+            raw: trimmed.to_string(),
+            tokens,
+        });
     }
-    ParsedBash { subcommands: subs, unparseable: false }
+    ParsedBash {
+        subcommands: subs,
+        unparseable: false,
+    }
 }
 
 const CATASTROPHIC: &[&str] = &[
@@ -119,6 +134,15 @@ const CATASTROPHIC: &[&str] = &[
 /// Catastrophic commands are always denied, even in bypass mode.
 pub fn is_catastrophic(sub: &Sub) -> bool {
     CATASTROPHIC.iter().any(|p| sub.raw.contains(p))
+}
+
+/// Catastrophic commands checked against the *raw* command string — catches
+/// destructive commands even when [`parse_bash`] can't tokenize them (e.g.
+/// `rm -rf $HOME`, which contains `$` so yields no subcommands). Used by the
+/// permission engine so a catastrophic command is denied in every mode,
+/// including bypass, before the bypass-allow short-circuit.
+pub fn is_catastrophic_cmd(cmd: &str) -> bool {
+    CATASTROPHIC.iter().any(|p| cmd.contains(p))
 }
 
 const ALWAYS_ASK_MARKERS: &[&str] = &["sudo", "--force", "| sh", "| bash", "|sh", "|bash"];
@@ -159,7 +183,10 @@ mod tests {
     /// Helper: parse and assert not-unparseable, returning the sub-commands.
     fn subs(cmd: &str) -> Vec<Sub> {
         let p = parse_bash(cmd);
-        assert!(!p.unparseable, "expected parseable, got unparseable for {cmd:?}");
+        assert!(
+            !p.unparseable,
+            "expected parseable, got unparseable for {cmd:?}"
+        );
         p.subcommands
     }
 
@@ -237,8 +264,14 @@ mod tests {
     fn rule_matches_exact_token_equality() {
         let s = subs("git status");
         assert!(rule_matches("git status", &s[0]));
-        assert!(!rule_matches("git status -s", &s[0]), "extra tokens break exact match");
-        assert!(!rule_matches("git", &s[0]), "fewer tokens break exact match");
+        assert!(
+            !rule_matches("git status -s", &s[0]),
+            "extra tokens break exact match"
+        );
+        assert!(
+            !rule_matches("git", &s[0]),
+            "fewer tokens break exact match"
+        );
     }
 
     #[test]

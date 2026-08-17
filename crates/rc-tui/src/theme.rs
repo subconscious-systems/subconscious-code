@@ -23,12 +23,17 @@ const ACCENT_RGB: Color = Color::Rgb(255, 92, 39);
 /// Dimmer brand orange — deep headings.
 const ACCENT_DIM_RGB: Color = Color::Rgb(184, 74, 30);
 
-pub const DEFAULT_LOGO: &str = "◈";
+/// One-cell terminal reduction of `logo.svg`'s six-petal flower. `✻` keeps the
+/// same radial/petaled silhouette at the smallest size a terminal can render;
+/// it is used as the tiny assistant-output/activity mark, while the checked-in
+/// raster below preserves the exact SVG at larger sizes.
+pub const DEFAULT_LOGO: &str = "✻";
 
 /// The rasterized `logo.svg` as monochrome half-block art (▀/▄/█/space). The
-/// TUI renders it in [`palette().logo()`] as a startup splash. Generating it is
-/// a one-off offline step (`rsvg-convert` + a pixel→half-block pass); the art is
-/// checked in so the binary ships with the brand and needs no image runtime.
+/// TUI renders it in [`Palette::logo`] as the welcome card's static splash.
+/// Generating it is a one-off offline step (`rsvg-convert` + a pixel→half-block
+/// pass); the art is checked in so the binary ships with the brand and needs no
+/// image runtime. In-turn animation stays a one-cell Unicode mark.
 pub const LOGO_ART: &str = include_str!("../assets/logo.txt");
 
 /// The resolved color budget, constructed once from the environment.
@@ -79,7 +84,21 @@ impl Palette {
         if self.no_color {
             Style::new().add_modifier(Modifier::UNDERLINED)
         } else {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED)
+        }
+    }
+    /// Reasoning — the model's chain-of-thought, distinct from its answer:
+    /// dim + italic, so it reads as private monologue rather than output. Under
+    /// `NO_COLOR` the italic modifier alone carries the distinction.
+    pub fn reasoning(&self) -> Style {
+        if self.no_color {
+            Style::new().add_modifier(Modifier::ITALIC)
+        } else {
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
         }
     }
     /// A semantic state color (red error, green success) — dropped to
@@ -108,7 +127,24 @@ pub fn palette() -> &'static Palette {
     PALETTE.get_or_init(Palette::new)
 }
 
-/// The logo splash as styled lines, for the top of the transcript.
+/// Whether motion (spinner, caret blink) is allowed. Animations are on by
+/// default; set `SC_NO_ANIM` (present and non-empty) to disable them — for
+/// accessibility, low-CPU hosts, or terminals whose braille glyphs render
+/// poorly. Disabled motion degrades to a static glyph; the elapsed-time
+/// readouts (which are information, not decoration) keep updating.
+static ANIM: OnceLock<bool> = OnceLock::new();
+
+pub fn animations_enabled() -> bool {
+    *ANIM.get_or_init(|| {
+        // Mirror NO_COLOR's convention: present and non-empty disables.
+        std::env::var_os("SC_NO_ANIM")
+            .map(|v| !v.is_empty())
+            .map(|disabled| !disabled)
+            .unwrap_or(true)
+    })
+}
+
+/// The logo splash as styled lines for the static welcome card.
 pub fn splash_lines() -> Vec<Line<'static>> {
     let s = palette().logo();
     LOGO_ART
@@ -126,13 +162,17 @@ pub fn splash_lines() -> Vec<Line<'static>> {
 /// ASCII-art logo) to `~/.sc/logo.txt`:
 ///
 /// ```sh
-/// echo "◈" > ~/.sc/logo.txt        # a single Unicode mark
+/// echo "✻" > ~/.sc/logo.txt        # a single Unicode mark
 /// echo "(o)" > ~/.sc/logo.txt      # or a short ASCII token
 /// ```
 pub fn logo_glyph() -> String {
-    let Ok(home) = std::env::var("HOME") else { return DEFAULT_LOGO.to_string() };
+    let Ok(home) = std::env::var("HOME") else {
+        return DEFAULT_LOGO.to_string();
+    };
     let path = std::path::Path::new(&home).join(".sc").join("logo.txt");
-    let Ok(s) = std::fs::read_to_string(&path) else { return DEFAULT_LOGO.to_string() };
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return DEFAULT_LOGO.to_string();
+    };
     s.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())

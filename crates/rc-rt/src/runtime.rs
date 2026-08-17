@@ -46,8 +46,8 @@ impl Runtime {
         let (driver_tx, driver_rx) = mpsc::unbounded_channel::<DriverCmd>();
 
         let pending = std::sync::Arc::new(PendingAsks::new());
-        let sink =
-            std::sync::Arc::new(RuntimeSink::new(events_tx.clone())) as std::sync::Arc<dyn EventSink>;
+        let sink = std::sync::Arc::new(RuntimeSink::new(events_tx.clone()))
+            as std::sync::Arc<dyn EventSink>;
         let prompter = RuntimePrompter::new(events_tx.clone(), pending.clone());
         let permission = agent.permission.clone();
 
@@ -68,13 +68,20 @@ impl Runtime {
             pending,
         ));
 
-        Self { events_tx, actions_tx, _driver: driver, _pump: pump }
+        Self {
+            events_tx,
+            actions_tx,
+            _driver: driver,
+            _pump: pump,
+        }
     }
 
     /// Subscribe to the agent event stream. Call once; drain with sync
     /// [`EventStream::try_next`] (TUI) or async [`EventStream::recv`] (tests).
     pub fn subscribe(&self) -> EventStream {
-        EventStream { rx: self.events_tx.subscribe() }
+        EventStream {
+            rx: self.events_tx.subscribe(),
+        }
     }
 
     /// Push a user action (sync — safe from any thread/task).
@@ -107,7 +114,9 @@ impl EventStream {
             Err(broadcast::error::TryRecvError::Lagged(n)) => Some(Err(n)),
             // Empty (nothing right now) and Closed (runtime gone) both read as
             // "no event this tick" — the TUI polls again or stops on its own Quit.
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => None,
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                None
+            }
         }
     }
 

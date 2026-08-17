@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use rc_core::{
     agent::AgentLoop, model::EventSink, model::FinalizedToolCall, model::Model, model::ModelError,
     model::ModelRequest, model::ModelResponse, model::NullSink, project::project,
-    project::verify_invariant, registry::ToolRegistry, tool::Concurrency, tool::Tool, tool::ToolCtx,
-    tool::ToolError, tool::ToolOutcome, turn::Session, turn::ToolCall, turn::Turn, AllowAllChecker,
-    Mode, NullPrompter, PermissionChecker, PermissionEngine,
+    project::verify_invariant, registry::ToolRegistry, tool::Concurrency, tool::Tool,
+    tool::ToolCtx, tool::ToolError, tool::ToolOutcome, turn::Session, turn::ToolCall, turn::Turn,
+    AllowAllChecker, Mode, NullPrompter, PermissionChecker, PermissionEngine,
 };
 use rc_core::{AskResponse, FinishReason, Prompter, ToolResultBody, Usage};
 use serde_json::{json, Value};
@@ -23,12 +23,18 @@ struct MockModel {
 }
 impl MockModel {
     fn new(responses: Vec<ModelResponse>) -> Self {
-        Self { responses: Mutex::new(responses.into_iter().collect()) }
+        Self {
+            responses: Mutex::new(responses.into_iter().collect()),
+        }
     }
 }
 #[async_trait]
 impl Model for MockModel {
-    async fn complete(&self, _req: ModelRequest, _sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
+    async fn complete(
+        &self,
+        _req: ModelRequest,
+        _sink: &dyn EventSink,
+    ) -> Result<ModelResponse, ModelError> {
         let mut q = self.responses.lock().unwrap();
         Ok(q.pop_front().expect("scripted responses exhausted"))
     }
@@ -38,14 +44,23 @@ impl Model for MockModel {
 struct Echo;
 #[async_trait]
 impl Tool for Echo {
-    fn name(&self) -> &str { "Echo" }
-    fn description(&self) -> &str { "Echo back the `msg` argument." }
+    fn name(&self) -> &str {
+        "Echo"
+    }
+    fn description(&self) -> &str {
+        "Echo back the `msg` argument."
+    }
     fn schema(&self) -> Value {
         json!({ "type": "object", "properties": { "msg": { "type": "string" } }, "required": ["msg"] })
     }
-    fn concurrency(&self) -> Concurrency { Concurrency::Parallel }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Parallel
+    }
     async fn call(&self, input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
-        let msg = input.get("msg").and_then(|v| v.as_str()).unwrap_or("(none)");
+        let msg = input
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(none)");
         Ok(ToolOutcome::ok(format!("echo: {msg}")))
     }
 }
@@ -74,11 +89,21 @@ async fn loop_runs_tool_then_answers() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s1".into(), std::env::temp_dir(), "mock".into());
     let outcome = agent
-        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "do it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
@@ -127,20 +152,35 @@ async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s2".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "x".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "x".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
     // The parse-error tool result must answer the (synthesized) call id c1.
     let wire = project(&session.messages);
-    assert!(verify_invariant(&wire).is_ok(), "parse-error result must satisfy the invariant");
+    assert!(
+        verify_invariant(&wire).is_ok(),
+        "parse-error result must satisfy the invariant"
+    );
 
     match &session.messages[2] {
-        Turn::ToolResult { result, .. } => assert!(result.render().contains("invalid tool arguments")),
+        Turn::ToolResult { result, .. } => {
+            assert!(result.render().contains("invalid tool arguments"))
+        }
         other => panic!("expected a parse-error tool result, got {other:?}"),
     }
 }
@@ -178,14 +218,24 @@ async fn ask_escalation_denied_by_null_prompter_becomes_a_denied_result() {
 
     let mut session = Session::new("s3".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "edit it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "edit it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
     assert!(verify_invariant(&project(&session.messages)).is_ok());
     match &session.messages[2] {
         Turn::ToolResult { result, .. } => {
-            assert!(result.render().contains("denied"), "expected a denied result, got {:?}", result.render())
+            assert!(
+                result.render().contains("denied"),
+                "expected a denied result, got {:?}",
+                result.render()
+            )
         }
         other => panic!("expected a denied tool result, got {other:?}"),
     }
@@ -197,15 +247,27 @@ async fn ask_escalation_denied_by_null_prompter_becomes_a_denied_result() {
 #[derive(Default)]
 struct RecordingSink(Mutex<Vec<String>>);
 impl EventSink for RecordingSink {
-    fn on_text(&self, _d: &str) { self.0.lock().unwrap().push("text".into()); }
-    fn on_reasoning(&self, _d: &str) { self.0.lock().unwrap().push("reasoning".into()); }
-    fn on_tool_start(&self, _c: &ToolCall) { self.0.lock().unwrap().push("tool_start".into()); }
+    fn on_text(&self, _d: &str) {
+        self.0.lock().unwrap().push("text".into());
+    }
+    fn on_reasoning(&self, _d: &str) {
+        self.0.lock().unwrap().push("reasoning".into());
+    }
+    fn on_tool_start(&self, _c: &ToolCall) {
+        self.0.lock().unwrap().push("tool_start".into());
+    }
     fn on_tool_end(&self, _id: &str, _t: &str, _r: &ToolResultBody) {
         self.0.lock().unwrap().push("tool_end".into());
     }
-    fn on_iter(&self, c: u32, _m: u32) { self.0.lock().unwrap().push(format!("iter{c}")); }
-    fn on_usage(&self, _u: &Usage) { self.0.lock().unwrap().push("usage".into()); }
-    fn on_finish(&self, _r: &FinishReason) { self.0.lock().unwrap().push("finish".into()); }
+    fn on_iter(&self, c: u32, _m: u32) {
+        self.0.lock().unwrap().push(format!("iter{c}"));
+    }
+    fn on_usage(&self, _u: &Usage) {
+        self.0.lock().unwrap().push("usage".into());
+    }
+    fn on_finish(&self, _r: &FinishReason) {
+        self.0.lock().unwrap().push("finish".into());
+    }
 }
 
 #[tokio::test]
@@ -237,11 +299,21 @@ async fn loop_emits_iter_tool_end_and_usage() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
     let sink = RecordingSink::default();
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "do it".into(), &sink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "do it".into(),
+            &sink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -300,18 +372,35 @@ async fn async_prompter_once_allows_the_call_without_a_grant() {
     let registry = Arc::new(ToolRegistry::new(vec![]));
     let engine = Arc::new(PermissionEngine::new(Mode::Default, vec![], vec![], vec![]))
         as Arc<dyn PermissionChecker>;
-    let model = Arc::new(MockModel::new(vec![edit_call("c1"), stop_response("ok")])) as Arc<dyn Model>;
+    let model =
+        Arc::new(MockModel::new(vec![edit_call("c1"), stop_response("ok")])) as Arc<dyn Model>;
     let agent = AgentLoop::new(model, registry, engine);
-    let prompter = MockPrompter { response: AskResponse::Once };
+    let prompter = MockPrompter {
+        response: AskResponse::Once,
+    };
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "edit it".into(), &NullSink, &prompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "edit it".into(),
+            &NullSink,
+            &prompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
-    assert!(session.perm_grants.is_empty(), "Once adds no grant: {:?}", session.perm_grants);
+    assert!(
+        session.perm_grants.is_empty(),
+        "Once adds no grant: {:?}",
+        session.perm_grants
+    );
     match &session.messages[2] {
         Turn::ToolResult { result, .. } => {
-            assert!(matches!(result, ToolResultBody::Error { .. }), "allowed -> unknown tool: {:?}", result);
+            assert!(
+                matches!(result, ToolResultBody::Error { .. }),
+                "allowed -> unknown tool: {:?}",
+                result
+            );
         }
         other => panic!("expected a tool result, got {other:?}"),
     }
@@ -322,12 +411,21 @@ async fn async_prompter_session_adds_a_grant() {
     let registry = Arc::new(ToolRegistry::new(vec![]));
     let engine = Arc::new(PermissionEngine::new(Mode::Default, vec![], vec![], vec![]))
         as Arc<dyn PermissionChecker>;
-    let model = Arc::new(MockModel::new(vec![edit_call("c1"), stop_response("ok")])) as Arc<dyn Model>;
+    let model =
+        Arc::new(MockModel::new(vec![edit_call("c1"), stop_response("ok")])) as Arc<dyn Model>;
     let agent = AgentLoop::new(model, registry, engine);
-    let prompter = MockPrompter { response: AskResponse::Session("Edit".into()) };
+    let prompter = MockPrompter {
+        response: AskResponse::Session("Edit".into()),
+    };
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "edit it".into(), &NullSink, &prompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "edit it".into(),
+            &NullSink,
+            &prompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(session.perm_grants, vec!["Edit".to_string()]);
@@ -346,8 +444,16 @@ async fn turn_timeout_ends_a_long_loop() {
     }
     #[async_trait]
     impl Model for Slow {
-        async fn complete(&self, _req: ModelRequest, _sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
-            let n = { let mut c = self.n.lock().unwrap(); *c += 1; *c };
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            _sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let n = {
+                let mut c = self.n.lock().unwrap();
+                *c += 1;
+                *c
+            };
             tokio::time::sleep(self.delay).await;
             Ok(ModelResponse {
                 text: String::new(),
@@ -365,22 +471,41 @@ async fn turn_timeout_ends_a_long_loop() {
 
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let calls = Arc::new(Mutex::new(0u32));
-    let model = Arc::new(Slow { delay: Duration::from_millis(20), n: calls.clone() }) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>)
-        .with_turn_timeout(Some(Duration::from_millis(50)));
+    let model = Arc::new(Slow {
+        delay: Duration::from_millis(20),
+        n: calls.clone(),
+    }) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    )
+    .with_turn_timeout(Some(Duration::from_millis(50)));
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     let start = SystemTime::now();
     let outcome = agent
-        .run(&mut session, "loop".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "loop".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     let elapsed = start.elapsed().unwrap_or_default();
     let n = *calls.lock().unwrap();
 
     assert_eq!(outcome, rc_core::LoopOutcome::TimeUp);
-    assert!(elapsed < Duration::from_secs(2), "should stop near 50 ms, took {elapsed:?}");
-    assert!((2..50).contains(&n), "should run a few iters ({n}), not to the limit");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "should stop near 50 ms, took {elapsed:?}"
+    );
+    assert!(
+        (2..50).contains(&n),
+        "should run a few iters ({n}), not to the limit"
+    );
 }
 
 // ---- M3: cross-turn usage accumulation ------------------------------------
@@ -388,7 +513,12 @@ async fn turn_timeout_ends_a_long_loop() {
 #[tokio::test]
 async fn accumulates_usage_across_iterations() {
     fn usage(p: u64, c: u64) -> Usage {
-        Usage { prompt_tokens: p, completion_tokens: c, total_tokens: p + c, prompt_tokens_details: None }
+        Usage {
+            prompt_tokens: p,
+            completion_tokens: c,
+            total_tokens: p + c,
+            prompt_tokens_details: None,
+        }
     }
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
@@ -412,15 +542,28 @@ async fn accumulates_usage_across_iterations() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "go".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     let t = &session.total_usage;
     assert_eq!(t.prompt_tokens, 30, "prompt summed across iterations");
-    assert_eq!(t.completion_tokens, 5, "completion summed across iterations");
+    assert_eq!(
+        t.completion_tokens, 5,
+        "completion summed across iterations"
+    );
     assert_eq!(t.total_tokens, 35, "total summed across iterations");
 }
 
@@ -447,11 +590,21 @@ async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
         usage: None,
     }];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     let outcome = agent
-        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "do it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
@@ -460,11 +613,17 @@ async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
     assert_eq!(session.messages.len(), 3);
     match &session.messages[2] {
         Turn::ToolResult { result, .. } => {
-            assert!(matches!(result, ToolResultBody::Interrupted), "expected Interrupted, got {result:?}");
+            assert!(
+                matches!(result, ToolResultBody::Interrupted),
+                "expected Interrupted, got {result:?}"
+            );
         }
         other => panic!("expected a synthesized tool result, got {other:?}"),
     }
-    assert!(verify_invariant(&project(&session.messages)).is_ok(), "invariant must hold");
+    assert!(
+        verify_invariant(&project(&session.messages)).is_ok(),
+        "invariant must hold"
+    );
 }
 
 #[tokio::test]
@@ -482,11 +641,21 @@ async fn length_with_outstanding_call_synthesizes_an_interrupted_result() {
         usage: None,
     }];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     let outcome = agent
-        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "do it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Length);
@@ -496,7 +665,10 @@ async fn length_with_outstanding_call_synthesizes_an_interrupted_result() {
     );
     assert!(session.messages.iter().any(|t| matches!(
         t,
-        Turn::ToolResult { result: ToolResultBody::Interrupted, .. }
+        Turn::ToolResult {
+            result: ToolResultBody::Interrupted,
+            ..
+        }
     )));
 }
 
@@ -525,11 +697,21 @@ async fn length_without_tool_calls_auto_continues() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     let outcome = agent
-        .run(&mut session, "explain".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "explain".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
@@ -545,7 +727,10 @@ async fn length_without_tool_calls_auto_continues() {
         Turn::Assistant { text, .. } => assert_eq!(text.as_ref(), " done"),
         other => panic!("expected the continued answer, got {other:?}"),
     }
-    assert!(verify_invariant(&project(&session.messages)).is_ok(), "invariant must hold");
+    assert!(
+        verify_invariant(&project(&session.messages)).is_ok(),
+        "invariant must hold"
+    );
 }
 
 #[tokio::test]
@@ -566,11 +751,21 @@ async fn length_with_outstanding_call_stops_and_synthesizes() {
         usage: None,
     }];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     let outcome = agent
-        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "do it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Length);
@@ -580,7 +775,10 @@ async fn length_with_outstanding_call_stops_and_synthesizes() {
     );
     assert!(session.messages.iter().any(|t| matches!(
         t,
-        Turn::ToolResult { result: ToolResultBody::Interrupted, .. }
+        Turn::ToolResult {
+            result: ToolResultBody::Interrupted,
+            ..
+        }
     )));
 }
 
@@ -594,7 +792,11 @@ struct CapturingModel {
 }
 #[async_trait]
 impl Model for CapturingModel {
-    async fn complete(&self, req: ModelRequest, _sink: &dyn EventSink) -> Result<ModelResponse, ModelError> {
+    async fn complete(
+        &self,
+        req: ModelRequest,
+        _sink: &dyn EventSink,
+    ) -> Result<ModelResponse, ModelError> {
         *self.captured.lock().unwrap() = Some(req);
         Ok(self.response.clone())
     }
@@ -626,23 +828,50 @@ async fn loop_uses_the_wired_context_assembler() {
         finish_reason: rc_proto::FinishReason::Stop,
         usage: None,
     };
-    let model = Arc::new(CapturingModel { captured: captured.clone(), response }) as Arc<dyn Model>;
+    let model = Arc::new(CapturingModel {
+        captured: captured.clone(),
+        response,
+    }) as Arc<dyn Model>;
     let registry = Arc::new(ToolRegistry::new(vec![]));
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>)
-        .with_assembler(Arc::new(FixedAssembler { prompt: "SENTINEL SYSTEM PROMPT".into() })
-            as Arc<dyn rc_core::ContextAssembler>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    )
+    .with_assembler(Arc::new(FixedAssembler {
+        prompt: "SENTINEL SYSTEM PROMPT".into(),
+    }) as Arc<dyn rc_core::ContextAssembler>);
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "hi".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "hi".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
-    let req = captured.lock().unwrap().clone().expect("a request was captured");
+    let req = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a request was captured");
+    assert_eq!(
+        req.opts.session_id.as_deref(),
+        Some("s"),
+        "every model request must carry the active session identity"
+    );
     use rc_proto::WireMessage;
     match req.messages.first() {
         Some(WireMessage::System { content }) => {
-            assert_eq!(content.as_ref(), "SENTINEL SYSTEM PROMPT", "loop must use the wired assembler");
+            assert_eq!(
+                content.as_ref(),
+                "SENTINEL SYSTEM PROMPT",
+                "loop must use the wired assembler"
+            );
         }
         other => panic!("expected a system message, got {other:?}"),
     }
@@ -660,22 +889,45 @@ async fn loop_without_assembler_uses_legacy_default_prompt() {
         finish_reason: rc_proto::FinishReason::Stop,
         usage: None,
     };
-    let model = Arc::new(CapturingModel { captured: captured.clone(), response }) as Arc<dyn Model>;
+    let model = Arc::new(CapturingModel {
+        captured: captured.clone(),
+        response,
+    }) as Arc<dyn Model>;
     let registry = Arc::new(ToolRegistry::new(vec![]));
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "hi".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "hi".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
-    let req = captured.lock().unwrap().clone().expect("a request was captured");
+    let req = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a request was captured");
     use rc_proto::WireMessage;
     match req.messages.first() {
         Some(WireMessage::System { content }) => {
-            assert!(content.contains("You are `sc`"), "default prompt: {content}");
-            assert!(!content.contains("SENTINEL"), "no custom prompt without an assembler");
+            assert!(
+                content.contains("You are `sc`"),
+                "default prompt: {content}"
+            );
+            assert!(
+                !content.contains("SENTINEL"),
+                "no custom prompt without an assembler"
+            );
         }
         other => panic!("expected a system message, got {other:?}"),
     }
@@ -687,12 +939,18 @@ async fn loop_without_assembler_uses_legacy_default_prompt() {
 struct PanicTool;
 #[async_trait]
 impl Tool for PanicTool {
-    fn name(&self) -> &str { "PanicTool" }
-    fn description(&self) -> &str { "Panics on purpose." }
+    fn name(&self) -> &str {
+        "PanicTool"
+    }
+    fn description(&self) -> &str {
+        "Panics on purpose."
+    }
     fn schema(&self) -> Value {
         json!({ "type": "object", "properties": {}, "required": [] })
     }
-    fn concurrency(&self) -> Concurrency { Concurrency::Parallel }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Parallel
+    }
     async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
         panic!("PanicTool: simulated tool-impl bug");
     }
@@ -703,7 +961,9 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
     // A tool whose `call` panics must not take down the agent loop. The loop
     // surfaces a non-retryable error result for that call and continues to a
     // normal Stop — the invariant holds and no panic escapes `run`.
-    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(PanicTool) as Arc<dyn Tool>]));
+    let registry = Arc::new(ToolRegistry::new(
+        vec![Arc::new(PanicTool) as Arc<dyn Tool>],
+    ));
     let responses = vec![
         ModelResponse {
             text: String::new(),
@@ -725,12 +985,22 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     // The run must NOT panic (the tool's panic is isolated by tokio).
     let outcome = agent
-        .run(&mut session, "do it".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "do it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
@@ -740,14 +1010,20 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
     match &session.messages[2] {
         Turn::ToolResult { result, .. } => match result {
             ToolResultBody::Error { message, retryable } => {
-                assert!(message.contains("panic"), "expected a panic error, got {message}");
+                assert!(
+                    message.contains("panic"),
+                    "expected a panic error, got {message}"
+                );
                 assert!(!*retryable, "a panic is not retryable");
             }
             other => panic!("expected an Error result, got {other:?}"),
         },
         other => panic!("expected a tool result, got {other:?}"),
     }
-    assert!(verify_invariant(&project(&session.messages)).is_ok(), "invariant must hold");
+    assert!(
+        verify_invariant(&project(&session.messages)).is_ok(),
+        "invariant must hold"
+    );
 }
 
 // ---- unlimited context (M8) -------------------------------------------------
@@ -803,13 +1079,11 @@ async fn large_tool_results_reach_the_wire_uncapped() {
                 ModelResponse {
                     text: String::new(),
                     reasoning: None,
-                    tool_calls: vec![rc_core::model::FinalizedToolCall::Call(
-                        rc_core::ToolCall {
-                            id: "c1".into(),
-                            name: "Fat".into(),
-                            arguments: "{}".into(),
-                        },
-                    )],
+                    tool_calls: vec![rc_core::model::FinalizedToolCall::Call(rc_core::ToolCall {
+                        id: "c1".into(),
+                        name: "Fat".into(),
+                        arguments: "{}".into(),
+                    })],
                     finish_reason: rc_proto::FinishReason::ToolCalls,
                     usage: None,
                 }
@@ -825,7 +1099,9 @@ async fn large_tool_results_reach_the_wire_uncapped() {
         }
     }
 
-    let model = Arc::new(TwoTurn { requests: requests.clone() }) as Arc<dyn Model>;
+    let model = Arc::new(TwoTurn {
+        requests: requests.clone(),
+    }) as Arc<dyn Model>;
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Fat) as Arc<dyn Tool>]));
     let agent = AgentLoop::new(
         model,
@@ -835,7 +1111,13 @@ async fn large_tool_results_reach_the_wire_uncapped() {
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "go".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -854,7 +1136,11 @@ async fn large_tool_results_reach_the_wire_uncapped() {
         BODY,
         "the tool body must reach the model whole — a cap crept back in"
     );
-    assert!(!tool_msg.contains("truncated"), "no truncation sentinel: {}", &tool_msg[..80]);
+    assert!(
+        !tool_msg.contains("truncated"),
+        "no truncation sentinel: {}",
+        &tool_msg[..80]
+    );
 }
 
 // ---- hard runaway backstop --------------------------------------------------
@@ -869,9 +1155,15 @@ async fn hard_tool_result_cap_clips_a_runaway_output() {
     struct Huge;
     #[async_trait]
     impl Tool for Huge {
-        fn name(&self) -> &str { "Huge" }
-        fn description(&self) -> &str { "Returns a runaway body." }
-        fn schema(&self) -> Value { json!({"type": "object", "properties": {}}) }
+        fn name(&self) -> &str {
+            "Huge"
+        }
+        fn description(&self) -> &str {
+            "Returns a runaway body."
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
         async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
             // 10 KB — over the 4 KB test cap, under the 100 MB default.
             Ok(ToolOutcome::ok("z".repeat(10_000)))
@@ -900,12 +1192,22 @@ async fn hard_tool_result_cap_clips_a_runaway_output() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>)
-        .with_hard_tool_result_cap(4_000);
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    )
+    .with_hard_tool_result_cap(4_000);
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "go".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -936,9 +1238,15 @@ async fn hard_tool_result_cap_zero_disables_it() {
     struct Big;
     #[async_trait]
     impl Tool for Big {
-        fn name(&self) -> &str { "Big" }
-        fn description(&self) -> &str { "Returns a big body." }
-        fn schema(&self) -> Value { json!({"type": "object", "properties": {}}) }
+        fn name(&self) -> &str {
+            "Big"
+        }
+        fn description(&self) -> &str {
+            "Returns a big body."
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
         async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
             Ok(ToolOutcome::ok("y".repeat(50_000)))
         }
@@ -966,12 +1274,22 @@ async fn hard_tool_result_cap_zero_disables_it() {
         },
     ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
-    let agent = AgentLoop::new(model, registry, Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>)
-        .with_hard_tool_result_cap(0); // disabled
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    )
+    .with_hard_tool_result_cap(0); // disabled
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
-        .run(&mut session, "go".into(), &NullSink, &NullPrompter, CancellationToken::new())
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 

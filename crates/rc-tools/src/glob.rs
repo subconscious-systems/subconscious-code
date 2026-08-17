@@ -11,7 +11,6 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-
 #[derive(Deserialize, JsonSchema)]
 pub struct GlobInput {
     /// Glob pattern, e.g. `src/**/*.rs`. `*` matches one path segment, `**`
@@ -42,7 +41,10 @@ impl Glob {
 
     /// A `Glob` bounded to `cap` paths (`0` = unlimited).
     pub fn with_cap(cap: usize) -> Self {
-        Self { cap, description: glob_description(cap) }
+        Self {
+            cap,
+            description: glob_description(cap),
+        }
     }
 }
 
@@ -84,7 +86,12 @@ impl Tool for Glob {
         let root = match inp.path.as_deref() {
             Some(p) => match resolve_within(&ctx.allowed_roots, &ctx.cwd, p) {
                 Ok(c) => c,
-                Err(msg) => return Ok(ToolOutcome::Error { message: msg, retryable: false }),
+                Err(msg) => {
+                    return Ok(ToolOutcome::Error {
+                        message: msg,
+                        retryable: false,
+                    })
+                }
             },
             None => std::fs::canonicalize(&ctx.cwd).unwrap_or_else(|_| ctx.cwd.clone()),
         };
@@ -102,7 +109,9 @@ impl Tool for Glob {
         let mut hits: Vec<(PathBuf, SystemTime)> = Vec::new();
         for entry in ignore::WalkBuilder::new(&root).build() {
             let Ok(entry) = entry else { continue };
-            let Some(ft) = entry.file_type() else { continue };
+            let Some(ft) = entry.file_type() else {
+                continue;
+            };
             if !ft.is_file() {
                 continue;
             }
@@ -118,7 +127,7 @@ impl Tool for Glob {
         }
 
         hits.sort_by_key(|b| std::cmp::Reverse(b.1)); // newest first
-        // `cap == 0` = every match (the default).
+                                                      // `cap == 0` = every match (the default).
         let keep = if self.cap == 0 { hits.len() } else { self.cap };
         let truncated = hits.len() > keep;
         let mut content: String = hits
@@ -129,7 +138,11 @@ impl Tool for Glob {
         if truncated {
             content.push_str(&format!("… [{} more matches omitted]\n", hits.len() - keep));
         }
-        Ok(ToolOutcome::Ok { content, truncated, artifacts: Vec::new() })
+        Ok(ToolOutcome::Ok {
+            content,
+            truncated,
+            artifacts: Vec::new(),
+        })
     }
 }
 

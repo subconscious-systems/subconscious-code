@@ -43,14 +43,81 @@ pub struct Completion {
     pub candidates: Vec<String>,
 }
 
-/// The fixed slash-command palette. `/clear` and `/mode` map to host actions
-/// (the TUI handles them on submit, not as a tool call); `/help` prints a hint.
-fn slash_palette() -> &'static [(&'static str, &'static str)] {
+/// The fixed slash-command palette — the union of the slash commands shipped
+/// by Claude Code, Codex, and Cursor (de-duplicated; aliases live in
+/// [`crate::app`]'s `handle_slash`, not here, so they don't clutter the menu).
+/// `/clear`, `/mode`, and `/rewind` map to host actions the TUI already
+/// supported; the rest are either new host-side actions or prompt-expansion
+/// commands that submit a canned instruction to the model.
+///
+/// `pub(crate)` so `app::run_slash` can render `/help` from this single source
+/// of truth — the help text and the menu can never drift apart.
+pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
     &[
+        // Conversation / context hygiene.
         ("/clear", "Clear the transcript and start a fresh turn"),
-        ("/help", "Show composer keybindings and slash commands"),
+        (
+            "/compact",
+            "Compact the conversation (free context, keep a summary)",
+        ),
+        (
+            "/context",
+            "Show returned context tokens (or preflight estimate)",
+        ),
+        (
+            "/rewind",
+            "Restore files changed in the last turn (Write/Edit only)",
+        ),
+        // Session / environment introspection.
+        ("/cost", "Show token usage for the last turn"),
+        ("/usage", "Show token usage (alias of /cost)"),
+        ("/menu", "Open the menu: projects, sessions, and settings"),
+        ("/status", "Show session status (model, mode, cwd, busy)"),
+        ("/model", "Show the active model"),
         ("/mode", "Show or cycle the permission mode"),
-        ("/rewind", "Restore files changed in the last turn (Write/Edit only)"),
+        (
+            "/permissions",
+            "Show the active permission mode and rule hints",
+        ),
+        ("/doctor", "Run a self-check of the environment and config"),
+        ("/history", "Summarize the transcript length so far"),
+        ("/export", "Export the transcript to a file"),
+        // Lifecycle.
+        ("/quit", "Quit the session"),
+        ("/resume", "Resume a previous conversation"),
+        ("/update", "Check for an sc CLI update"),
+        ("/login", "Show authentication status"),
+        ("/logout", "Show authentication status"),
+        // Integrations / capabilities (notes — not all backends are wired yet).
+        ("/mcp", "List connected MCP servers"),
+        ("/memory", "Show the memory / CLAUDE.md location"),
+        ("/add-dir", "Add a working directory to the session"),
+        ("/vim", "Toggle vim keybindings (not yet wired)"),
+        (
+            "/terminal-setup",
+            "Show terminal setup hints for Shift+Enter",
+        ),
+        ("/approval", "Show approval / permission mode"),
+        // Prompt-expansion commands (submit a canned instruction to the model).
+        (
+            "/review",
+            "Review the pending code changes on the current branch",
+        ),
+        ("/pr", "Create a pull request for the current branch"),
+        ("/init", "Generate a CLAUDE.md documenting the codebase"),
+        ("/diff", "Show the diff of pending changes"),
+        (
+            "/release-notes",
+            "Summarize release notes from recent git history",
+        ),
+        ("/bug", "Help report a bug from recent errors"),
+        ("/doc", "Generate documentation for the code"),
+        ("/fix", "Find and fix bugs in the code"),
+        ("/explain", "Explain the code"),
+        ("/edit", "Apply edits to the code"),
+        ("/codebase", "Summarize the structure of the codebase"),
+        // Reference.
+        ("/help", "Show composer keybindings and slash commands"),
     ]
 }
 
@@ -75,7 +142,11 @@ pub fn complete(buffer: &str, root: &Path) -> Option<Completion> {
             if candidates.is_empty() {
                 return None;
             }
-            Some(Completion { kind: MenuKind::Slash, replace_start: start, candidates })
+            Some(Completion {
+                kind: MenuKind::Slash,
+                replace_start: start,
+                candidates,
+            })
         }
         Trigger::File { start } => {
             let prefix = &buffer[start + 1..];
@@ -83,7 +154,11 @@ pub fn complete(buffer: &str, root: &Path) -> Option<Completion> {
             if candidates.is_empty() {
                 return None;
             }
-            Some(Completion { kind: MenuKind::File, replace_start: start, candidates })
+            Some(Completion {
+                kind: MenuKind::File,
+                replace_start: start,
+                candidates,
+            })
         }
     }
 }
@@ -223,7 +298,13 @@ mod tests {
     #[test]
     fn slash_filters_by_prefix() {
         let c = complete("/c", Path::new(".")).unwrap();
-        assert_eq!(c.candidates, vec!["/clear".to_string()]);
+        // Every candidate starts with the `/c` prefix; the palette grew to many
+        // `/c…` commands (clear, codebase, compact, context, cost), so assert
+        // membership and the prefix invariant rather than an exact singleton.
+        assert!(c.candidates.iter().all(|s| s.starts_with("/c")));
+        assert!(c.candidates.contains(&"/clear".to_string()));
+        assert!(c.candidates.contains(&"/compact".to_string()));
+        assert!(c.candidates.contains(&"/cost".to_string()));
     }
 
     #[test]

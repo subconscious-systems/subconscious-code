@@ -33,9 +33,17 @@ pub fn resolve_within(roots: &[PathBuf], cwd: &Path, candidate: &str) -> Result<
 
 /// Resolve a path that may not exist yet (Write creating a new file):
 /// canonicalize the parent, append the file name, then scope-check.
-pub fn resolve_within_loose(roots: &[PathBuf], cwd: &Path, candidate: &str) -> Result<PathBuf, String> {
+pub fn resolve_within_loose(
+    roots: &[PathBuf],
+    cwd: &Path,
+    candidate: &str,
+) -> Result<PathBuf, String> {
     let p = Path::new(candidate);
-    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
     if let Ok(canon) = std::fs::canonicalize(&abs) {
         return if under_root(&canon, roots) {
             Ok(canon)

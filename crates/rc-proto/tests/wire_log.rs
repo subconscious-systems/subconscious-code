@@ -72,12 +72,23 @@ async fn debug_request_log_has_body_but_not_the_api_key() {
         Some(std::time::Duration::from_secs(60)),
     )
     .unwrap();
-    let messages = vec![WireMessage::User { content: "fingerprint-me".into() }];
-    let _ = client.complete(&messages, &CompleteOpts::default()).await.unwrap();
+    let messages = vec![WireMessage::User {
+        content: "fingerprint-me".into(),
+    }];
+    let _ = client
+        .complete(&messages, &CompleteOpts::default())
+        .await
+        .unwrap();
 
     let captured = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
-    assert!(captured.contains("→ POST"), "request log should be present: {captured}");
-    assert!(captured.contains("fingerprint-me"), "body should be logged: {captured}");
+    assert!(
+        captured.contains("→ POST"),
+        "request log should be present: {captured}"
+    );
+    assert!(
+        captured.contains("fingerprint-me"),
+        "body should be logged: {captured}"
+    );
     assert!(
         !captured.contains("secret-key-xyz"),
         "API key must never appear in logs: {captured}"

@@ -14,8 +14,8 @@ use crate::wire::{
     WireMessage,
 };
 use bytes::Bytes;
-use std::io::Write as _;
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -26,6 +26,10 @@ use tokio_stream::Stream;
 pub struct CompleteOpts {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Stable Subconscious Code session identity. Sent as an HTTP header rather
+    /// than a body field so correlation never changes canonical prompt bytes or
+    /// prefix-cache behavior.
+    pub session_id: Option<String>,
     /// T2: abort the stream if no chunk arrives within this duration (a stall),
     /// failing fast instead of waiting for the total request timeout. `None`
     /// (default) disables the idle bound. Consumed by `rc_core::ChatModel`; not a
@@ -73,6 +77,10 @@ pub struct ChatClient {
 /// to stderr per request. Set `SC_DEBUG_FULL_BODY=1` to opt back into the full
 /// dump when you genuinely need it.
 const DEBUG_BODY_PREVIEW: usize = 8 * 1024;
+const CLIENT_HEADER: &str = "x-subconscious-client";
+const CLIENT_NAME: &str = "subconscious_code";
+const SESSION_HEADER: &str = "x-subconscious-code-session-id";
+const MAX_SESSION_ID_LEN: usize = 256;
 
 impl ChatClient {
     /// `api_key` empty → `NoApiKey` immediately, so the caller surfaces a clear
@@ -149,14 +157,28 @@ impl ChatClient {
         &self,
         url: &str,
         body: &Bytes,
+        session_id: Option<&str>,
     ) -> Result<reqwest::Response, ProtoError> {
+        if session_id.is_some_and(|id| {
+            id.is_empty()
+                || id.len() > MAX_SESSION_ID_LEN
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+        }) {
+            return Err(ProtoError::InvalidSessionId);
+        }
         let mut attempt = 0u32;
         loop {
             let mut req = self
                 .http
                 .post(url)
                 .bearer_auth(self.api_key.clone())
-                .header("content-type", "application/json");
+                .header("content-type", "application/json")
+                .header(CLIENT_HEADER, CLIENT_NAME);
+            if let Some(session_id) = session_id {
+                req = req.header(SESSION_HEADER, session_id);
+            }
             if self.gzip_request {
                 req = req.header("content-encoding", "gzip");
             }
@@ -181,15 +203,24 @@ impl ChatClient {
             if transient && attempt < self.retry.max_retries {
                 // Honor `Retry-After` (seconds) if the server sent one, capped at
                 // max_delay; else exponential backoff.
-                let d = self.retry_after(&resp).unwrap_or_else(|| self.backoff(attempt));
-                tracing::warn!(status = status.as_u16(), attempt, "transient HTTP error; retrying in {d:?}");
+                let d = self
+                    .retry_after(&resp)
+                    .unwrap_or_else(|| self.backoff(attempt));
+                tracing::warn!(
+                    status = status.as_u16(),
+                    attempt,
+                    "transient HTTP error; retrying in {d:?}"
+                );
                 tokio::time::sleep(d).await;
                 attempt += 1;
                 continue;
             }
             let text = resp.text().await.unwrap_or_default();
             tracing::debug!("← {status}\n{text}");
-            return Err(ProtoError::Status { status: status.as_u16(), body: text });
+            return Err(ProtoError::Status {
+                status: status.as_u16(),
+                body: text,
+            });
         }
     }
 
@@ -197,7 +228,10 @@ impl ChatClient {
     /// (a refinement); deterministic backoff is enough to spread load.
     fn backoff(&self, attempt: u32) -> Duration {
         let factor = 1u64 << attempt.min(20);
-        self.retry.base_delay.saturating_mul(factor as u32).min(self.retry.max_delay)
+        self.retry
+            .base_delay
+            .saturating_mul(factor as u32)
+            .min(self.retry.max_delay)
     }
 
     /// A transport error worth retrying: a *connection* failure (DNS, TCP
@@ -211,7 +245,13 @@ impl ChatClient {
     /// `max_delay` so a misconfigured/hostile value can't stall the turn. The
     /// HTTP-date form and unparseable values return `None` (fall back to backoff).
     fn retry_after(&self, resp: &reqwest::Response) -> Option<Duration> {
-        let secs: u64 = resp.headers().get("retry-after")?.to_str().ok()?.parse().ok()?;
+        let secs: u64 = resp
+            .headers()
+            .get("retry-after")?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()?;
         Some(Duration::from_secs(secs).min(self.retry.max_delay))
     }
 
@@ -292,10 +332,16 @@ impl ChatClient {
         let body = self.encode_body(&req)?;
         let url = format!("{}/chat/completions", self.base_url);
         self.log_request(&url, &body, false);
-        let resp = self.send_with_retry(&url, &body).await?;
+        let resp = self
+            .send_with_retry(&url, &body, opts.session_id.as_deref())
+            .await?;
         let status = resp.status();
         let parsed: ChatCompletionResponse = resp.json().await?;
-        tracing::debug!("← {status} choices={} usage={:?}", parsed.choices.len(), parsed.usage);
+        tracing::debug!(
+            "← {status} choices={} usage={:?}",
+            parsed.choices.len(),
+            parsed.usage
+        );
         if parsed.choices.is_empty() {
             return Err(ProtoError::EmptyChoices);
         }
@@ -321,14 +367,22 @@ impl ChatClient {
             temperature: opts.temperature,
             stream: true,
             tools: tools.to_vec(),
-            tool_choice: if tools.is_empty() { None } else { Some(ToolChoiceValue::Auto) },
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                Some(ToolChoiceValue::Auto)
+            },
             parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
-            stream_options: Some(StreamOptions { include_usage: true }),
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
         let body = self.encode_body(&req)?;
         let url = format!("{}/chat/completions", self.base_url);
         self.log_request(&url, &body, true);
-        let resp = self.send_with_retry(&url, &body).await?;
+        let resp = self
+            .send_with_retry(&url, &body, opts.session_id.as_deref())
+            .await?;
         let status = resp.status();
         tracing::debug!("← {status} streaming");
         let body: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
@@ -455,9 +509,18 @@ mod tests {
     #[tokio::test]
     async fn connection_refused_is_transient_transport() {
         let err = closed_port_err().await;
-        assert!(err.is_connect(), "connection refused is a connect error: {err}");
-        assert!(!err.is_timeout(), "connection refused is not a timeout: {err}");
-        assert!(ChatClient::is_transient_transport(&err), "should retry: {err}");
+        assert!(
+            err.is_connect(),
+            "connection refused is a connect error: {err}"
+        );
+        assert!(
+            !err.is_timeout(),
+            "connection refused is not a timeout: {err}"
+        );
+        assert!(
+            ChatClient::is_transient_transport(&err),
+            "should retry: {err}"
+        );
     }
 
     #[tokio::test]
@@ -470,14 +533,20 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
             .mount(&server)
             .await;
-        let client = reqwest::Client::builder().timeout(Duration::from_millis(80)).build().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(80))
+            .build()
+            .unwrap();
         let err = client
             .post(format!("{}/chat/completions", server.uri()))
             .send()
             .await
             .expect_err("should time out");
         assert!(err.is_timeout(), "should be a timeout: {err}");
-        assert!(!ChatClient::is_transient_transport(&err), "timeout must not retry: {err}");
+        assert!(
+            !ChatClient::is_transient_transport(&err),
+            "timeout must not retry: {err}"
+        );
     }
 
     #[tokio::test]
@@ -489,22 +558,41 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let client = ChatClient::new(format!("http://{addr}"), "k".into(), "m".into(), Some(Duration::from_secs(60)))
-            .unwrap()
-            .with_retry(RetryOpts {
-                max_retries: 2,
-                base_delay: Duration::from_millis(40),
-                max_delay: Duration::from_millis(200),
-            });
+        let client = ChatClient::new(
+            format!("http://{addr}"),
+            "k".into(),
+            "m".into(),
+            Some(Duration::from_secs(60)),
+        )
+        .unwrap()
+        .with_retry(RetryOpts {
+            max_retries: 2,
+            base_delay: Duration::from_millis(40),
+            max_delay: Duration::from_millis(200),
+        });
         let start = std::time::Instant::now();
         let err = client
-            .complete(&[WireMessage::User { content: "hi".into() }], &CompleteOpts::default())
+            .complete(
+                &[WireMessage::User {
+                    content: "hi".into(),
+                }],
+                &CompleteOpts::default(),
+            )
             .await
             .expect_err("closed port should fail");
         let elapsed = start.elapsed();
-        assert!(err.to_string().contains("transport"), "expected an Http error: {err}");
+        assert!(
+            err.to_string().contains("transport"),
+            "expected an Http error: {err}"
+        );
         // 2 backoffs: 40 ms + 80 ms = 120 ms. No-retry would be ~0 ms.
-        assert!(elapsed >= Duration::from_millis(80), "should have backed off (retried), took {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(3), "should give up fast, took {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "should have backed off (retried), took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should give up fast, took {elapsed:?}"
+        );
     }
 }

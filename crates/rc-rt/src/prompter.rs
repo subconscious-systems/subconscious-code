@@ -28,7 +28,10 @@ pub(crate) struct PendingAsks {
 
 impl PendingAsks {
     pub(crate) fn new() -> Self {
-        Self { map: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+        Self {
+            map: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     /// Register a fresh ask; returns its id and the receiver to await.
