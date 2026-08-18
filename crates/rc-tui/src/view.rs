@@ -242,6 +242,11 @@ pub(crate) struct ViewState {
     pub copy_pending: bool,
     /// A short-lived "copied N chars" confirmation and when it was shown.
     pub copy_notice: Option<(String, Instant)>,
+    /// Where the session is, for the status bar: the working directory's leaf
+    /// and the git branch when there is one (`subconscious-code (main)`).
+    /// Resolved once at startup — it is the fact that scrolls off the top of a
+    /// long transcript and never comes back, so the persistent chrome owns it.
+    pub location: String,
     /// Whether mouse capture is on. While it is, the app receives every drag
     /// and the terminal never sees one, so text cannot be selected — the one
     /// thing a terminal is otherwise always good for. Off hands the mouse back
@@ -324,6 +329,7 @@ impl ViewState {
             last_input: None,
             process_started: Instant::now(),
             menu_overlay: None,
+            location: String::new(),
             mouse_capture: false,
             selection: None,
             selection_text: None,
@@ -776,7 +782,11 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
     // loop's frequency happens to be — no per-frame accumulator needed.
     let now = Instant::now();
 
-    let area = frame.area();
+    // Content is capped rather than stretched: a 200-column terminal spread a
+    // 40-column welcome card and 200-column transcript lines edge to edge,
+    // which is both ugly and hard to read (the eye loses the line start on the
+    // way back). Everything below lays out inside this.
+    let area = content_area(frame.area());
     // `/menu` is a modal: it takes the whole frame and the whole keymap, so
     // nothing behind it can be typed into by accident.
     if let Some(menu) = &state.menu_overlay {
@@ -1107,35 +1117,58 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
 /// attention on an idle screen. In-turn motion uses only the one-cell logo.
 fn draw_welcome_card(frame: &mut Frame, state: &ViewState, area: Rect) {
     let p = theme::palette();
-    let card_h = 10u16.min(area.height);
+
+    // Key hints, one grammar throughout: a key, then an imperative verb. The
+    // keys are styled as a column of their own so the eye can scan down them
+    // without reading the labels. `Shift+Tab` names the modes it cycles —
+    // it is the only binding here whose effect a new user cannot guess.
+    let hints: &[(&str, &str)] = &[
+        ("@", "mention a file"),
+        ("/", "run a command — /help lists them"),
+        (
+            "Shift+Tab",
+            "switch mode — default, accept edits, plan, ask, auto",
+        ),
+        ("Alt+↑ ↓", "recall an earlier prompt"),
+        ("Ctrl+C", "quit"),
+    ];
+
+    let mut lines: Vec<Line<'static>> = vec![
+        // One mark, one name. The glyph *is* the brand element, so the name
+        // does not need a second one beside it.
+        Line::from(vec![
+            Span::styled(format!("{} ", theme::logo_glyph()), p.accent()),
+            Span::styled("Subconscious Code", p.accent()),
+        ]),
+        Line::from(vec![
+            Span::styled("  model  ", p.chrome()),
+            // Body, not chrome: dim gray over a transparent background with
+            // something bright behind it is unreadable, and this is content.
+            Span::styled(state.model_name.clone(), p.body()),
+        ]),
+        Line::default(),
+    ];
+    for (key, label) in hints {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<11}"), p.code()),
+            Span::styled((*label).to_string(), p.body()),
+        ]));
+    }
+
+    // Sits directly above the composer rather than floating at the top of an
+    // empty screen: the eye should travel from "what this is" to "where you
+    // type" in one short hop, and the transcript pushes the card off the top
+    // as soon as there is one.
+    let card_h = (lines.len() as u16).min(area.height);
     let card = Rect {
         x: area.x,
-        y: area.y,
+        y: area.y + area.height.saturating_sub(card_h),
         width: area.width,
         height: card_h,
     };
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(card);
-    frame.render_widget(block, card);
-    // Left column: the logo. Right column: the info, top-aligned.
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(18), Constraint::Min(1)])
-        .split(inner);
-    frame.render_widget(Paragraph::new(theme::splash_lines()), cols[0]);
-    // The info lines avoid colliding with strings the render tests assert are
-    // absent in fresh state ("type a prompt" / "/help" live in the composer
-    // placeholder and the status-bar hint), so the card stays up while typing.
-    let info = vec![
-        Line::styled(
-            format!("{} sc · model: {}", theme::logo_glyph(), state.model_name),
-            p.accent(),
-        ),
-        Line::styled(format!("cwd: {}", state.cwd), p.chrome()),
-        Line::styled("@file mentions a file", p.chrome()),
-        Line::styled("Shift+Tab mode · Alt+↑↓ history · Ctrl+C quit", p.chrome()),
-    ];
-    frame.render_widget(Paragraph::new(info), cols[1]);
+    // No border. The indent alone groups it, which leaves the box outline free
+    // to mean "this is the interactive element" — see `draw_composer`.
+    frame.render_widget(Paragraph::new(lines), card);
 }
 
 fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
@@ -1164,11 +1197,22 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
     // (dangerous), so Shift+Tab's state is unmistakable.
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::raw(" "));
+    // State first, and carried by a colored glyph: whether sc is working or
+    // waiting is the one thing worth reading without parsing a word.
     if state.busy {
         spans.push(logo_spinner_span(now, state.turn_started));
         spans.push(Span::raw(" "));
+        spans.push(Span::styled(activity.clone(), p.accent()));
+    } else {
+        spans.push(Span::styled("●", p.semantic(Color::Green)));
+        spans.push(Span::styled(" idle", p.body()));
     }
-    spans.push(Span::styled(state.model_name.clone(), p.body()));
+    spans.push(Span::styled(" · ", p.chrome()));
+    // Where you are, not what model you're on. The model is on the welcome
+    // card and in `/status`; the location is the thing that scrolls off the
+    // top of the transcript and never comes back, so it earns the persistent
+    // slot.
+    spans.push(Span::styled(state.location.clone(), p.body()));
     spans.push(Span::styled(" · ", p.chrome()));
     spans.push(Span::styled(
         mode_name(state.mode).to_string(),
@@ -1185,18 +1229,16 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
         }
         spans.push(Span::styled(human_count(tokens as usize), p.body()));
         spans.push(Span::styled(" tok", p.chrome()));
+        // Compact on purpose: at the capped content width the state line has
+        // to leave room for the right-hand indicator, and "(62.0% cache hit)"
+        // spent eleven columns saying what "62% cached" says.
         if let Some(rate) = state.cache_hit_rate {
             spans.push(Span::styled(
-                format!(" ({} cache hit)", human_percent(rate)),
+                format!(" · {} cached", human_percent(rate)),
                 p.chrome(),
             ));
         }
     }
-    spans.push(Span::styled(" · ", p.chrome()));
-    spans.push(Span::styled(
-        activity,
-        if state.busy { p.accent() } else { p.chrome() },
-    ));
     if let Some(s) = stream_rate_span(state, now) {
         spans.push(s);
     }
@@ -1208,6 +1250,23 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
     let right = right_hint(state);
     let line = right_align(spans, right, area.width);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The widest the interface draws, however wide the terminal is. Prose stops
+/// being readable somewhere past this, and the chrome has nothing like this
+/// much to say.
+const MAX_CONTENT_WIDTH: u16 = 100;
+
+/// Cap `area` at [`MAX_CONTENT_WIDTH`], left-aligned with a one-column margin
+/// so the interface hugs the side a terminal's text already starts at rather
+/// than floating in the middle.
+fn content_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.min(MAX_CONTENT_WIDTH),
+        height: area.height,
+    }
 }
 
 /// How long the "copied N chars" confirmation holds the status corner.
@@ -1237,12 +1296,14 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
     }
     let indicator = scroll_indicator(state);
     if !indicator.is_empty() {
-        return vec![Span::styled(indicator, p.chrome())];
+        // Body, not chrome: where you are in a held transcript is live state,
+        // and dim gray is the first thing to disappear on a busy background.
+        return vec![Span::styled(indicator, p.body())];
     }
     if state.busy {
         return vec![
-            Span::styled("Esc ", p.chrome()),
-            Span::styled("interrupt", p.accent()),
+            Span::styled("Esc ", p.code()),
+            Span::styled("interrupt", p.body()),
         ];
     }
     // A drafted prompt is one Esc from being cleared (not lost — the second
@@ -1250,21 +1311,19 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
     // an empty line shows the discoverability hint instead.
     if !state.composer.is_empty() {
         vec![
-            Span::styled("Esc ", p.chrome()),
-            Span::styled("clear", p.accent()),
-            Span::styled(" · Ctrl+C quit", p.chrome()),
+            Span::styled("Esc ", p.code()),
+            Span::styled("clear", p.body()),
         ]
     } else if state.has_completed_reasoning() {
         vec![
-            Span::styled("Ctrl+T ", p.chrome()),
-            Span::styled("thought", p.accent()),
-            Span::styled(" · Ctrl+C quit", p.chrome()),
+            Span::styled("Ctrl+T ", p.code()),
+            Span::styled("thought", p.body()),
         ]
     } else {
-        vec![
-            Span::styled("/help · ", p.chrome()),
-            Span::styled("Ctrl+C quit", p.code()),
-        ]
+        // Nothing to report. The corner stays empty rather than parking
+        // onboarding here — `/help` and `Ctrl+C` are on the welcome card,
+        // where they belong, and this line is for things that change.
+        Vec::new()
     }
 }
 
@@ -1371,9 +1430,11 @@ fn human_count(n: usize) -> String {
     }
 }
 
-/// Render a provider cache ratio as a compact percentage.
+/// Render a provider cache ratio as a compact percentage. Whole numbers: at
+/// the capped status width a tenth of a percent is not worth a column, and the
+/// clamp keeps a provider that reports a nonsense ratio from printing "140%".
 fn human_percent(rate: f64) -> String {
-    format!("{:.1}%", rate.clamp(0.0, 1.0) * 100.0)
+    format!("{:.0}%", rate.clamp(0.0, 1.0) * 100.0)
 }
 
 fn draw_composer(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
@@ -1388,7 +1449,10 @@ fn draw_composer(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant)
     let mut spans: Vec<Span<'static>> = vec![Span::styled("> ", p.chrome())];
     if state.composer.is_empty() {
         spans.push(composer_caret_span(state, now));
-        spans.push(Span::styled(" type a prompt · /help · @file", p.chrome()));
+        // One phrase, not a menu: `/help` and `@file` are on the welcome
+        // card. Chrome-dim placeholder text is the first thing to vanish on a
+        // translucent background, so this sits a tier brighter.
+        spans.push(Span::styled(" type a prompt", p.accent_dim()));
     } else {
         spans.extend(composer_content_spans(state));
         spans.push(composer_caret_span(state, now));
@@ -1411,7 +1475,14 @@ fn draw_composer(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant)
         .wrap(Wrap { trim: false })
         // Untitled on purpose: the `>` prompt and the placeholder already say
         // what the box is, so a "compose" label was redundant chrome.
-        .block(Block::default().borders(Borders::ALL));
+        // Accented border. It is the only interactive element on screen, and
+        // the welcome card no longer draws one, so the outline now means
+        // "type here" rather than just "a box".
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(p.accent_dim()),
+        );
     frame.render_widget(paragraph.scroll((scroll_y, 0)), area);
 }
 
@@ -2248,15 +2319,36 @@ mod tests {
         );
     }
 
+    /// The persistent chrome reports live state: whether sc is working, where
+    /// the session is, and which permission mode is armed. The model is *not*
+    /// here — it is on the welcome card, and this slot goes to the location,
+    /// which is what scrolls away and never comes back.
     #[test]
-    fn status_line_shows_model_mode_and_activity() {
+    fn status_line_shows_state_location_and_mode() {
         let mut state = ViewState::new("mock-model".into());
         state.mode = AgentMode::Plan;
+        state.location = "subconscious-code (main)".into();
         state.busy = true;
-        let screen = rendered(&mut state);
-        assert!(screen.contains("mock-model"), "model name: {screen}");
-        assert!(screen.contains("plan"), "mode: {screen}");
+        let screen = rendered_sized(&mut state, 78, 10);
         assert!(screen.contains("working"), "busy state: {screen}");
+        assert!(screen.contains("plan"), "mode: {screen}");
+        assert!(
+            screen.contains("subconscious-code (main)"),
+            "location: {screen}"
+        );
+        assert!(
+            !screen.contains("mock-model"),
+            "the model does not compete for the state line: {screen}"
+        );
+    }
+
+    /// Idle draws a colored state glyph rather than only a word, so working vs
+    /// waiting reads without being parsed.
+    #[test]
+    fn idle_state_carries_a_glyph() {
+        let mut state = ViewState::new("m".into());
+        let screen = rendered(&mut state);
+        assert!(screen.contains("● idle"), "idle glyph: {screen}");
     }
 
     /// The context figure is the headline number for this agent, so it has to
@@ -2287,7 +2379,8 @@ mod tests {
     #[test]
     fn human_scales_read_at_a_glance() {
         assert_eq!(human_count(2_748_220), "2.7M");
-        assert_eq!(human_percent(0.08125), "8.1%");
+        assert_eq!(human_percent(0.08125), "8%");
+        assert_eq!(human_percent(1.4), "100%", "a nonsense ratio is clamped");
     }
 
     #[test]
@@ -2829,14 +2922,28 @@ mod tests {
         assert_eq!(composer_display_text(&state), "one line\ntwo\nthree");
     }
 
-    /// The status bar's right corner carries a context-sensitive hint — the
-    /// discoverability hint when idle, the interrupt key when busy, the held-
-    /// view indicator when scrolled up. Here: idle → the help/quit hint.
+    /// The right corner is for things that change — interrupt, scroll
+    /// position, a copy confirmation. Idle with nothing happening, it stays
+    /// empty instead of parking onboarding in the one line that should be
+    /// reporting live state.
     #[test]
-    fn status_right_hint_shows_help_when_idle() {
+    fn status_right_corner_is_empty_when_nothing_is_happening() {
         let mut state = ViewState::new("m".into());
         let screen = rendered(&mut state);
-        assert!(screen.contains("Ctrl+C quit"), "idle right hint: {screen}");
+        // Scoped to the state line itself: the welcome card legitimately
+        // mentions /help and Ctrl+C, and that is the point — one owner each.
+        let status = screen
+            .lines()
+            .find(|r| r.contains("idle"))
+            .expect("status line on screen");
+        assert!(
+            !status.contains("Ctrl+C"),
+            "no static onboarding in the state line: {status}"
+        );
+        assert!(
+            !status.contains("/help"),
+            "help lives on the welcome card: {status}"
+        );
     }
 
     /// Busy → the right hint switches to the interrupt affordance.
@@ -2861,16 +2968,6 @@ mod tests {
         let screen = rendered(&mut state);
         assert!(screen.contains("Esc"), "draft shows Esc: {screen}");
         assert!(screen.contains("clear"), "draft shows clear: {screen}");
-        // The quit affordance stays visible alongside it.
-        assert!(
-            screen.contains("Ctrl+C quit"),
-            "quit still hinted: {screen}"
-        );
-        // The empty-state help hint is displaced by the clearer Esc-clear hint.
-        assert!(
-            !screen.contains("/help"),
-            "no /help once drafting: {screen}"
-        );
     }
 
     /// Returned prompt tokens replace the estimate, and cache is a rate over
@@ -2881,12 +2978,14 @@ mod tests {
         state.context_tokens = Some(12_345);
         state.context_tokens_estimated = false;
         state.cache_hit_rate = Some(0.081);
-        let screen = rendered(&mut state);
+        let screen = rendered_sized(&mut state, 78, 10);
         assert!(
             screen.contains("ctx: 12.3K tok"),
             "reported context: {screen}"
         );
-        assert!(screen.contains("8.1% cache hit"), "cache rate: {screen}");
+        // Compact form — the state line is width-constrained and this says the
+        // same thing in fewer columns.
+        assert!(screen.contains("8% cached"), "cache rate: {screen}");
         assert!(!screen.contains('Σ'), "cumulative count removed: {screen}");
     }
 
@@ -2941,33 +3040,59 @@ mod tests {
         assert!(text.contains("Bash"), "tool name: {text}");
     }
 
-    /// Before the first turn, the welcome card shows the logo on the left and
-    /// the model + cwd info on the right, all inside a bordered box.
+    /// Before the first turn the welcome card carries the onboarding: one
+    /// brand mark, the model, and the key hints. It owns these — the status
+    /// bar deliberately does not repeat them.
     #[test]
-    fn welcome_card_shows_logo_and_info_before_first_turn() {
+    fn welcome_card_carries_the_onboarding() {
         let mut state = ViewState::new("gw-glm-5.2".into());
-        state.cwd = "/home/daniel/subconscious-code".into();
-        // Wider than the default 60x10: the logo column widened to fit the
-        // rotating render (see `draw_welcome_card`), and 60 cols no longer
-        // leaves room for the cwd line on the right without clipping it —
-        // same as it would on a real narrow terminal, not a test artifact.
-        let screen = rendered_sized(&mut state, 80, 10);
-        assert!(screen.contains("┌"), "box top border: {screen}");
-        assert!(screen.contains("│"), "box side border: {screen}");
+        let screen = rendered_sized(&mut state, 80, 20);
+        assert!(screen.contains("Subconscious Code"), "wordmark: {screen}");
+        assert!(screen.contains("gw-glm-5.2"), "model: {screen}");
+        assert!(screen.contains("mention a file"), "@ hint: {screen}");
+        assert!(screen.contains("Ctrl+C"), "quit hint: {screen}");
+        // The one binding whose effect can't be guessed names its options.
         assert!(
-            screen.contains("sc · model: gw-glm-5.2"),
-            "model line to the right: {screen}"
+            screen.contains("accept edits"),
+            "Shift+Tab names the modes: {screen}"
         );
+    }
+
+    /// The card is unbordered and sits directly above the composer, so the
+    /// only outline on screen belongs to the thing you type into and the eye
+    /// doesn't cross an empty screen to get from one to the other.
+    #[test]
+    fn welcome_card_is_unbordered_and_meets_the_composer() {
+        let mut state = ViewState::new("m".into());
+        let screen = rendered_sized(&mut state, 80, 24);
+        let rows: Vec<&str> = screen.lines().collect();
+        let wordmark = rows
+            .iter()
+            .position(|r| r.contains("Subconscious Code"))
+            .expect("wordmark on screen");
+        let box_top = rows
+            .iter()
+            .position(|r| r.contains("┌"))
+            .expect("composer box on screen");
+        let last_hint = rows
+            .iter()
+            .position(|r| r.contains("Ctrl+C"))
+            .expect("hints on screen");
         assert!(
-            screen.contains("cwd: /home/daniel/subconscious-code"),
-            "cwd line: {screen}"
+            box_top > wordmark,
+            "the only bordered box is below the card (the composer): {screen}"
         );
-        // The rotating logo renders from a shading ramp (` .:-=+*#%@`), not
-        // fixed glyphs — assert some non-blank ramp character shows up rather
-        // than any one specific one.
+        // The card ends where the input begins — at most the blank breathing
+        // row and the status line in between, never a screen of void.
         assert!(
-            screen.chars().any(|c| ":-=+*#%@".contains(c)),
-            "logo render on the left: {screen}"
+            box_top - last_hint <= 3,
+            "card meets the input (hint row {last_hint}, box row {box_top}): {screen}"
+        );
+        // Exactly one box: the card contributes no border of its own.
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("┌")).count(),
+            1,
+            "one bordered element on screen: {screen}"
         );
     }
 
@@ -2979,7 +3104,7 @@ mod tests {
         state.transcript.push(Line::from("> hello"));
         let screen = rendered(&mut state);
         assert!(
-            !screen.contains("sc · model:"),
+            !screen.contains("Subconscious Code"),
             "no welcome card once conversation started: {screen}"
         );
     }
@@ -2993,7 +3118,7 @@ mod tests {
         state.transcript.clear();
         let screen = rendered(&mut state);
         assert!(
-            screen.contains("sc · model: m"),
+            screen.contains("Subconscious Code"),
             "welcome card after clear: {screen}"
         );
     }

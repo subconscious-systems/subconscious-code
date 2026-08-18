@@ -15,7 +15,6 @@
 //! terminal with `NO_COLOR` set still reads cleanly.
 
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
 use std::sync::OnceLock;
 
 /// Brand orange from `logo.svg`'s `#FF5C27` fill — headings + splash + menu bg.
@@ -28,13 +27,6 @@ const ACCENT_DIM_RGB: Color = Color::Rgb(184, 74, 30);
 /// it is used as the tiny assistant-output/activity mark, while the checked-in
 /// raster below preserves the exact SVG at larger sizes.
 pub const DEFAULT_LOGO: &str = "✻";
-
-/// The rasterized `logo.svg` as monochrome half-block art (▀/▄/█/space). The
-/// TUI renders it in [`Palette::logo`] as the welcome card's static splash.
-/// Generating it is a one-off offline step (`rsvg-convert` + a pixel→half-block
-/// pass); the art is checked in so the binary ships with the brand and needs no
-/// image runtime. In-turn animation stays a one-cell Unicode mark.
-pub const LOGO_ART: &str = include_str!("../assets/logo.txt");
 
 /// The resolved color budget, constructed once from the environment.
 pub struct Palette {
@@ -114,10 +106,6 @@ impl Palette {
             Style::new().fg(Color::Black).bg(ACCENT_RGB)
         }
     }
-    /// The splash — same as the accent.
-    pub fn logo(&self) -> Style {
-        self.accent()
-    }
 }
 
 static PALETTE: OnceLock<Palette> = OnceLock::new();
@@ -142,15 +130,6 @@ pub fn animations_enabled() -> bool {
             .map(|disabled| !disabled)
             .unwrap_or(true)
     })
-}
-
-/// The logo splash as styled lines for the static welcome card.
-pub fn splash_lines() -> Vec<Line<'static>> {
-    let s = palette().logo();
-    LOGO_ART
-        .lines()
-        .map(|l| Line::styled(l.to_string(), s))
-        .collect()
 }
 
 /// The user's logo glyph from `~/.sc/logo.txt`, if present. The first non-empty

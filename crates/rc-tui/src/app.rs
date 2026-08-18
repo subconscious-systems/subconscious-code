@@ -113,6 +113,7 @@ pub(crate) fn run(
     // The host already emitted the capture sequence (or didn't); this keeps
     // the flag, the hint and Ctrl+O agreeing with the terminal's actual state.
     app.view.mouse_capture = mouse;
+    app.view.location = describe_location(&app.cwd);
     // The mode the host resolved — a resumed session's own mode, or the
     // configured default. Set before the first draw so the status bar agrees
     // with the engine from frame one instead of claiming "default" until
@@ -623,14 +624,20 @@ impl App {
                 'w' | 'W' => self.delete_word(),
                 't' | 'T' => self.toggle_latest_reasoning(),
                 'o' | 'O' => self.toggle_mouse_capture(),
-                'u' | 'U' => {
-                    self.view.composer.clear();
-                    self.view.clear_paste_markers();
-                    self.view.last_input = Some(Instant::now());
-                    self.refresh_menu();
-                }
+                'u' | 'U' => self.clear_composer_line(),
                 _ => {} // other Ctrl+letter combos: ignore, don't insert
             },
+            // Cmd+Backspace is the macOS "delete to start of line" gesture. Only
+            // terminals that report the Super modifier (kitty protocol: Ghostty,
+            // WezTerm, kitty; iTerm2 when configured) deliver it — Terminal.app
+            // swallows Cmd entirely, so Ctrl+U remains the portable spelling.
+            KeyCode::Backspace
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SUPER | KeyModifiers::META) =>
+            {
+                self.clear_composer_line()
+            }
             // Alt+Backspace (mac) and Ctrl+W (emacs) both delete the last word.
             KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => self.delete_word(),
             KeyCode::Char(c) => {
@@ -860,6 +867,15 @@ impl App {
             self.view.follow = false;
             self.view.scroll_top = new_top;
         }
+    }
+
+    /// Wipe the composer line: Ctrl+U, or Cmd+Backspace where the terminal
+    /// reports it.
+    fn clear_composer_line(&mut self) {
+        self.view.composer.clear();
+        self.view.clear_paste_markers();
+        self.view.last_input = Some(Instant::now());
+        self.refresh_menu();
     }
 
     /// Ctrl+W / Alt+Backspace: delete the last whitespace-delimited word from
@@ -1924,6 +1940,52 @@ fn load_history(path: &Path) -> Vec<String> {
     out
 }
 
+/// The status bar's location label: the directory leaf, plus the git branch
+/// when `cwd` is inside a repository — `subconscious-code (main)`.
+///
+/// Read straight from `.git/HEAD` rather than by shelling out to git: this
+/// runs at startup on the UI path, and a process spawn there is both slower
+/// and one more thing to fail. A detached HEAD has no branch name, so only the
+/// directory shows.
+fn describe_location(cwd: &Path) -> String {
+    let leaf = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.display().to_string());
+    match git_branch(cwd) {
+        // Long branch names are the norm on a feature branch and would crowd
+        // the mode and context readouts out of the line.
+        Some(branch) => format!("{leaf} ({})", truncate(&branch, 24)),
+        None => leaf,
+    }
+}
+
+/// The checked-out branch of the repository containing `dir`, if any. Walks up
+/// looking for `.git`, which is a file (not a directory) inside a worktree or
+/// submodule — hence the `exists` check rather than `is_dir`.
+fn git_branch(dir: &Path) -> Option<String> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let git = d.join(".git");
+        if git.exists() {
+            let head = if git.is_dir() {
+                std::fs::read_to_string(git.join("HEAD")).ok()?
+            } else {
+                // A worktree/submodule `.git` file points at the real gitdir.
+                let text = std::fs::read_to_string(&git).ok()?;
+                let path = text.trim().strip_prefix("gitdir:")?.trim();
+                std::fs::read_to_string(Path::new(path).join("HEAD")).ok()?
+            };
+            return head
+                .trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(|b| b.to_string());
+        }
+        cur = d.parent();
+    }
+    None
+}
+
 /// Put `text` on the *user's* clipboard with OSC 52.
 ///
 /// Not a clipboard crate on purpose: `sc` is routinely run over SSH, where the
@@ -2155,6 +2217,29 @@ mod tests {
             head: (5, 4)
         }
         .is_empty());
+    }
+
+    /// The location label pairs the directory leaf with the branch, and keeps
+    /// a long feature-branch name from crowding out the rest of the line.
+    #[test]
+    fn location_label_pairs_directory_with_branch() {
+        // This repo is a git checkout, so the label carries a branch.
+        let here = std::env::current_dir().unwrap();
+        let label = describe_location(&here);
+        assert!(
+            label.starts_with(
+                here.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap()
+                    .as_str()
+            ),
+            "leads with the directory: {label}"
+        );
+        // Whatever the branch, the label stays short enough to share the line.
+        assert!(label.len() <= 64, "bounded length: {label}");
+
+        // A directory with no repository above it is just the directory.
+        assert_eq!(describe_location(Path::new("/")), "/");
     }
 
     #[test]
