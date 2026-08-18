@@ -5,7 +5,7 @@
 //! single-line composer. Markdown / word-level diff land in M4b.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -229,12 +229,59 @@ pub(crate) struct ViewState {
     /// `Some` it owns both the frame and the keymap, so there's no half-state
     /// where a keystroke lands in the composer hidden behind it.
     pub menu_overlay: Option<crate::menu::MenuState>,
+    /// The live mouse selection, in *screen* cells. `None` when nothing is
+    /// selected. Screen coordinates rather than transcript offsets because
+    /// what the user is selecting is what they can see — after wrapping,
+    /// markdown styling and collapsing, the rendered buffer is the only place
+    /// that text exists in the shape they are pointing at.
+    pub selection: Option<Selection>,
+    /// The selected text, harvested from the render buffer during [`draw`].
+    pub selection_text: Option<String>,
+    /// Set on mouse-up: the run loop copies [`Self::selection_text`] to the
+    /// clipboard after the next draw (the text only exists once drawn).
+    pub copy_pending: bool,
+    /// A short-lived "copied N chars" confirmation and when it was shown.
+    pub copy_notice: Option<(String, Instant)>,
     /// Whether mouse capture is on. While it is, the app receives every drag
     /// and the terminal never sees one, so text cannot be selected — the one
     /// thing a terminal is otherwise always good for. Off hands the mouse back
     /// for selection and copy, at the cost of wheel scrolling. Toggled with
     /// Ctrl+O (`/select`).
     pub mouse_capture: bool,
+}
+
+/// A drag selection, anchored where the button went down and headed wherever
+/// the pointer is now. Ordering is not normalized here — a selection dragged
+/// upward or leftward is as valid as one dragged down, so the range is sorted
+/// at use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Selection {
+    /// Where the drag began (column, row).
+    pub anchor: (u16, u16),
+    /// Where the pointer is now.
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    /// The selection as (start, end) in reading order, whichever way it was
+    /// dragged.
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        // Compare row-major: a point on an earlier row always precedes one on
+        // a later row, whatever the columns are.
+        let a = (self.anchor.1, self.anchor.0);
+        let b = (self.head.1, self.head.0);
+        if a <= b {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// True when the pointer never left the cell it went down on — a click,
+    /// not a drag.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
 }
 
 impl ViewState {
@@ -278,6 +325,10 @@ impl ViewState {
             process_started: Instant::now(),
             menu_overlay: None,
             mouse_capture: true,
+            selection: None,
+            selection_text: None,
+            copy_pending: false,
+            copy_notice: None,
         }
     }
 
@@ -733,6 +784,10 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
         state.tool_hitboxes.clear();
         frame.render_widget(Clear, area);
         draw_menu_overlay(frame, menu, area, now);
+        // A modal owns the screen; a selection made behind it would highlight
+        // cells that are no longer there.
+        state.selection = None;
+        state.selection_text = None;
         return;
     }
     // The composer wraps long prompts instead of clipping them: its box grows
@@ -771,6 +826,59 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
             draw_menu(frame, menu, chunks[3]);
         }
     }
+    // Last, over everything: the selection highlight is applied to the
+    // finished buffer, and the text is read back out of it. Doing this after
+    // every widget has drawn is what makes it work uniformly across the
+    // transcript, the status bar and the composer without any of them knowing
+    // that selection exists.
+    apply_selection(frame, state);
+}
+
+/// Reverse-video the selected cells and harvest their text.
+///
+/// The rendered buffer is the source of truth: by this point wrapping,
+/// markdown styling, and tool/reasoning collapsing have all happened, so the
+/// glyphs on screen are the only faithful representation of what the user
+/// dragged across. Reading them back means "copy" always matches what the eye
+/// selected, with no second, divergent path through the transcript model.
+fn apply_selection(frame: &mut Frame, state: &mut ViewState) {
+    let Some(selection) = state.selection else {
+        state.selection_text = None;
+        return;
+    };
+    if selection.is_empty() {
+        state.selection_text = None;
+        return;
+    }
+    let area = frame.area();
+    let (start, end) = selection.ordered();
+    let buf = frame.buffer_mut();
+    let mut text = String::new();
+
+    for row in start.1..=end.1.min(area.height.saturating_sub(1)) {
+        // Linear (flow) selection, not a rectangle: the first row runs from
+        // the anchor to the edge, whole rows follow, and the last stops at the
+        // pointer — the same shape a text editor or browser gives you, which
+        // is what makes multi-line copy read correctly.
+        let from = if row == start.1 { start.0 } else { 0 };
+        let to = if row == end.1 {
+            end.0
+        } else {
+            area.width.saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in from..=to.min(area.width.saturating_sub(1)) {
+            let cell = &mut buf[(col, row)];
+            line.push_str(cell.symbol());
+            cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+        }
+        // Trailing padding is an artifact of the terminal grid, never content.
+        text.push_str(line.trim_end());
+        if row < end.1 {
+            text.push('\n');
+        }
+    }
+    state.selection_text = (!text.trim().is_empty()).then_some(text);
 }
 
 fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: Instant) {
@@ -1102,9 +1210,20 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// How long the "copied N chars" confirmation holds the status corner.
+const COPY_NOTICE_TTL: Duration = Duration::from_secs(3);
+
 /// The right-aligned status hint, chosen for the current state.
 fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
     let p = theme::palette();
+    // A just-finished copy takes the corner for a beat: an escape sequence
+    // leaves no other trace, so this line is the only evidence the clipboard
+    // got anything.
+    if let Some((msg, at)) = &state.copy_notice {
+        if at.elapsed() < COPY_NOTICE_TTL {
+            return vec![Span::styled(msg.clone(), p.accent())];
+        }
+    }
     // Scrolled up dominates: the user is navigating, so the "where am I"
     // indicator earns the corner.
     // Select mode leads: the wheel is dead while it's on, and a user who
@@ -1861,6 +1980,54 @@ mod tests {
                 || screen.contains("(unset)"),
             "source indicator: {screen}"
         );
+    }
+
+    /// A drag copies exactly the glyphs the user dragged across, including
+    /// across a line break, with the grid's trailing padding stripped. The
+    /// coordinates are discovered from a first render rather than hardcoded,
+    /// so the test doesn't encode the current layout arithmetic.
+    #[test]
+    fn dragging_across_lines_copies_what_is_on_screen() {
+        let mut state = ViewState::new("gw-glm-5.2".into());
+        state.transcript.push(Line::raw("alpha one"));
+        state.transcript.push(Line::raw("beta two"));
+        let screen = rendered_sized(&mut state, 40, 12);
+        let rows: Vec<&str> = screen.lines().collect();
+        let (ay, ax) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, r)| r.find("alpha one").map(|x| (y as u16, x as u16)))
+            .expect("first line on screen");
+        let (by, bx) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, r)| r.find("beta two").map(|x| (y as u16, x as u16)))
+            .expect("second line on screen");
+
+        state.selection = Some(Selection {
+            anchor: (ax, ay),
+            head: (bx + "beta two".len() as u16 - 1, by),
+        });
+        let _ = rendered_sized(&mut state, 40, 12);
+        assert_eq!(
+            state.selection_text.as_deref(),
+            Some("alpha one\nbeta two"),
+            "the harvested text is what was on screen, unpadded"
+        );
+    }
+
+    /// A press that never moved selects nothing, so a plain click can keep its
+    /// existing meaning (expand/collapse a block) without copying.
+    #[test]
+    fn a_click_harvests_no_text() {
+        let mut state = ViewState::new("gw-glm-5.2".into());
+        state.transcript.push(Line::raw("alpha one"));
+        state.selection = Some(Selection {
+            anchor: (2, 2),
+            head: (2, 2),
+        });
+        let _ = rendered_sized(&mut state, 40, 12);
+        assert!(state.selection_text.is_none());
     }
 
     /// Select mode has to announce itself: with capture released the wheel

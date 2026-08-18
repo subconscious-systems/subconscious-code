@@ -82,7 +82,7 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
         ("/doctor", "Run a self-check of the environment and config"),
         (
             "/select",
-            "Release the mouse so you can select and copy text (Ctrl+O)",
+            "Hand the mouse to your terminal for its own selection (Ctrl+O)",
         ),
         ("/history", "Summarize the transcript length so far"),
         ("/export", "Export the transcript to a file"),

@@ -24,6 +24,7 @@ use serde_json::Value;
 use crate::complete::{self, Completion};
 use crate::diff;
 use crate::theme;
+use crate::view::Selection;
 use crate::view::{self, CompletionMenu, PendingAsk, ViewState};
 use crate::Term;
 
@@ -116,6 +117,9 @@ pub(crate) fn run(
     loop {
         app.drain_events();
         terminal.draw(|f| view::draw(f, &mut app.view))?;
+        // After the draw, never before: `view::draw` is what harvests the
+        // selected text out of the finished buffer.
+        app.flush_copy();
         if app.quit {
             break;
         }
@@ -422,6 +426,10 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Typing ends a selection: the highlight would otherwise sit over text
+        // that has scrolled or changed underneath it. The copy already
+        // happened on mouse-up, so nothing is lost.
+        self.clear_selection();
         // Ctrl+C always quits, even mid-ask / mid-turn.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.runtime.action(UserAction::Quit);
@@ -767,13 +775,65 @@ impl App {
     fn handle_mouse(&mut self, ev: MouseEvent) {
         const WHEEL_LINES: i32 = 3;
         match ev.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(-WHEEL_LINES),
-            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES),
-            MouseEventKind::Down(MouseButton::Left) => self.toggle_expandable_at(ev.column, ev.row),
-            // Drag/hold/right-click aren't tracked. Native text selection still
-            // works in most terminals by holding Shift while dragging, the
-            // standard mouse-capture tradeoff.
+            // Scrolling moves the text out from under a highlight, so the
+            // selection can't survive it.
+            MouseEventKind::ScrollUp => {
+                self.clear_selection();
+                self.scroll_by(-WHEEL_LINES)
+            }
+            MouseEventKind::ScrollDown => {
+                self.clear_selection();
+                self.scroll_by(WHEEL_LINES)
+            }
+            // A press no longer acts immediately: not until the button comes
+            // up do we know whether this was a click (toggle a block) or a
+            // drag (select text).
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.view.copy_notice = None;
+                self.view.selection = Some(Selection {
+                    anchor: (ev.column, ev.row),
+                    head: (ev.column, ev.row),
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = self.view.selection.as_mut() {
+                    sel.head = (ev.column, ev.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => match self.view.selection {
+                // Dragged: copy on release, with no extra keystroke — the
+                // selection *is* the copy gesture.
+                Some(sel) if !sel.is_empty() => self.view.copy_pending = true,
+                // Never moved: a plain click, which keeps its old meaning.
+                _ => {
+                    self.clear_selection();
+                    self.toggle_expandable_at(ev.column, ev.row);
+                }
+            },
             _ => {}
+        }
+    }
+
+    /// Drop any selection and the text harvested for it.
+    fn clear_selection(&mut self) {
+        self.view.selection = None;
+        self.view.selection_text = None;
+    }
+
+    /// Copy a finished drag to the clipboard. Called right after a draw,
+    /// because the text is read out of the rendered buffer and only exists
+    /// once the frame has been painted.
+    fn flush_copy(&mut self) {
+        if !self.view.copy_pending {
+            return;
+        }
+        self.view.copy_pending = false;
+        let Some(text) = self.view.selection_text.clone() else {
+            return;
+        };
+        if copy_to_clipboard(&text).is_ok() {
+            let n = text.chars().count();
+            self.view.copy_notice = Some((format!("copied {n} chars"), Instant::now()));
         }
     }
 
@@ -989,9 +1049,12 @@ impl App {
                 self.view
                     .transcript
                     .push(mk("  Ctrl+T       expand/collapse latest thought"));
-                self.view.transcript.push(mk(
-                    "  Ctrl+O       select mode: drag to select/copy (wheel off)",
-                ));
+                self.view
+                    .transcript
+                    .push(mk("  drag         select text — copied on release"));
+                self.view
+                    .transcript
+                    .push(mk("  Ctrl+O       hand the mouse to the terminal instead"));
                 self.view
                     .transcript
                     .push(mk("  Ctrl+W / U   delete word / clear the line"));
@@ -1204,7 +1267,7 @@ impl App {
         let msg = if self.view.mouse_capture {
             "select mode off — the wheel scrolls the transcript again"
         } else {
-            "select mode on — drag to select, then copy with your terminal; Ctrl+O to restore wheel scrolling"
+            "select mode on — the terminal handles selection now; Ctrl+O to restore wheel scrolling and in-app copy"
         };
         self.view
             .transcript
@@ -1857,6 +1920,59 @@ fn load_history(path: &Path) -> Vec<String> {
     out
 }
 
+/// Put `text` on the *user's* clipboard with OSC 52.
+///
+/// Not a clipboard crate on purpose: `sc` is routinely run over SSH, where the
+/// process has no access to the clipboard the user is actually pasting into —
+/// a local clipboard API would copy into the void on the remote host. OSC 52
+/// travels back down the same terminal connection and the terminal emulator
+/// does the copying, so it works identically local and remote.
+///
+/// Inside tmux the sequence has to be wrapped in a DCS passthrough (and its
+/// ESCs doubled) or tmux swallows it. Terminals that refuse OSC 52 for
+/// security drop it silently — there is no reply to wait for — which is why
+/// select mode (Ctrl+O) stays as the fallback.
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let osc = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let seq = match std::env::var_os("TMUX") {
+        Some(_) => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
+        None => osc,
+    };
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())?;
+    out.flush()
+}
+
+/// Standard-alphabet base64 with padding (RFC 4648).
+///
+/// Hand-rolled because OSC 52 is the only thing in the workspace that needs
+/// base64, and twenty lines beats a dependency in the build graph.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b1 = chunk[0] as u32;
+        let b2 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b3 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b1 << 16) | (b2 << 8) | b3;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        // A 1- or 2-byte tail pads rather than encoding bits that aren't there.
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Best-effort append of one prompt to the history file, creating `~/.sc` if
 /// it doesn't exist. Failures are ignored — history is a convenience, never a
 /// load on the turn.
@@ -1976,6 +2092,65 @@ mod tests {
             suggested_rule("Edit", &serde_json::json!({"file_path": "/tmp/x"})),
             "Edit"
         );
+    }
+
+    /// RFC 4648 test vectors, including every padding case — a wrong tail is
+    /// the classic hand-rolled-base64 bug, and OSC 52 fails silently, so a
+    /// broken encoder would look like "copy just doesn't work".
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        // Non-ASCII goes through as its UTF-8 bytes.
+        assert_eq!(base64("é".as_bytes()), "w6k=");
+    }
+
+    /// A selection reads the same whichever way it was dragged.
+    #[test]
+    fn selection_orders_row_major_in_both_directions() {
+        let down = Selection {
+            anchor: (3, 1),
+            head: (7, 4),
+        };
+        assert_eq!(down.ordered(), ((3, 1), (7, 4)));
+
+        let up = Selection {
+            anchor: (7, 4),
+            head: (3, 1),
+        };
+        assert_eq!(
+            up.ordered(),
+            ((3, 1), (7, 4)),
+            "dragging up is the same span"
+        );
+
+        // Same row, dragged leftward.
+        let left = Selection {
+            anchor: (9, 2),
+            head: (2, 2),
+        };
+        assert_eq!(left.ordered(), ((2, 2), (9, 2)));
+    }
+
+    /// A press that never moves is a click, not a selection — that distinction
+    /// is what lets a click keep toggling reasoning/tool blocks.
+    #[test]
+    fn a_press_without_movement_is_not_a_selection() {
+        let click = Selection {
+            anchor: (4, 4),
+            head: (4, 4),
+        };
+        assert!(click.is_empty());
+        assert!(!Selection {
+            anchor: (4, 4),
+            head: (5, 4)
+        }
+        .is_empty());
     }
 
     #[test]
