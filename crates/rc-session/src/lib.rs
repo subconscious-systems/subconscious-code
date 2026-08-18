@@ -231,7 +231,7 @@ pub fn list(dir: &Path) -> Vec<SessionInfo> {
         })
         .collect();
     // Newest first: the session you want is nearly always the one you just left.
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|a| std::cmp::Reverse(a.modified));
     out
 }
 

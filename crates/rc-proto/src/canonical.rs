@@ -57,7 +57,7 @@ pub fn canonicalize(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
+            entries.sort_by_key(|e| e.0);
             let mut out = serde_json::Map::with_capacity(entries.len());
             for (k, val) in entries {
                 out.insert(k.clone(), canonicalize(val));
