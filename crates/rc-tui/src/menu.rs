@@ -37,6 +37,12 @@ pub enum Outcome {
     Resume(PathBuf),
     /// Start a fresh session with this working directory.
     NewIn(PathBuf),
+    /// Rebuild the agent for the session that is already running and re-enter
+    /// the TUI. The conversation is preserved (it is reloaded from the session
+    /// file); the point is a fresh HTTP client, which is the only way a
+    /// newly-saved API key can take effect — the running one holds the key it
+    /// was constructed with.
+    Reload,
 }
 
 /// Which page is showing.
@@ -80,6 +86,10 @@ pub(crate) enum Row {
     NewSession(PathBuf),
     /// A settings field, by index into [`EDITABLE`].
     Field(usize),
+    /// Open the masked API-key editor. Writes `~/.sc/key` (mode 0600) on save —
+    /// not a `settings.json` field, so it has its own commit path rather than a
+    /// [`FieldSpec`](rc_config::edit::FieldSpec).
+    ChangeApiKey,
     Close,
 }
 
@@ -99,8 +109,15 @@ pub(crate) struct MenuState {
     pub settings: Settings,
     /// The in-progress text buffer while editing a field, if any.
     pub editing: Option<String>,
+    /// True when `editing` holds a new API key: the buffer renders masked, and
+    /// [`Self::commit`] routes to `~/.sc/key` instead of `settings.json`.
+    pub editing_api_key: bool,
     /// A transient line under the page: a save confirmation or an error.
     pub status: Option<String>,
+    /// Set when a commit needs the host to act — currently only a saved API
+    /// key, which requires a rebuilt client. `app` takes this after each
+    /// commit and leaves the TUI with it.
+    pub pending_outcome: Option<Outcome>,
 }
 
 impl MenuState {
@@ -113,7 +130,9 @@ impl MenuState {
             projects: group_projects(rc_session::list(sessions_dir)),
             settings: Settings::load(project_dir),
             editing: None,
+            editing_api_key: false,
             status: None,
+            pending_outcome: None,
         }
     }
 
@@ -123,6 +142,7 @@ impl MenuState {
             MenuPage::Root => vec![
                 Row::Goto(MenuPage::Projects),
                 Row::Goto(MenuPage::Settings),
+                Row::ChangeApiKey,
                 Row::Close,
             ],
             MenuPage::Projects => self
@@ -172,6 +192,7 @@ impl MenuState {
         self.page = page;
         self.selected = 0;
         self.editing = None;
+        self.editing_api_key = false;
         self.status = None;
     }
 
@@ -227,10 +248,55 @@ impl MenuState {
         self.status = None;
     }
 
+    /// Open the masked API-key editor with a fresh buffer. The key is never
+    /// prefilled — re-entering a key is the common case, and showing the
+    /// current secret inline (even masked) would invite a shoulder-surfing
+    /// mistake. An empty Enter later is a cancel, not a clear.
+    pub fn begin_api_key_edit(&mut self) {
+        self.editing = Some(String::new());
+        self.editing_api_key = true;
+        self.status = None;
+    }
+
+    /// Insert pasted text into the open edit buffer. Returns `false` when no
+    /// editor is open, so the caller can fall through to its own handling.
+    ///
+    /// The menu has to accept a native bracketed paste on its own: with
+    /// bracketed paste enabled the terminal delivers the payload as one
+    /// `Event::Paste`, and no `Char` key events ever arrive — which is why an
+    /// API key, the one value nobody types by hand, could not be pasted at
+    /// all. Only the first line is taken: a key copied from a browser or a
+    /// password manager carries a trailing newline, and an embedded newline
+    /// must not reach the key handler as Enter, which would save a
+    /// half-entered value.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(buf) = self.editing.as_mut() else {
+            return false;
+        };
+        let first = text.lines().next().unwrap_or("");
+        // Control characters (a stray tab, an ANSI escape from a styled copy)
+        // would render as garbage in a single-line field and, masked, be
+        // invisible in a key.
+        let cleaned: String = first.chars().filter(|c| !c.is_control()).collect();
+        if cleaned.is_empty() {
+            return true;
+        }
+        buf.push_str(&cleaned);
+        // Dropping the rest of a multi-line paste silently would look like a
+        // successful paste of the whole thing.
+        self.status = (text.lines().filter(|l| !l.trim().is_empty()).count() > 1)
+            .then(|| "pasted the first line only".to_string());
+        true
+    }
+
     /// Commit `value` to the selected field, writing `~/.sc/settings.json`.
     /// Sets [`Self::status`] either way; reloads settings on success so the
     /// page reflects the new resolved state.
     pub fn commit(&mut self, value: &str, project_dir: &Path) {
+        if self.editing_api_key {
+            self.commit_api_key(value, project_dir);
+            return;
+        }
         let Some(field) = self.current_field() else {
             return;
         };
@@ -263,8 +329,53 @@ impl MenuState {
         }
     }
 
-    /// Cycle a `Choice`/`Bool` field and save immediately — there's no text to
-    /// confirm, so a keypress is the whole interaction.
+    /// Commit a typed API key to `~/.sc/key` (mode 0600). An empty value is a
+    /// cancel, not a clear — removing the file is not offered from the menu
+    /// (delete `~/.sc/key` by hand to revert to env-only).
+    ///
+    /// On success this asks the host for an [`Outcome::Reload`] rather than
+    /// telling the user to restart `sc`. The running client holds the key it
+    /// was built with, so a save with no rebuild looks like it did nothing —
+    /// which is exactly how it read. The reload keeps the conversation and
+    /// adopts the key that was just typed even when the env var would outrank
+    /// it at startup: the user typed it into *this* process, so it is what
+    /// they mean for this run.
+    fn commit_api_key(&mut self, value: &str, project_dir: &Path) {
+        let value = value.trim();
+        if value.is_empty() {
+            self.editing = None;
+            self.editing_api_key = false;
+            self.status = Some("unchanged".into());
+            return;
+        }
+        // Read the env override *before* reload — env doesn't change, but the
+        // post-reload settings is the clean source of the resolved env-var name.
+        let env_name = self.settings.api_key_env.clone();
+        let env_set = std::env::var(&env_name)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
+        match rc_config::set_api_key(value) {
+            Ok(path) => {
+                self.editing = None;
+                self.editing_api_key = false;
+                self.settings = Settings::load(project_dir);
+                // The env var is still what a *fresh* `sc` resolves first, so
+                // a saved key that differs from it reverts on the next launch.
+                // Reloading now is honest about both halves.
+                self.status = Some(if env_set {
+                    format!(
+                        "saved to {} — reloading; ${env_name} still wins at next launch",
+                        path.display()
+                    )
+                } else {
+                    format!("saved to {} — reloading sc", path.display())
+                });
+                self.pending_outcome = Some(Outcome::Reload);
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
     pub fn cycle_current(&mut self, delta: i32, project_dir: &Path) {
         let Some(field) = self.current_field() else {
             return;
@@ -313,7 +424,7 @@ pub(crate) fn group_projects(sessions: Vec<SessionInfo>) -> Vec<Project> {
     let mut projects: Vec<Project> = by_dir
         .into_iter()
         .map(|(dir, mut sessions)| {
-            sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+            sessions.sort_by_key(|a| std::cmp::Reverse(a.modified));
             let last = sessions
                 .first()
                 .map(|s| s.modified)
@@ -325,7 +436,7 @@ pub(crate) fn group_projects(sessions: Vec<SessionInfo>) -> Vec<Project> {
             }
         })
         .collect();
-    projects.sort_by(|a, b| b.last.cmp(&a.last));
+    projects.sort_by_key(|a| std::cmp::Reverse(a.last));
     projects
 }
 
@@ -533,6 +644,86 @@ mod tests {
         );
     }
 
+    /// The root menu offers "Change API key" alongside Projects and Settings —
+    /// it's the one setting that can't live in `settings.json`.
+    #[test]
+    fn root_menu_offers_change_api_key() {
+        let m = state_with(vec![]);
+        assert!(m.rows().contains(&Row::ChangeApiKey));
+    }
+
+    /// The API-key editor opens an empty, masked buffer (never prefilled with
+    /// the current secret) and flags itself so `commit` routes to `~/.sc/key`.
+    #[test]
+    fn api_key_editor_opens_empty_and_masked() {
+        let mut m = state_with(vec![]);
+        m.begin_api_key_edit();
+        assert_eq!(m.editing.as_deref(), Some(""));
+        assert!(m.editing_api_key, "must be flagged so render masks it");
+    }
+
+    /// An empty Enter in the API-key editor cancels without touching the key
+    /// file — clearing the key is not offered from the menu.
+    #[test]
+    fn api_key_empty_enter_cancels_without_clearing() {
+        let mut m = state_with(vec![]);
+        m.begin_api_key_edit();
+        m.commit("", Path::new("/nonexistent-project-dir"));
+        assert!(m.editing.is_none());
+        assert!(!m.editing_api_key);
+        assert_eq!(m.status.as_deref(), Some("unchanged"));
+        assert!(
+            m.pending_outcome.is_none(),
+            "a cancel must not reload the agent"
+        );
+    }
+
+    /// A bracketed paste lands in the open editor — the whole point of the
+    /// API-key row, since a key is pasted and never typed.
+    #[test]
+    fn paste_fills_the_open_editor() {
+        let mut m = state_with(vec![]);
+        m.begin_api_key_edit();
+        assert!(
+            m.paste("sk-pasted-key"),
+            "an open editor consumes the paste"
+        );
+        assert_eq!(m.editing.as_deref(), Some("sk-pasted-key"));
+        assert!(m.status.is_none(), "a clean paste needs no remark");
+    }
+
+    /// A key copied from a browser or password manager usually carries a
+    /// trailing newline; it must not survive into the value, and it must not
+    /// reach the key handler as Enter.
+    #[test]
+    fn paste_strips_a_trailing_newline_and_takes_one_line() {
+        let mut m = state_with(vec![]);
+        m.begin_api_key_edit();
+        m.paste("sk-pasted-key\n");
+        assert_eq!(m.editing.as_deref(), Some("sk-pasted-key"));
+
+        m.begin_api_key_edit();
+        m.paste("sk-first\nsk-second\n");
+        assert_eq!(m.editing.as_deref(), Some("sk-first"));
+        assert!(
+            m.status
+                .as_deref()
+                .is_some_and(|s| s.contains("first line")),
+            "the dropped lines are called out, got {:?}",
+            m.status
+        );
+    }
+
+    /// With no editor open the menu declines the paste, so the caller can drop
+    /// it instead of feeding the hidden composer behind the modal.
+    #[test]
+    fn paste_is_declined_when_no_editor_is_open() {
+        let mut m = state_with(vec![]);
+        assert!(!m.paste("some text"));
+        assert!(m.editing.is_none());
+        assert!(m.status.is_none());
+    }
+
     #[test]
     fn ago_reads_coarsely() {
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -553,7 +744,9 @@ mod tests {
             projects: group_projects(sessions),
             settings: Settings::load(Path::new("/nonexistent-project-dir")),
             editing: None,
+            editing_api_key: false,
             status: None,
+            pending_outcome: None,
         }
     }
 }

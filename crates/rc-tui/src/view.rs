@@ -229,6 +229,12 @@ pub(crate) struct ViewState {
     /// `Some` it owns both the frame and the keymap, so there's no half-state
     /// where a keystroke lands in the composer hidden behind it.
     pub menu_overlay: Option<crate::menu::MenuState>,
+    /// Whether mouse capture is on. While it is, the app receives every drag
+    /// and the terminal never sees one, so text cannot be selected — the one
+    /// thing a terminal is otherwise always good for. Off hands the mouse back
+    /// for selection and copy, at the cost of wheel scrolling. Toggled with
+    /// Ctrl+O (`/select`).
+    pub mouse_capture: bool,
 }
 
 impl ViewState {
@@ -271,6 +277,7 @@ impl ViewState {
             last_input: None,
             process_started: Instant::now(),
             menu_overlay: None,
+            mouse_capture: true,
         }
     }
 
@@ -1100,6 +1107,14 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
     let p = theme::palette();
     // Scrolled up dominates: the user is navigating, so the "where am I"
     // indicator earns the corner.
+    // Select mode leads: the wheel is dead while it's on, and a user who
+    // forgot they toggled it would read that as the scroll having broken.
+    if !state.mouse_capture {
+        return vec![
+            Span::styled("select mode", p.accent()),
+            Span::styled(" · Ctrl+O restores scroll", p.chrome()),
+        ];
+    }
     let indicator = scroll_indicator(state);
     if !indicator.is_empty() {
         return vec![Span::styled(indicator, p.chrome())];
@@ -1562,16 +1577,24 @@ fn draw_menu_overlay(frame: &mut Frame, menu: &MenuState, area: Rect, now: Insta
     lines.push(Line::default());
     if let Some(buf) = &menu.editing {
         // An open editor replaces the help line — while typing, the only
-        // relevant keys are Enter and Esc.
+        // relevant keys are Enter and Esc. The API key is masked: a secret
+        // typed in clear is a shoulder-surfing leak.
+        let shown: String = if menu.editing_api_key {
+            "•".repeat(buf.chars().count())
+        } else {
+            buf.clone()
+        };
         lines.push(Line::from(vec![
             Span::styled("  > ".to_string(), p.accent()),
-            Span::styled(buf.clone(), p.body()),
+            Span::styled(shown, p.body()),
             Span::styled("█".to_string(), p.accent()),
         ]));
-        lines.push(Line::styled(
-            "  ↵ save · Esc cancel".to_string(),
-            p.chrome(),
-        ));
+        let hint = if menu.editing_api_key {
+            "  api key · ↵ save · Esc cancel"
+        } else {
+            "  ↵ save · Esc cancel"
+        };
+        lines.push(Line::styled(hint.to_string(), p.chrome()));
     } else {
         if let Some(field) = menu.current_field() {
             lines.push(Line::styled(format!("  {}", field.help), p.chrome()));
@@ -1631,6 +1654,26 @@ fn menu_row_line(menu: &MenuState, row: &Row, selected: bool, now: Instant) -> L
         }
         Row::Goto(MenuPage::Settings) => "Settings".to_string(),
         Row::Goto(_) => "…".to_string(),
+        Row::ChangeApiKey => {
+            // Never show the key itself — only where the active one came from,
+            // so the user can tell whether a save will take effect. Env wins, so
+            // a set env var is reported even when a key file also exists.
+            let env_set = std::env::var(&menu.settings.api_key_env)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some();
+            let source = if env_set {
+                format!("(set via ${})", menu.settings.api_key_env)
+            } else if rc_config::key_file_path()
+                .map(|p| p.exists())
+                .unwrap_or(false)
+            {
+                "(saved, ~/.sc/key)".to_string()
+            } else {
+                "(unset)".to_string()
+            };
+            format!("{:<20} {}", "Change API key", source)
+        }
         Row::Close => "Close".to_string(),
         Row::Project(dir) => match menu.project(dir) {
             Some(proj) => format!(
@@ -1781,7 +1824,9 @@ mod tests {
             ]),
             settings: rc_config::Settings::load(std::path::Path::new("/nonexistent")),
             editing: None,
+            editing_api_key: false,
             status: None,
+            pending_outcome: None,
         }
     }
 
@@ -1800,6 +1845,66 @@ mod tests {
         assert!(screen.contains("2 projects"), "project count: {screen}");
         assert!(screen.contains("Settings"), "settings entry: {screen}");
         assert!(screen.contains("↵ select"), "key hints: {screen}");
+    }
+
+    /// The root menu offers "Change API key" — the one setting that can't live
+    /// in `settings.json` — with its source indicator (env / key file / unset).
+    #[test]
+    fn menu_root_lists_change_api_key() {
+        let screen = menu_screen(crate::menu::MenuPage::Root);
+        assert!(screen.contains("Change API key"), "entry: {screen}");
+        // Exactly one source indicator is shown; which one depends on the
+        // test env, so assert the label format rather than a specific source.
+        assert!(
+            screen.contains("(set via $")
+                || screen.contains("(saved, ~/.sc/key)")
+                || screen.contains("(unset)"),
+            "source indicator: {screen}"
+        );
+    }
+
+    /// Select mode has to announce itself: with capture released the wheel
+    /// stops scrolling, and a user who forgot they toggled it would read that
+    /// as the scroll being broken.
+    #[test]
+    fn select_mode_owns_the_status_hint() {
+        let mut state = ViewState::new("gw-glm-5.2".into());
+        let plain = rendered_sized(&mut state, 78, 10);
+        assert!(
+            !plain.contains("select mode"),
+            "not advertised while capture is on: {plain}"
+        );
+
+        state.mouse_capture = false;
+        let screen = rendered_sized(&mut state, 78, 10);
+        assert!(screen.contains("select mode"), "mode shown: {screen}");
+        assert!(
+            screen.contains("Ctrl+O"),
+            "the way back is on screen: {screen}"
+        );
+    }
+
+    /// The API-key editor never puts the secret on screen: the buffer renders
+    /// as bullets. A key typed in clear is a shoulder-surfing leak, and a
+    /// terminal scrollback (or a screenshot) keeps it.
+    #[test]
+    fn menu_api_key_editor_masks_the_typed_key() {
+        let mut state = ViewState::new("gw-glm-5.2".into());
+        let mut menu = sample_menu(crate::menu::MenuPage::Root);
+        menu.begin_api_key_edit();
+        menu.editing = Some("sk-secret-123".into());
+        state.menu_overlay = Some(menu);
+        let screen = rendered_sized(&mut state, 78, 18);
+
+        assert!(
+            !screen.contains("sk-secret-123"),
+            "the key must never be rendered: {screen}"
+        );
+        assert!(
+            screen.contains(&"•".repeat("sk-secret-123".len())),
+            "expected one bullet per character: {screen}"
+        );
+        assert!(screen.contains("api key · ↵ save"), "editor hint: {screen}");
     }
 
     /// Projects are grouped directories with a session count and recency —

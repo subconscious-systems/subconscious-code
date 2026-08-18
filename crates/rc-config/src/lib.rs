@@ -6,9 +6,12 @@
 //!   on top. Enterprise/locked settings, JSON Schema validation, and hot-reload
 //!   land in later milestones (G1/G4/G5).
 //!
-//! The API key is never stored in a settings file — it is resolved from the
-//! env var named by `provider.api_key_env` (default `SC_API_KEY`). `sc doctor`
-//! (G7) will complain loudly if a key-shaped string appears in any file.
+//! The API key is resolved from the env var named by `provider.api_key_env`
+//! (default `SC_API_KEY`), falling back to `~/.sc/key` — a dedicated file the
+//! TUI `/menu` "Change API key" option writes at mode 0600 — when the env var
+//! is unset. It is never stored in a *settings* file: `sc doctor` (G7)
+//! complains loudly if a key-shaped string appears in a settings file. The
+//! `~/.sc/key` file is the sanctioned exception.
 //!
 //! M3 adds the `permissions` block (§7.1/§10.2): allow/ask/deny rule lists,
 //! `defaultMode`, and `additionalDirectories`.
@@ -26,6 +29,10 @@ pub mod edit;
 pub struct Settings {
     pub base_url: String,
     pub api_key: Option<String>,
+    /// The env var the key was resolved from (default `SC_API_KEY`, overridable
+    /// via `provider.api_key_env`). Exposed so the TUI can warn when a saved
+    /// `~/.sc/key` is shadowed by the env var.
+    pub api_key_env: String,
     pub model: String,
     /// Model names saved to switch between, from `settings.json`'s `models`
     /// array. A roster for the UI, not a behavior setting: nothing in the
@@ -401,7 +408,7 @@ impl Settings {
             }
         }
 
-        let api_key = std::env::var(&api_key_env).ok().filter(|s| !s.is_empty());
+        let api_key = resolve_api_key(&api_key_env);
 
         Settings {
             base_url,
@@ -418,6 +425,7 @@ impl Settings {
                 models
             },
             api_key,
+            api_key_env,
             model,
             small_model,
             timeout_ms,
@@ -457,6 +465,78 @@ fn user_settings_path() -> Option<PathBuf> {
 
 fn project_settings_path(project: &Path) -> Option<PathBuf> {
     Some(project.join(".sc").join("settings.json"))
+}
+
+/// `~/.sc/key` — the dedicated API-key file the TUI `/menu` "Change API key"
+/// option writes. It is the env var's fallback: [`Settings::load`] uses it
+/// only when the env var named by `provider.api_key_env` is unset. Created
+/// mode 0600 by [`set_api_key`].
+pub fn key_file_path() -> Option<PathBuf> {
+    user_dir().map(|d| d.join("key"))
+}
+
+/// Read and trim the key file; `None` if it is missing, empty, or blank. The
+/// loader calls this only as the env var's fallback, so a present file never
+/// overrides an explicit env var.
+fn read_key_file(path: &Path) -> Option<String> {
+    let v = std::fs::read_to_string(path).ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// The active API key: the env var named by `provider.api_key_env` first,
+/// then `~/.sc/key`. This is startup precedence — an explicit env var beats a
+/// file, so a scripted or CI invocation is never quietly overridden by
+/// whatever was last saved on that machine.
+pub fn resolve_api_key(env_name: &str) -> Option<String> {
+    std::env::var(env_name)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| key_file_path().and_then(|p| read_key_file(&p)))
+}
+
+/// Just the saved key from `~/.sc/key`, ignoring the environment.
+///
+/// The `/menu` reload path uses this rather than [`resolve_api_key`]: the user
+/// has *just* typed a key into this process, so it is the one they mean for
+/// this run even when the env var would otherwise outrank it. Startup
+/// precedence is untouched, so the next launch is back to env-first.
+pub fn saved_api_key() -> Option<String> {
+    key_file_path().and_then(|p| read_key_file(&p))
+}
+
+/// Write `value` to `~/.sc/key` (mode 0600), creating `~/.sc/` if needed. This
+/// is the persistence path for the TUI "Change API key" menu option. The env
+/// var still wins, so a saved key takes effect on the next `sc` launch unless
+/// the env var is set in the shell.
+pub fn set_api_key(value: &str) -> Result<PathBuf, String> {
+    let path = key_file_path().ok_or("HOME is not set; cannot locate ~/.sc/key")?;
+    write_key_file(&path, value)?;
+    Ok(path)
+}
+
+fn write_key_file(path: &Path, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("api key cannot be empty".into());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, format!("{value}\n"))
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Read + parse a settings file. M0 failed soft (a malformed or absent file
@@ -579,5 +659,40 @@ mod tests {
             s.models,
             s.model
         );
+    }
+
+    /// With the env var unset, the resolver is exactly the saved key — the
+    /// property the `/menu` reload leans on. (Asserted without mutating the
+    /// environment, which would race the other tests in this binary.)
+    #[test]
+    fn resolve_falls_back_to_the_saved_key_when_the_env_var_is_unset() {
+        assert_eq!(
+            resolve_api_key("SC_API_KEY_DEFINITELY_NOT_SET_IN_THIS_PROCESS"),
+            saved_api_key(),
+        );
+    }
+
+    /// The dedicated key file round-trips, trims surrounding whitespace, is
+    /// created mode 0600 on unix, and an empty/blank value is rejected (the
+    /// menu treats an empty Enter as a cancel, not a clear).
+    #[test]
+    fn key_file_round_trips_and_is_masked_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        write_key_file(&path, "  sk-test-1234567890  \n").unwrap();
+        assert_eq!(read_key_file(&path).as_deref(), Some("sk-test-1234567890"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key file must be 0600, got {:o}", mode);
+        }
+        // A blank file reads as None — the loader treats it as "no key".
+        std::fs::write(&path, "   \n").unwrap();
+        assert_eq!(read_key_file(&path), None);
+        // An empty value is rejected rather than writing a blank key file.
+        assert!(write_key_file(&path, "   ").is_err(), "empty key rejected");
+        // A missing file reads as None (no panic).
+        assert_eq!(read_key_file(&dir.path().join("absent")), None);
     }
 }

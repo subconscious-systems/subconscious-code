@@ -165,7 +165,9 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let api_key = settings
+    // Mutable because `/menu` can save a new key mid-run: the reload path below
+    // adopts it and rebuilds the client around it.
+    let mut api_key = settings
         .api_key
         .clone()
         .context("no API key: set $SC_API_KEY (or the var named by provider.api_key_env)")?;
@@ -303,11 +305,11 @@ async fn run(cli: Cli) -> Result<()> {
     // are session-independent (they come from settings) and are shared across
     // rebuilds; the context assembler is not — its environment block and
     // memory files are rooted at the session's cwd — so it is rebuilt here.
-    let build_agent = |session: &Session| -> Result<AgentLoop> {
+    let build_agent = |session: &Session, api_key: &str| -> Result<AgentLoop> {
         let client = Arc::new(
             ChatClient::new(
                 settings.base_url.clone(),
-                api_key.clone(),
+                api_key.to_string(),
                 session.model.clone(),
                 timeout,
             )?
@@ -327,7 +329,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Headless one-shot: run one turn and print the answer (§5.8 U14).
     if let Some(prompt) = cli.print.filter(|p| !p.is_empty()) {
-        return run_headless(build_agent(&session)?, session, prompt).await;
+        return run_headless(build_agent(&session, &api_key)?, session, prompt).await;
     }
 
     // Interactive TUI (M4) with persistence (M5), in a loop so `/menu` can
@@ -336,8 +338,11 @@ async fn run(cli: Cli) -> Result<()> {
     // which is precisely why the switch can't happen inside rc-tui.
     loop {
         let model_name = session.model.clone();
+        // Kept for the reload path, which needs them after `session` has moved
+        // into the TUI.
+        let session_id = session.id.clone();
         let next = run_tui(
-            Arc::new(build_agent(&session)?),
+            Arc::new(build_agent(&session, &api_key)?),
             session,
             model_name,
             sessions_dir.clone(),
@@ -346,7 +351,10 @@ async fn run(cli: Cli) -> Result<()> {
         )
         .await?;
         let Some(next) = next else { return Ok(()) };
-        let switched_to_existing = matches!(&next, rc_tui::Outcome::Resume(_));
+        // A reload re-enters the *same* session, so it restores that session's
+        // own mode exactly as a resume does.
+        let switched_to_existing =
+            matches!(&next, rc_tui::Outcome::Resume(_) | rc_tui::Outcome::Reload);
         let (next_session, next_path) = match next {
             rc_tui::Outcome::Resume(path) => {
                 let resumed = rc_session::load(&path)
@@ -357,6 +365,22 @@ async fn run(cli: Cli) -> Result<()> {
                 Session::new(fresh_session_id(), dir, settings.model.clone()),
                 None,
             ),
+            // `/menu` saved an API key. Adopt it — the user typed it into this
+            // process, so it wins here even where the env var would outrank it
+            // at startup — and reopen the same session from its own file, which
+            // already holds every turn (the store appends as they happen).
+            rc_tui::Outcome::Reload => {
+                if let Some(saved) = rc_config::saved_api_key() {
+                    api_key = saved;
+                }
+                let path = session_path
+                    .clone()
+                    .unwrap_or_else(|| sessions_dir.join(format!("{session_id}.jsonl")));
+                let reloaded = rc_session::load(&path).with_context(|| {
+                    format!("/menu: could not reopen {} to reload", path.display())
+                })?;
+                (reloaded, Some(path))
+            }
         };
         session = next_session;
         session_path = next_path;

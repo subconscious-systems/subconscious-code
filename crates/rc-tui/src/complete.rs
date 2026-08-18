@@ -80,6 +80,10 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
             "Show the active permission mode and rule hints",
         ),
         ("/doctor", "Run a self-check of the environment and config"),
+        (
+            "/select",
+            "Release the mouse so you can select and copy text (Ctrl+O)",
+        ),
         ("/history", "Summarize the transcript length so far"),
         ("/export", "Export the transcript to a file"),
         // Lifecycle.

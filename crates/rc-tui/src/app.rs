@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use crossterm::execute;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use rc_core::{AgentMode, AskResponse, ToolCall, ToolResultBody, Turn};
@@ -342,9 +343,15 @@ impl App {
                 KeyCode::Enter => {
                     let value = buf.clone();
                     menu.commit(&value, &cwd);
+                    // A saved API key can only take effect on a rebuilt
+                    // client, so the commit asks to leave and come back.
+                    if let Some(outcome) = menu.pending_outcome.take() {
+                        self.leave_with(outcome);
+                    }
                 }
                 KeyCode::Esc => {
                     menu.editing = None;
+                    menu.editing_api_key = false;
                     menu.status = None;
                 }
                 KeyCode::Backspace => {
@@ -395,20 +402,23 @@ impl App {
             crate::menu::Row::Goto(page) => menu.goto(page),
             crate::menu::Row::Project(dir) => menu.goto(crate::menu::MenuPage::Sessions(dir)),
             crate::menu::Row::Field(_) => menu.begin_edit(),
+            crate::menu::Row::ChangeApiKey => menu.begin_api_key_edit(),
             crate::menu::Row::Close => self.view.menu_overlay = None,
             // Both of these leave the TUI: the host rebuilds the agent for the
             // new session/directory and runs a fresh TUI over it.
-            crate::menu::Row::Session(path) => {
-                self.outcome = Some(crate::menu::Outcome::Resume(path));
-                self.runtime.action(UserAction::Quit);
-                self.quit = true;
-            }
-            crate::menu::Row::NewSession(dir) => {
-                self.outcome = Some(crate::menu::Outcome::NewIn(dir));
-                self.runtime.action(UserAction::Quit);
-                self.quit = true;
-            }
+            crate::menu::Row::Session(path) => self.leave_with(crate::menu::Outcome::Resume(path)),
+            crate::menu::Row::NewSession(dir) => self.leave_with(crate::menu::Outcome::NewIn(dir)),
         }
+    }
+
+    /// Leave the TUI with something for the host to do — switch sessions, or
+    /// rebuild this one. Everything cwd- or key-scoped is constructed above
+    /// this crate, so the only way to change it is to hand back an outcome and
+    /// let `main` run a fresh TUI over the rebuilt agent.
+    fn leave_with(&mut self, outcome: crate::menu::Outcome) {
+        self.outcome = Some(outcome);
+        self.runtime.action(UserAction::Quit);
+        self.quit = true;
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -600,6 +610,7 @@ impl App {
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => match c {
                 'w' | 'W' => self.delete_word(),
                 't' | 'T' => self.toggle_latest_reasoning(),
+                'o' | 'O' => self.toggle_mouse_capture(),
                 'u' | 'U' => {
                     self.view.composer.clear();
                     self.view.clear_paste_markers();
@@ -628,9 +639,14 @@ impl App {
     /// Native bracketed paste is deliberately separate from key handling:
     /// newlines stay inside the composer and cannot trigger Enter's submit arm.
     fn handle_paste(&mut self, text: &str) {
-        // Modal surfaces own their input. Never paste into the hidden composer
-        // while a settings editor or permission decision is in front of it.
-        if self.view.menu_overlay.is_some() || self.view.pending_ask.is_some() {
+        // Modal surfaces own their input. An open menu editor takes the paste
+        // (an API key is pasted, never typed); otherwise it is dropped rather
+        // than landing in the composer hidden behind the modal.
+        if let Some(menu) = self.view.menu_overlay.as_mut() {
+            menu.paste(text);
+            return;
+        }
+        if self.view.pending_ask.is_some() {
             return;
         }
         if self.view.append_paste(text) == 0 {
@@ -973,6 +989,9 @@ impl App {
                 self.view
                     .transcript
                     .push(mk("  Ctrl+T       expand/collapse latest thought"));
+                self.view.transcript.push(mk(
+                    "  Ctrl+O       select mode: drag to select/copy (wheel off)",
+                ));
                 self.view
                     .transcript
                     .push(mk("  Ctrl+W / U   delete word / clear the line"));
@@ -1059,6 +1078,7 @@ impl App {
                     p.chrome(),
                 ));
             }
+            SlashAction::SelectMode => self.toggle_mouse_capture(),
             SlashAction::Permissions => {
                 let lines = vec![
                     format!("  mode   {:?}", self.view.mode),
@@ -1162,6 +1182,36 @@ impl App {
             .push(Line::styled(format!("» {msg}"), p.chrome()));
     }
 
+    /// Hand the mouse back to the terminal, or take it again.
+    ///
+    /// Mouse capture is what makes the wheel scroll the transcript, but it
+    /// also means the terminal never sees a drag — so there is no way to
+    /// select text, and copy/paste out of `sc` is impossible. Neither state is
+    /// right all the time, so it is a toggle rather than a default, and the
+    /// status bar says which one is live.
+    fn toggle_mouse_capture(&mut self) {
+        let p = theme::palette();
+        self.view.mouse_capture = !self.view.mouse_capture;
+        let mut out = std::io::stdout();
+        // Best-effort: a terminal that rejects the sequence leaves the flag
+        // and the hint consistent with each other, which is all the rest of
+        // the app reads.
+        let _ = if self.view.mouse_capture {
+            execute!(out, EnableMouseCapture)
+        } else {
+            execute!(out, DisableMouseCapture)
+        };
+        let msg = if self.view.mouse_capture {
+            "select mode off — the wheel scrolls the transcript again"
+        } else {
+            "select mode on — drag to select, then copy with your terminal; Ctrl+O to restore wheel scrolling"
+        };
+        self.view
+            .transcript
+            .push(Line::styled(format!("» {msg}"), p.chrome()));
+        self.jump_to_bottom();
+    }
+
     /// If `text` is a recognized slash command, return its host-side action.
     /// Returns `None` for anything else (including `@`-prefixed text), so the
     /// text is submitted as a normal prompt. Aliases (e.g. `/h`, `/c`, `/q`)
@@ -1190,6 +1240,7 @@ impl App {
             "/model" => Some(SlashAction::Model),
             "/mode" => Some(SlashAction::CycleMode),
             "/permissions" => Some(SlashAction::Permissions),
+            "/select" | "/mouse" => Some(SlashAction::SelectMode),
             "/doctor" => Some(SlashAction::Doctor),
             "/history" => Some(SlashAction::History),
             "/export" => Some(SlashAction::Export),
@@ -1272,6 +1323,8 @@ enum SlashAction {
     Status,
     Model,
     Permissions,
+    /// Toggle mouse capture so the terminal can select text (`/select`).
+    SelectMode,
     Quit,
     Export,
     Doctor,
