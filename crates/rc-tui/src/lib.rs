@@ -59,15 +59,19 @@ pub fn run(
     cwd: PathBuf,
     initial_mode: rc_core::AgentMode,
     history: Vec<rc_core::Turn>,
+    mouse: bool,
 ) -> anyhow::Result<Option<Outcome>> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Off unless asked for. Capturing the mouse takes drag-to-select away from
+    // the terminal, and a terminal program that can't be copied out of is
+    // broken in a way no feature makes up for. `ui.mouse` (or Ctrl+O) turns on
+    // sc's own selection, which copies on release but needs a terminal that
+    // accepts OSC 52.
+    if mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -78,6 +82,7 @@ pub fn run(
         cwd,
         initial_mode,
         history,
+        mouse,
     );
 
     // Restore the terminal whatever happened above.

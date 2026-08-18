@@ -348,6 +348,7 @@ async fn run(cli: Cli) -> Result<()> {
             sessions_dir.clone(),
             mode,
             session_path.clone(),
+            settings.mouse,
         )
         .await?;
         let Some(next) = next else { return Ok(()) };
@@ -566,6 +567,7 @@ async fn run_tui(
     sessions_dir: PathBuf,
     initial_mode: AgentMode,
     resumed_path: Option<PathBuf>,
+    mouse: bool,
 ) -> Result<Option<rc_tui::Outcome>> {
     let cwd = session.cwd.clone();
     let history = session.messages.clone();
@@ -599,7 +601,7 @@ async fn run_tui(
 
     let runtime = rc_rt::Runtime::new(agent, session, store);
     match tokio::task::spawn_blocking(move || {
-        rc_tui::run(runtime, model_name, cwd, initial_mode, history)
+        rc_tui::run(runtime, model_name, cwd, initial_mode, history, mouse)
     })
     .await
     {

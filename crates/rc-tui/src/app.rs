@@ -107,8 +107,12 @@ pub(crate) fn run(
     cwd: PathBuf,
     initial_mode: AgentMode,
     history: Vec<Turn>,
+    mouse: bool,
 ) -> anyhow::Result<Option<crate::menu::Outcome>> {
     let mut app = App::new(runtime, model_name, cwd, history);
+    // The host already emitted the capture sequence (or didn't); this keeps
+    // the flag, the hint and Ctrl+O agreeing with the terminal's actual state.
+    app.view.mouse_capture = mouse;
     // The mode the host resolved — a resumed session's own mode, or the
     // configured default. Set before the first draw so the status bar agrees
     // with the engine from frame one instead of claiming "default" until
@@ -1049,12 +1053,12 @@ impl App {
                 self.view
                     .transcript
                     .push(mk("  Ctrl+T       expand/collapse latest thought"));
-                self.view
-                    .transcript
-                    .push(mk("  drag         select text — copied on release"));
-                self.view
-                    .transcript
-                    .push(mk("  Ctrl+O       hand the mouse to the terminal instead"));
+                self.view.transcript.push(mk(
+                    "  drag         select text with your terminal, then copy",
+                ));
+                self.view.transcript.push(mk(
+                    "  Ctrl+O       let sc take the mouse: in-app copy + wheel",
+                ));
                 self.view
                     .transcript
                     .push(mk("  Ctrl+W / U   delete word / clear the line"));
@@ -1265,9 +1269,9 @@ impl App {
             execute!(out, DisableMouseCapture)
         };
         let msg = if self.view.mouse_capture {
-            "select mode off — the wheel scrolls the transcript again"
+            "sc has the mouse — drag inside sc to select and copy; the wheel scrolls. Ctrl+O gives it back"
         } else {
-            "select mode on — the terminal handles selection now; Ctrl+O to restore wheel scrolling and in-app copy"
+            "mouse released — select and copy with your terminal as usual"
         };
         self.view
             .transcript

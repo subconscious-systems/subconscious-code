@@ -73,6 +73,12 @@ pub struct Settings {
     /// M8: gzip the request body (`Content-Encoding: gzip`). Off by default —
     /// the gateway must advertise support. Env `SC_REQUEST_GZIP`.
     pub request_gzip: bool,
+    /// Whether the TUI grabs the mouse. Off by default: with the mouse
+    /// captured the terminal never sees a drag, so its own select-and-copy
+    /// stops working — the behavior users expect from every other terminal
+    /// program. On, `sc` does its own selection and copies on release (which
+    /// needs a terminal that accepts OSC 52) and the wheel scrolls precisely.
+    pub mouse: bool,
 }
 
 /// The `permissions` block (§7.1/§10.2). Rule strings are parsed by rc-perm.
@@ -162,6 +168,14 @@ struct SettingsFile {
     permissions: Option<PermissionsConfig>,
     sandbox: Option<SandboxConfig>,
     context: Option<ContextConfig>,
+    ui: Option<UiFile>,
+}
+
+/// The `ui` block: terminal-interaction preferences.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct UiFile {
+    mouse: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -240,6 +254,10 @@ impl Settings {
         let mut sandbox = SandboxConfig::default();
         let mut context = ContextConfig::default();
         let mut request_gzip = false;
+        // Default off, matching every other terminal program: selection and
+        // copy keep working out of the box, and a user who wants in-app
+        // selection or wheel scrolling opts in (settings, SC_MOUSE, Ctrl+O).
+        let mut mouse = false;
 
         // Later layers override earlier ones. User before project so a
         // committed project file beats a user global — matches §10.1 (project
@@ -270,6 +288,11 @@ impl Settings {
                         }
                         if let Some(g) = p.request_gzip {
                             request_gzip = g;
+                        }
+                    }
+                    if let Some(ui) = file.ui {
+                        if let Some(m) = ui.mouse {
+                            mouse = m;
                         }
                     }
                     if let Some(m) = file.model {
@@ -365,6 +388,9 @@ impl Settings {
         if let Some(b) = env_bool("SC_REQUEST_GZIP") {
             request_gzip = b;
         }
+        if let Some(b) = env_bool("SC_MOUSE") {
+            mouse = b;
+        }
         // Context caps: `0` = unlimited, so an explicit `SC_TOOL_RESULT_CAP=0`
         // is a meaningful value and parses like any other.
         if let Ok(v) = std::env::var("SC_INLINE_FILE_CAP") {
@@ -440,6 +466,7 @@ impl Settings {
             sandbox,
             context,
             request_gzip,
+            mouse,
         }
     }
 }
@@ -659,6 +686,14 @@ mod tests {
             s.models,
             s.model
         );
+    }
+
+    /// The mouse is released by default: `sc` must not break the terminal's
+    /// own select-and-copy for a user who never asked it to.
+    #[test]
+    fn mouse_capture_is_off_unless_asked_for() {
+        let s = Settings::load(Path::new("/nonexistent-project-dir"));
+        assert!(!s.mouse, "default must leave the mouse to the terminal");
     }
 
     /// With the env var unset, the resolver is exactly the saved key — the

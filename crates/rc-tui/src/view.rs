@@ -324,7 +324,7 @@ impl ViewState {
             last_input: None,
             process_started: Instant::now(),
             menu_overlay: None,
-            mouse_capture: true,
+            mouse_capture: false,
             selection: None,
             selection_text: None,
             copy_pending: false,
@@ -1226,12 +1226,13 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
     }
     // Scrolled up dominates: the user is navigating, so the "where am I"
     // indicator earns the corner.
-    // Select mode leads: the wheel is dead while it's on, and a user who
-    // forgot they toggled it would read that as the scroll having broken.
-    if !state.mouse_capture {
+    // Captured is the non-default state and the surprising one: while sc holds
+    // the mouse, the terminal's own select-and-copy stops working, which reads
+    // as the terminal being broken unless the corner says who has the mouse.
+    if state.mouse_capture {
         return vec![
-            Span::styled("select mode", p.accent()),
-            Span::styled(" · Ctrl+O restores scroll", p.chrome()),
+            Span::styled("sc has the mouse", p.accent()),
+            Span::styled(" · Ctrl+O releases", p.chrome()),
         ];
     }
     let indicator = scroll_indicator(state);
@@ -2030,21 +2031,21 @@ mod tests {
         assert!(state.selection_text.is_none());
     }
 
-    /// Select mode has to announce itself: with capture released the wheel
-    /// stops scrolling, and a user who forgot they toggled it would read that
-    /// as the scroll being broken.
+    /// Capturing the mouse takes select-and-copy away from the terminal, so
+    /// that state has to announce itself — otherwise it reads as the terminal
+    /// having broken. The default (released) says nothing.
     #[test]
-    fn select_mode_owns_the_status_hint() {
+    fn captured_mouse_owns_the_status_hint() {
         let mut state = ViewState::new("gw-glm-5.2".into());
         let plain = rendered_sized(&mut state, 78, 10);
         assert!(
-            !plain.contains("select mode"),
-            "not advertised while capture is on: {plain}"
+            !plain.contains("has the mouse"),
+            "the default state is quiet: {plain}"
         );
 
-        state.mouse_capture = false;
+        state.mouse_capture = true;
         let screen = rendered_sized(&mut state, 78, 10);
-        assert!(screen.contains("select mode"), "mode shown: {screen}");
+        assert!(screen.contains("has the mouse"), "state shown: {screen}");
         assert!(
             screen.contains("Ctrl+O"),
             "the way back is on screen: {screen}"
