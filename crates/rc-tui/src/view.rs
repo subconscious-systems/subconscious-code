@@ -7,15 +7,19 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use rc_core::{AgentMode, Usage};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::complete::Completion;
 use crate::menu::{ago, MenuPage, MenuState, Row};
 use crate::theme;
+
+type FileSnapshots = (Option<std::sync::Arc<[u8]>>, Option<std::sync::Arc<[u8]>>);
 
 /// A pending permission ask the user must answer before the turn proceeds.
 #[derive(Clone)]
@@ -74,6 +78,7 @@ struct ToolBlock {
 /// to anchor the expanded block in the viewport.
 pub(crate) struct TranscriptToggle {
     pub summary_index: usize,
+    #[cfg(test)]
     pub expanded: bool,
 }
 
@@ -147,8 +152,8 @@ pub(crate) struct ViewState {
     /// Frozen duration once answer text begins. Without this, a reasoning block
     /// would incorrectly include the time spent streaming the final answer.
     pub reasoning_elapsed: Option<Duration>,
-    /// Completed reasoning bodies, normally hidden behind `thought for N.NNs`
-    /// rows and restored in-place when the user presses Ctrl+T.
+    /// Completed reasoning bodies, normally hidden behind clickable
+    /// `thought for N.NNs` rows and restored in place when selected.
     reasoning_blocks: Vec<ReasoningBlock>,
     /// Click targets for visible reasoning summaries, refreshed by
     /// `draw_transcript` after its exact wrap/scroll calculation.
@@ -205,6 +210,10 @@ pub(crate) struct ViewState {
     /// the spinner phase. `None` while idle. Set optimistically on submit so
     /// the indicator appears instantly, refreshed on `Ready`.
     pub turn_started: Option<Instant>,
+    /// Net file mutations in the active turn. The first `before` snapshot and
+    /// latest `after` snapshot are retained per path, so editing the same line
+    /// twice counts once in the final turn divider rather than twice.
+    pub turn_file_changes: HashMap<PathBuf, FileSnapshots>,
     /// Number of tool calls in flight (a batch may run several at once). The
     /// live tool-spinner line shows while this is > 0.
     pub running: u32,
@@ -322,6 +331,7 @@ impl ViewState {
             scroll_top: 0,
             area_height: 0,
             turn_started: None,
+            turn_file_changes: HashMap::new(),
             running: 0,
             running_tool: None,
             stream_chars: 0,
@@ -404,14 +414,10 @@ impl ViewState {
         );
     }
 
-    /// Whether Ctrl+T has a completed reasoning block to toggle.
-    pub(crate) fn has_completed_reasoning(&self) -> bool {
-        !self.reasoning_blocks.is_empty()
-    }
-
     /// Expand/collapse the most recent completed reasoning block in place.
     /// Completed bodies are retained in `reasoning_blocks`, so collapsing is a
     /// presentation choice rather than destructive compaction.
+    #[cfg(test)]
     pub(crate) fn toggle_latest_reasoning(&mut self) -> Option<TranscriptToggle> {
         let block_index = self.reasoning_blocks.len().checked_sub(1)?;
         self.toggle_reasoning(block_index)
@@ -471,6 +477,7 @@ impl ViewState {
 
         Some(TranscriptToggle {
             summary_index,
+            #[cfg(test)]
             expanded,
         })
     }
@@ -588,6 +595,7 @@ impl ViewState {
 
         Some(TranscriptToggle {
             summary_index,
+            #[cfg(test)]
             expanded,
         })
     }
@@ -707,10 +715,11 @@ fn parse_live(
     out
 }
 
-/// Parse assistant markdown and put the one-cell `logo.svg` reduction on its
-/// first visible line. This is deliberately the only conversation-side orange
-/// identity marker: user prompts use a neutral `>` echo, so the brand mark now
-/// means "model output" at a glance. Leading blank lines stay blank.
+/// Parse assistant markdown into a consistent two-cell response gutter. The
+/// first visible row carries the one-cell `logo.svg` reduction plus a space;
+/// every later visible row gets two spaces, so headings, prose, tables and code
+/// all align with the content after the mark. Leading/structural blank rows stay
+/// blank rather than acquiring invisible padding.
 fn parse_assistant_output(text: &str) -> Vec<Line<'static>> {
     let mut lines = crate::markdown::parse_blocks(text);
     if lines.is_empty() {
@@ -724,13 +733,20 @@ fn parse_assistant_output(text: &str) -> Vec<Line<'static>> {
                 .any(|span| !span.content.trim().is_empty())
         })
         .unwrap_or(0);
-    lines[first_visible].spans.insert(
-        0,
-        Span::styled(
-            format!("{} ", theme::DEFAULT_LOGO),
-            theme::palette().accent(),
-        ),
-    );
+    for (index, line) in lines.iter_mut().enumerate().skip(first_visible) {
+        if line.width() == 0 {
+            continue;
+        }
+        let gutter = if index == first_visible {
+            Span::styled(
+                format!("{} ", theme::DEFAULT_LOGO),
+                theme::palette().accent(),
+            )
+        } else {
+            Span::raw("  ")
+        };
+        line.spans.insert(0, gutter);
+    }
     lines
 }
 
@@ -753,19 +769,13 @@ fn reasoning_summary_line(elapsed: Option<Duration>, expanded: bool) -> Line<'st
 /// streaming. It is deliberately content-free and cannot expand until the
 /// phase completes and its precise duration is frozen.
 fn live_reasoning_line() -> Line<'static> {
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(logo_glyph().to_string(), theme::palette().accent()),
-    ])
+    Line::styled("Marathoning", theme::palette().chrome())
 }
 
-/// The live reasoning placeholder is exactly one fast-turning brand glyph.
-/// No reasoning text or multi-row art is materialized while the model thinks.
-fn animated_live_reasoning_line(now: Instant, process_started: Instant) -> Line<'static> {
-    Line::from(vec![
-        Span::raw("  "),
-        logo_spinner_span(now, Some(process_started)),
-    ])
+/// The live reasoning placeholder is a compact animated label. No reasoning
+/// text, logo, or multi-row art is materialized.
+fn animated_live_reasoning_line(now: Instant, started: Option<Instant>) -> Line<'static> {
+    Line::from(marathoning_spans(now, started))
 }
 
 fn reasoning_body_lines(reasoning: &str) -> Vec<Line<'static>> {
@@ -782,11 +792,11 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
     // loop's frequency happens to be — no per-frame accumulator needed.
     let now = Instant::now();
 
-    // Content is capped rather than stretched: a 200-column terminal spread a
-    // 40-column welcome card and 200-column transcript lines edge to edge,
-    // which is both ugly and hard to read (the eye loses the line start on the
-    // way back). Everything below lays out inside this.
-    let area = content_area(frame.area());
+    // The transcript and composer own the full terminal width. Turn dividers
+    // deliberately reach both edges; status chrome can keep the quiet outer
+    // margin on very wide screens.
+    let frame_area = frame.area();
+    let area = content_area(frame_area);
     // `/menu` is a modal: it takes the whole frame and the whole keymap, so
     // nothing behind it can be typed into by accident.
     if let Some(menu) = &state.menu_overlay {
@@ -808,7 +818,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
     let bottom = if state.pending_ask.is_some() {
         Constraint::Length(4)
     } else {
-        let inner_w = area.width.saturating_sub(2).max(1);
+        let inner_w = frame_area.width.saturating_sub(2).max(1);
         let rows = composer_rows(&composer_display_text(state), inner_w).max(1) as u16;
         Constraint::Length(rows.min(MAX_COMPOSER_ROWS) + 2)
     };
@@ -822,11 +832,12 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
             Constraint::Length(1), // blank breathing room
             Constraint::Length(1), // status bar
             bottom,                // composer / ask
+            Constraint::Length(1), // model footer
         ])
-        .split(area);
+        .split(frame_area);
     draw_transcript(frame, state, chunks[0], now);
     frame.render_widget(Clear, chunks[1]); // keep the gap blank across frames
-    draw_status(frame, state, chunks[2], now);
+    draw_status(frame, state, content_area(chunks[2]), now);
     if let Some(ask) = &state.pending_ask {
         draw_ask(frame, ask, chunks[3]);
     } else {
@@ -836,6 +847,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
             draw_menu(frame, menu, chunks[3]);
         }
     }
+    draw_model_footer(frame, state, chunks[4]);
     // Last, over everything: the selection highlight is applied to the
     // finished buffer, and the text is read back out of it. Doing this after
     // every widget has drawn is what makes it work uniformly across the
@@ -905,7 +917,7 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     // the card is gone. `/clear` brings it back by emptying the transcript.
     if state.welcome_card_visible() {
         frame.render_widget(Clear, area);
-        draw_welcome_card(frame, state, area);
+        draw_welcome_card(frame, area);
         return;
     }
 
@@ -976,7 +988,8 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start);
     for i in start..end {
         if i < tr_len {
-            lines.push(state.transcript[i].clone());
+            let line = &state.transcript[i];
+            lines.push(full_width_turn_divider(line, w).unwrap_or_else(|| line.clone()));
         } else if has_stream {
             let stream_index = i - tr_len;
             if stream_index == 0
@@ -986,7 +999,10 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
                 // Replace only the cached content-free placeholder. This tiny
                 // line can animate every frame without re-parsing a growing
                 // markdown answer on every frame.
-                lines.push(animated_live_reasoning_line(now, state.process_started));
+                lines.push(animated_live_reasoning_line(
+                    now,
+                    state.reasoning_started.or(state.turn_started),
+                ));
             } else {
                 lines.push(state.current_parsed[stream_index].clone());
             }
@@ -996,16 +1012,27 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
             lines.push(live_lines[i - tr_len].clone());
         }
     }
-    // While the model streams, append a live typing caret to the end of the
-    // last visible line so the generation point is visible — the "still typing"
-    // cue. Shown while either reasoning or answer text is streaming, and only
-    // when the streaming content is in the visible window (`end > tr_len` means
-    // the last visible line is a streaming line, not a transcript one — avoids
-    // mis-marking an old line while scrolled up) and a turn is in flight.
-    if has_stream && state.busy && end > tr_len && !lines.is_empty() {
-        if let Some(last) = lines.last_mut() {
-            last.spans.push(stream_caret_span(state, now));
+    // Box-drawn Markdown tables have a useful natural width, but allowing a
+    // wider table to pass through Paragraph's ordinary word wrapper tears the
+    // border apart: each logical row wraps independently, so separators no
+    // longer line up. Keep the full box whenever it fits. On narrower screens,
+    // constrain its columns and wrap text inside each cell while rebuilding the
+    // box at the exact viewport width.
+    // Preserve the originating transcript index when one logical table/prose
+    // row becomes several pre-wrapped physical rows. Hit-testing below needs
+    // that mapping; `start + offset` is no longer valid after responsive
+    // expansion.
+    let mut line_sources: Vec<usize> = (start..end).collect();
+    if w > 0 {
+        let mut fitted = Vec::new();
+        let mut fitted_sources = Vec::new();
+        for (source, line) in line_sources.into_iter().zip(lines) {
+            let rows = responsive_content_lines(line, w);
+            fitted_sources.extend(std::iter::repeat_n(source, rows.len()));
+            fitted.extend(rows);
         }
+        lines = fitted;
+        line_sources = fitted_sources;
     }
     // Capture wrapped-row geometry before `lines` moves into the Paragraph.
     // Each tuple is (retained block, physical row, wrapped height, label width).
@@ -1018,7 +1045,7 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
                 .wrap(Wrap { trim: false })
                 .line_count(w)
                 .max(1);
-            let global_index = start + offset;
+            let global_index = line_sources[offset];
             if global_index < tr_len {
                 if let Some(block_index) = state
                     .reasoning_blocks
@@ -1105,17 +1132,372 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     frame.render_widget(paragraph.scroll((scroll_y, 0)), area);
 }
 
-/// The pre-conversation welcome card: the brand logo (the static half-block
-/// [`theme::splash_lines`] art) on the left, and the model + cwd + key hints
-/// on the right, both inside one bordered box. A real `Block` + horizontal
-/// `Layout` (not text-art) so it stays a proper box at any terminal width —
+/// Fit assistant content to the viewport before `Paragraph` sees it.
+///
+/// Oversized table rows become one or more rows of a constrained boxed table,
+/// so cells wrap internally and every border still meets. Other assistant lines
+/// are pre-wrapped with a hanging two-cell gutter; ratatui's default wrapper
+/// starts continuation rows at column zero and would lose that indentation.
+fn responsive_content_lines(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    if width == 0 || line.width() <= width as usize {
+        return vec![line];
+    }
+
+    let gutter_len = assistant_gutter_len(&line);
+    let gutter_width = if gutter_len == 1 {
+        line.spans[0].width()
+    } else {
+        0
+    };
+    let table_spans = &line.spans[gutter_len..];
+    let content_width = (width as usize).saturating_sub(gutter_width);
+    if table_spans.is_empty() || content_width == 0 {
+        return vec![line];
+    }
+
+    if let Some((left, middle, right, natural_widths, style)) = table_border(table_spans) {
+        if let Some(widths) = constrained_table_widths(&natural_widths, content_width) {
+            return vec![render_constrained_border(
+                line.spans.first().cloned().filter(|_| gutter_len == 1),
+                &widths,
+                left,
+                middle,
+                right,
+                style,
+            )];
+        }
+    }
+
+    if let Some((cells, natural_widths, separator_style)) = table_cells(table_spans) {
+        if let Some(widths) = constrained_table_widths(&natural_widths, content_width) {
+            return render_constrained_row(
+                line.spans.first().cloned().filter(|_| gutter_len == 1),
+                gutter_width,
+                cells,
+                &widths,
+                separator_style,
+            );
+        }
+    }
+
+    if gutter_len == 1 {
+        return wrap_assistant_line(line, width as usize, gutter_width);
+    }
+    vec![line]
+}
+
+fn assistant_gutter_len(line: &Line<'static>) -> usize {
+    line.spans.first().is_some_and(|span| {
+        let content = span.content.as_ref();
+        content == "  " || (content.ends_with(' ') && content.trim_end() == theme::DEFAULT_LOGO)
+    }) as usize
+}
+
+/// Parse `┌──┬──┐` / `├──┼──┤` / `└──┴──┘` and recover each natural cell
+/// width (the border segment includes the cell's two padding spaces).
+fn table_border(spans: &[Span<'static>]) -> Option<(char, char, char, Vec<usize>, Style)> {
+    let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    let chars: Vec<char> = text.chars().collect();
+    let (&left, &right) = (chars.first()?, chars.last()?);
+    let middle = match (left, right) {
+        ('┌', '┐') => '┬',
+        ('├', '┤') => '┼',
+        ('└', '┘') => '┴',
+        _ => return None,
+    };
+    let mut widths = Vec::new();
+    let mut segment = 0usize;
+    for ch in &chars[1..chars.len().saturating_sub(1)] {
+        if *ch == '─' {
+            segment += 1;
+        } else if *ch == middle && segment >= 2 {
+            widths.push(segment - 2);
+            segment = 0;
+        } else {
+            return None;
+        }
+    }
+    if segment < 2 {
+        return None;
+    }
+    widths.push(segment - 2);
+    Some((
+        left,
+        middle,
+        right,
+        widths,
+        spans.first().map_or_else(Style::new, |span| span.style),
+    ))
+}
+
+/// Split `│ cell │ cell │` while retaining inline styles and the natural padded
+/// width of every cell.
+fn table_cells(spans: &[Span<'static>]) -> Option<(Vec<Vec<Span<'static>>>, Vec<usize>, Style)> {
+    if spans.len() < 3
+        || spans.first().map(|span| span.content.as_ref()) != Some("│")
+        || spans.last().map(|span| span.content.as_ref()) != Some("│")
+    {
+        return None;
+    }
+
+    let separator_style = spans[0].style;
+    let mut cells: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut widths = Vec::new();
+    let mut cell: Vec<Span<'static>> = Vec::new();
+    for span in spans.iter().skip(1).cloned() {
+        if span.content.as_ref() == "│" {
+            let padded_width: usize = cell.iter().map(Span::width).sum();
+            widths.push(padded_width.saturating_sub(2));
+            trim_cell_spans(&mut cell);
+            cells.push(std::mem::take(&mut cell));
+        } else {
+            cell.push(span);
+        }
+    }
+    (!cells.is_empty()).then_some((cells, widths, separator_style))
+}
+
+/// Allocate the exact inner-width budget while favoring the natural size of
+/// short identifier columns. Large prose columns absorb the wrapping first.
+fn constrained_table_widths(natural: &[usize], table_width: usize) -> Option<Vec<usize>> {
+    let columns = natural.len();
+    let chrome = columns.checked_mul(3)?.checked_add(1)?; // `│ ` + ` │` per cell
+    let budget = table_width.checked_sub(chrome)?;
+    if columns == 0 || budget < columns {
+        return None;
+    }
+    if natural.iter().sum::<usize>() <= budget {
+        return Some(natural.to_vec());
+    }
+
+    let preferred: Vec<usize> = natural.iter().map(|width| (*width).clamp(1, 8)).collect();
+    let mut widths = if preferred.iter().sum::<usize>() <= budget {
+        preferred
+    } else {
+        vec![1; columns]
+    };
+    let desired: Vec<usize> = natural.iter().map(|width| (*width).max(1)).collect();
+    let mut remaining = budget.saturating_sub(widths.iter().sum());
+    while remaining > 0 {
+        let mut progressed = false;
+        for (width, target) in widths.iter_mut().zip(&desired) {
+            if remaining == 0 {
+                break;
+            }
+            if *width < *target {
+                *width += 1;
+                remaining -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    Some(widths)
+}
+
+fn render_constrained_border(
+    gutter: Option<Span<'static>>,
+    widths: &[usize],
+    left: char,
+    middle: char,
+    right: char,
+    style: Style,
+) -> Line<'static> {
+    let mut border = String::from(left);
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            border.push(middle);
+        }
+        border.extend(std::iter::repeat_n('─', width + 2));
+    }
+    border.push(right);
+    let mut spans = Vec::with_capacity(2);
+    if let Some(gutter) = gutter {
+        spans.push(gutter);
+    }
+    spans.push(Span::styled(border, style));
+    Line::from(spans)
+}
+
+fn render_constrained_row(
+    gutter: Option<Span<'static>>,
+    gutter_width: usize,
+    cells: Vec<Vec<Span<'static>>>,
+    widths: &[usize],
+    separator_style: Style,
+) -> Vec<Line<'static>> {
+    let wrapped: Vec<Vec<Vec<Span<'static>>>> = cells
+        .iter()
+        .zip(widths)
+        .map(|(cell, width)| wrap_styled_spans(cell, *width))
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    let mut lines = Vec::with_capacity(height);
+    for row in 0..height {
+        let mut spans = Vec::new();
+        if row == 0 {
+            if let Some(gutter) = gutter.clone() {
+                spans.push(gutter);
+            }
+        } else if gutter_width > 0 {
+            spans.push(Span::raw(" ".repeat(gutter_width)));
+        }
+        spans.push(Span::styled("│", separator_style));
+        for (column, width) in widths.iter().enumerate() {
+            spans.push(Span::styled(" ", separator_style));
+            let content = wrapped
+                .get(column)
+                .and_then(|rows| rows.get(row))
+                .cloned()
+                .unwrap_or_default();
+            let used: usize = content.iter().map(Span::width).sum();
+            spans.extend(content);
+            if used < *width {
+                spans.push(Span::raw(" ".repeat(width - used)));
+            }
+            spans.push(Span::styled(" │", separator_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Pre-wrap ordinary assistant prose with the same gutter on every physical
+/// row. This is the hanging indent ratatui's `Wrap` does not provide.
+fn wrap_assistant_line(
+    line: Line<'static>,
+    width: usize,
+    gutter_width: usize,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(gutter_width).max(1);
+    let wrapped = wrap_styled_spans(&line.spans[1..], content_width);
+    let line_style = line.style;
+    let first_gutter = line.spans[0].clone();
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| {
+            let mut spans = Vec::with_capacity(content.len() + 1);
+            if index == 0 {
+                spans.push(first_gutter.clone());
+            } else {
+                spans.push(Span::raw(" ".repeat(gutter_width)));
+            }
+            spans.extend(content);
+            Line::from(spans).style(line_style)
+        })
+        .collect()
+}
+
+/// Word-wrap styled spans, retaining style boundaries and hard-breaking a
+/// single token only when it cannot fit on an empty row.
+fn wrap_styled_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut glyphs: Vec<(char, Style, usize)> = Vec::new();
+    for span in spans {
+        for ch in span.content.chars() {
+            let cell_width = Span::raw(ch.to_string()).width().max(1);
+            glyphs.push((ch, span.style, cell_width));
+        }
+    }
+    if glyphs.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+    while start < glyphs.len() {
+        while start < glyphs.len() && glyphs[start].0.is_whitespace() {
+            start += 1;
+        }
+        if start >= glyphs.len() {
+            break;
+        }
+
+        let mut end = start;
+        let mut used = 0usize;
+        let mut last_space = None;
+        while end < glyphs.len() {
+            let next = glyphs[end].2;
+            if used + next > width {
+                break;
+            }
+            used += next;
+            if glyphs[end].0.is_whitespace() {
+                last_space = Some(end);
+            }
+            end += 1;
+        }
+
+        let (cut, mut next_start) = if end == glyphs.len() {
+            (end, end)
+        } else if let Some(space) = last_space.filter(|space| *space > start) {
+            (space, space + 1)
+        } else if end > start {
+            (end, end)
+        } else {
+            (start + 1, start + 1)
+        };
+        while next_start < glyphs.len() && glyphs[next_start].0.is_whitespace() {
+            next_start += 1;
+        }
+        rows.push(glyphs_to_spans(&glyphs[start..cut]));
+        start = next_start;
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
+fn glyphs_to_spans(glyphs: &[(char, Style, usize)]) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (ch, style, _) in glyphs {
+        if let Some(last) = spans.last_mut().filter(|span| span.style == *style) {
+            last.content.to_mut().push(*ch);
+        } else {
+            spans.push(Span::styled(ch.to_string(), *style));
+        }
+    }
+    spans
+}
+
+/// Remove table padding across span boundaries without losing cell styling.
+fn trim_cell_spans(spans: &mut Vec<Span<'static>>) {
+    while spans
+        .first()
+        .is_some_and(|span| span.content.trim().is_empty())
+    {
+        spans.remove(0);
+    }
+    if let Some(first) = spans.first_mut() {
+        let trimmed = first.content.trim_start().to_string();
+        first.content = trimmed.into();
+    }
+
+    while spans
+        .last()
+        .is_some_and(|span| span.content.trim().is_empty())
+    {
+        spans.pop();
+    }
+    if let Some(last) = spans.last_mut() {
+        let trimmed = last.content.trim_end().to_string();
+        last.content = trimmed.into();
+    }
+}
+
+/// The pre-conversation welcome card: the brand logo (an adaptive half-block
+/// raster of `logo.svg`) on the left, and the model + cwd + key hints
+/// on the right in one unbordered horizontal layout. A real `Layout` keeps
+/// both columns aligned at any terminal width —
 /// the info column wraps within its space on narrow terminals instead of
-/// breaking. Sized to the logo's height (8 rows + 2 border) and clamped to
-/// the area.
+/// breaking. Sized to the taller of the eight-row logo and wrapped info.
 ///
 /// Deliberately static: motion here would compete with the composer for
 /// attention on an idle screen. In-turn motion uses only the one-cell logo.
-fn draw_welcome_card(frame: &mut Frame, state: &ViewState, area: Rect) {
+fn draw_welcome_card(frame: &mut Frame, area: Rect) {
     let p = theme::palette();
 
     // Key hints, one grammar throughout: a key, then an imperative verb. The
@@ -1133,61 +1515,94 @@ fn draw_welcome_card(frame: &mut Frame, state: &ViewState, area: Rect) {
         ("Ctrl+C", "quit"),
     ];
 
-    let mut lines: Vec<Line<'static>> = vec![
+    let lines: Vec<Line<'static>> = vec![
         // One mark, one name. The glyph *is* the brand element, so the name
         // does not need a second one beside it.
         Line::from(vec![
             Span::styled(format!("{} ", theme::logo_glyph()), p.accent()),
             Span::styled("Subconscious Code", p.accent()),
         ]),
-        Line::from(vec![
-            Span::styled("  model  ", p.chrome()),
-            // Body, not chrome: dim gray over a transparent background with
-            // something bright behind it is unreadable, and this is content.
-            Span::styled(state.model_name.clone(), p.body()),
-        ]),
+        // Keep the eight-row intro aligned with the eight-row logo after the
+        // model moves to its persistent footer beneath the composer.
         Line::default(),
-    ];
-    for (key, label) in hints {
-        lines.push(Line::from(vec![
+        Line::default(),
+    ]
+    .into_iter()
+    .chain(hints.iter().map(|(key, label)| {
+        Line::from(vec![
             Span::styled(format!("  {key:<11}"), p.code()),
             Span::styled((*label).to_string(), p.body()),
-        ]));
-    }
+        ])
+    }))
+    .collect();
 
-    // Sits directly above the composer rather than floating at the top of an
-    // empty screen: the eye should travel from "what this is" to "where you
-    // type" in one short hop, and the transcript pushes the card off the top
-    // as soon as there is one.
-    let card_h = (lines.len() as u16).min(area.height);
+    // Use the highest-resolution SVG raster that leaves enough room for the
+    // onboarding copy. Narrow or short terminals keep the compact glyph,
+    // since clipping a large logo would make both columns less useful.
+    let splash = welcome_logo(area);
+    let splash_width = splash.map_or(0, |logo| logo.width);
+    let info_width = area.width.saturating_sub(splash_width).max(1);
+    let info_height = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(info_width) as u16;
+    let splash_height = splash.map_or(0, |logo| logo.height);
+
+    // The start screen belongs at the top, where a terminal session begins.
+    // Conversation content replaces it as soon as the first turn starts.
+    let card_h = info_height.max(splash_height).min(area.height);
     let card = Rect {
         x: area.x,
-        y: area.y + area.height.saturating_sub(card_h),
+        y: area.y,
         width: area.width,
         height: card_h,
     };
     // No border. The indent alone groups it, which leaves the box outline free
     // to mean "this is the interactive element" — see `draw_composer`.
-    frame.render_widget(Paragraph::new(lines), card);
+    if let Some(logo) = splash {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(splash_width), Constraint::Min(1)])
+            .split(card);
+        // Borrow the embedded raster directly: no SVG parsing, file read, or
+        // per-frame String/Line allocation on the startup screen.
+        frame.render_widget(Paragraph::new(logo.art).style(p.accent()), columns[0]);
+        let info_area = Rect {
+            x: columns[1].x,
+            y: columns[1]
+                .y
+                .saturating_add(columns[1].height.saturating_sub(info_height)),
+            width: columns[1].width,
+            height: info_height.min(columns[1].height),
+        };
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info_area);
+    } else {
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), card);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WelcomeLogo {
+    art: &'static str,
+    width: u16,
+    height: u16,
+}
+
+/// Select the densest faithful `logo.svg` raster the start screen can show.
+/// Width includes two blank cells between the image and onboarding copy.
+fn welcome_logo(area: Rect) -> Option<WelcomeLogo> {
+    const MIN_INFO_WIDTH: u16 = 46;
+    const GAP: u16 = 2;
+    const LOGO: WelcomeLogo = WelcomeLogo {
+        art: theme::LOGO_ART_SMALL,
+        width: 16 + GAP,
+        height: 8,
+    };
+
+    (area.height >= LOGO.height && area.width >= LOGO.width + MIN_INFO_WIDTH).then_some(LOGO)
 }
 
 fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
     let p = theme::palette();
-
-    // While busy, show the elapsed turn time once it crosses a second — a
-    // Codex-style "how long has this been going" readout. Sub-second, keep
-    // the word "working" so the state reads at a glance (and tests stay
-    // stable).
-    let activity = if state.busy {
-        let secs = elapsed_secs(now, state.turn_started);
-        if secs >= 1 {
-            format!("{secs}s")
-        } else {
-            "working".to_string()
-        }
-    } else {
-        "idle".to_string()
-    };
 
     // Left side: the primary, at-a-glance facts. Built from spans so the parts
     // that matter (model, mode, the headline numbers) read in the default
@@ -1197,19 +1612,24 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
     // (dangerous), so Shift+Tab's state is unmistakable.
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::raw(" "));
-    // State first, and carried by a colored glyph: whether sc is working or
-    // waiting is the one thing worth reading without parsing a word.
+    // Active work gets a live state prefix. At idle there is deliberately no
+    // permanent indicator; the location becomes the first status-bar field.
     if state.busy {
+        // Once a turn crosses a second, replace "working" with its elapsed
+        // time so long-running work stays legible at a glance.
+        let secs = elapsed_secs(now, state.turn_started);
+        let activity = if secs >= 1 {
+            format!("{secs}s")
+        } else {
+            "working".to_string()
+        };
         spans.push(logo_spinner_span(now, state.turn_started));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(activity.clone(), p.accent()));
-    } else {
-        spans.push(Span::styled("●", p.semantic(Color::Green)));
-        spans.push(Span::styled(" idle", p.body()));
+        spans.push(Span::styled(activity, p.accent()));
+        spans.push(Span::styled(" · ", p.chrome()));
     }
-    spans.push(Span::styled(" · ", p.chrome()));
-    // Where you are, not what model you're on. The model is on the welcome
-    // card and in `/status`; the location is the thing that scrolls off the
+    // Where you are, not what model you're on. The model has its own footer
+    // below the composer; the location is the thing that scrolls off the
     // top of the transcript and never comes back, so it earns the persistent
     // slot.
     spans.push(Span::styled(state.location.clone(), p.body()));
@@ -1252,21 +1672,116 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// The widest the interface draws, however wide the terminal is. Prose stops
-/// being readable somewhere past this, and the chrome has nothing like this
-/// much to say.
-const MAX_CONTENT_WIDTH: u16 = 100;
+/// Persistent model metadata directly beneath the primary input surface.
+fn draw_model_footer(frame: &mut Frame, state: &ViewState, area: Rect) {
+    let p = theme::palette();
+    let line = Line::from(Span::styled(format!(" {}", state.model_name), p.body()));
+    frame.render_widget(Paragraph::new(line), area);
+}
 
-/// Cap `area` at [`MAX_CONTENT_WIDTH`], left-aligned with a one-column margin
-/// so the interface hugs the side a terminal's text already starts at rather
-/// than floating in the middle.
+/// Use almost the whole terminal. Wide screens keep one quiet column on each
+/// side; narrower screens keep every available column for wrapped content.
 fn content_area(area: Rect) -> Rect {
+    if area.width <= 100 {
+        return area;
+    }
     Rect {
-        x: area.x,
+        x: area.x.saturating_add(1),
         y: area.y,
-        width: area.width.min(MAX_CONTENT_WIDTH),
+        width: area.width - 2,
         height: area.height,
     }
+}
+
+const TURN_DIVIDER_LEFT_MARKER: &str = "──────── ";
+const TURN_DIVIDER_RIGHT_MARKER: &str = " ────────";
+
+/// A compact transcript marker for a completed turn. It is expanded to the
+/// current terminal width by [`full_width_turn_divider`] during rendering, so
+/// resizes do not leave a stale short rule in history.
+pub(crate) fn turn_divider_line(
+    duration: String,
+    lines_added: usize,
+    lines_removed: usize,
+) -> Line<'static> {
+    let p = theme::palette();
+    let changed = lines_added.saturating_add(lines_removed);
+    let noun = if changed == 1 { "line" } else { "lines" };
+    let label = if changed == 0 {
+        vec![Span::styled(
+            format!("worked for {duration} · 0 lines changed"),
+            p.accent_dim(),
+        )]
+    } else {
+        vec![
+            Span::styled(
+                format!("worked for {duration} · {changed} {noun} changed ("),
+                p.accent_dim(),
+            ),
+            Span::styled(format!("+{lines_added}"), p.semantic(Color::Green)),
+            Span::styled(" ", p.accent_dim()),
+            Span::styled(format!("-{lines_removed}"), p.semantic(Color::Red)),
+            Span::styled(")", p.accent_dim()),
+        ]
+    };
+    let mut spans = Vec::with_capacity(label.len() + 2);
+    spans.push(Span::styled(TURN_DIVIDER_LEFT_MARKER, p.chrome()));
+    spans.extend(label);
+    spans.push(Span::styled(TURN_DIVIDER_RIGHT_MARKER, p.chrome()));
+    Line::from(spans)
+}
+
+/// Recognize our compact turn marker and left-align its label inside a rule
+/// that occupies exactly `width` cells. Ordinary transcript lines return
+/// `None`.
+fn full_width_turn_divider(line: &Line<'static>, width: u16) -> Option<Line<'static>> {
+    if line.spans.len() < 3
+        || line.spans[0].content.as_ref() != TURN_DIVIDER_LEFT_MARKER
+        || line.spans.last()?.content.as_ref() != TURN_DIVIDER_RIGHT_MARKER
+        || !line.spans[1].content.starts_with("worked for ")
+    {
+        return None;
+    }
+
+    let width = width as usize;
+    let label = &line.spans[1..line.spans.len() - 1];
+    let label_width = label.iter().map(Span::width).sum::<usize>();
+    if width <= label_width {
+        let mut remaining = width;
+        let mut clipped = Vec::new();
+        for span in label {
+            if remaining == 0 {
+                break;
+            }
+            let content = span.content.chars().take(remaining).collect::<String>();
+            remaining = remaining.saturating_sub(content.chars().count());
+            clipped.push(Span::styled(content, span.style));
+        }
+        return Some(Line::from(clipped));
+    }
+    let available = width - label_width;
+    if available == 1 {
+        let mut spans = label.to_vec();
+        spans.push(Span::styled("─", line.spans.last()?.style));
+        return Some(Line::from(spans));
+    }
+    if available == 2 {
+        let mut spans = vec![Span::styled("─ ", line.spans[0].style)];
+        spans.extend_from_slice(label);
+        return Some(Line::from(spans));
+    }
+
+    // One rule cell and a space introduce the label; every remaining cell is
+    // assigned to the trailing rule so the timing reads from the left edge.
+    let right_width = available - 3;
+    let mut spans = Vec::with_capacity(label.len() + 2);
+    spans.push(Span::styled("─ ", line.spans[0].style));
+    spans.extend_from_slice(label);
+    spans.push(Span::styled(
+        format!(" {}", "─".repeat(right_width)),
+        line.spans.last()?.style,
+    ));
+    Some(Line::from(spans))
 }
 
 /// How long the "copied N chars" confirmation holds the status corner.
@@ -1285,15 +1800,6 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
     }
     // Scrolled up dominates: the user is navigating, so the "where am I"
     // indicator earns the corner.
-    // Captured is the non-default state and the surprising one: while sc holds
-    // the mouse, the terminal's own select-and-copy stops working, which reads
-    // as the terminal being broken unless the corner says who has the mouse.
-    if state.mouse_capture {
-        return vec![
-            Span::styled("sc has the mouse", p.accent()),
-            Span::styled(" · Ctrl+O releases", p.chrome()),
-        ];
-    }
     let indicator = scroll_indicator(state);
     if !indicator.is_empty() {
         // Body, not chrome: where you are in a held transcript is live state,
@@ -1313,11 +1819,6 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
         vec![
             Span::styled("Esc ", p.code()),
             Span::styled("clear", p.body()),
-        ]
-    } else if state.has_completed_reasoning() {
-        vec![
-            Span::styled("Ctrl+T ", p.code()),
-            Span::styled("thought", p.body()),
         ]
     } else {
         // Nothing to report. The corner stays empty rather than parking
@@ -1481,6 +1982,7 @@ fn draw_composer(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant)
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(p.accent_dim()),
         );
     frame.render_widget(paragraph.scroll((scroll_y, 0)), area);
@@ -1555,18 +2057,20 @@ fn logo_glyph() -> &'static str {
 /// One-cell phases of the six-petal mark. Cycling these clockwise-ordered
 /// silhouettes gives the tiny terminal reduction visible motion without
 /// expanding it into an ASCII-art block.
-const LOGO_SPINNER_FRAMES: [&str; 4] = ["✻", "✽", "✼", "✽"];
+const LOGO_SPINNER_FRAMES: [&str; 8] = ["✻", "✽", "✼", "✽", "✻", "✽", "✼", "✽"];
 /// A deliberately quick 22 fps turn; the busy poll loop runs at 125 Hz, so
 /// each phase is sampled smoothly without slowing streaming event delivery.
 const LOGO_SPINNER_FRAME_MS: u128 = 45;
+/// One complete text-shimmer sweep. Kept under a second so the activity reads
+/// as brisk without flickering at the TUI's 125 Hz render cadence.
+const MARATHON_SHIMMER_PERIOD_MS: u128 = 900;
 /// The caret holds solid this long after the last keystroke before it starts
 /// to blink, so typing doesn't fight a flicker.
 const CARET_HOLD: Duration = Duration::from_secs(1);
 /// Caret blink half-period.
 const CARET_BLINK_MS: u64 = 530;
 
-/// One fast clockwise turn of the tiny brand mark. This is also the only
-/// thinking animation in the transcript; no text shimmer or ASCII art.
+/// One fast clockwise turn of the tiny brand mark used for running tools.
 fn logo_spinner_span(now: Instant, started: Option<Instant>) -> Span<'static> {
     let p = theme::palette();
     if !theme::animations_enabled() {
@@ -1576,7 +2080,7 @@ fn logo_spinner_span(now: Instant, started: Option<Instant>) -> Span<'static> {
         .map(|s| now.saturating_duration_since(s).as_millis())
         .unwrap_or(0);
     let frame = (elapsed_ms / LOGO_SPINNER_FRAME_MS) as usize % LOGO_SPINNER_FRAMES.len();
-    Span::styled(LOGO_SPINNER_FRAMES[frame].to_string(), p.accent())
+    Span::styled(LOGO_SPINNER_FRAMES[frame].to_string(), p.loading(frame))
 }
 
 /// Whole seconds elapsed since a turn's epoch, 0 while idle.
@@ -1586,12 +2090,58 @@ fn elapsed_secs(now: Instant, started: Option<Instant>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Waiting for the first token is represented by only the tiny rotating mark.
+fn marathoning_label(now: Instant, started: Option<Instant>) -> String {
+    format!("Marathoning · {}s", elapsed_secs(now, started))
+}
+
+/// Match Codex's text shimmer: one fast sweep with ten characters of
+/// off-screen padding on each side and a cosine-softened five-character band.
+/// The animation is calculated from the current phase start so every new model
+/// request begins with a calm label before the highlight travels across it.
+fn marathoning_spans(now: Instant, started: Option<Instant>) -> Vec<Span<'static>> {
+    let p = theme::palette();
+    let label = marathoning_label(now, started);
+    if !theme::animations_enabled() {
+        return vec![Span::styled(label, p.chrome())];
+    }
+
+    let chars: Vec<char> = label.chars().collect();
+    let char_count = chars.len();
+    let elapsed = started
+        .map(|start| now.saturating_duration_since(start))
+        .unwrap_or_default();
+
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(index, ch)| {
+            let intensity = shimmer_intensity(index, char_count, elapsed);
+            Span::styled(ch.to_string(), p.shimmer(intensity))
+        })
+        .collect()
+}
+
+fn shimmer_intensity(index: usize, char_count: usize, elapsed: Duration) -> f32 {
+    let padding = 10usize;
+    let period = char_count + padding * 2;
+    let phase = (elapsed.as_millis() % MARATHON_SHIMMER_PERIOD_MS) as f32
+        / MARATHON_SHIMMER_PERIOD_MS as f32;
+    let pos = (phase * period as f32) as isize;
+    let char_pos = index as isize + padding as isize;
+    let band_half_width = 5.0;
+    let distance = (char_pos - pos).abs() as f32;
+    if distance <= band_half_width {
+        let x = std::f32::consts::PI * (distance / band_half_width);
+        0.5 * (1.0 + x.cos())
+    } else {
+        0.0
+    }
+}
+
+/// Waiting for the first token uses only the animated, timed label.
 fn thinking_lines(state: &ViewState, now: Instant) -> Vec<Line<'static>> {
-    vec![Line::from(vec![
-        Span::raw("  "),
-        logo_spinner_span(now, state.turn_started),
-    ])]
+    let started = state.reasoning_started.or(state.turn_started);
+    vec![Line::from(marathoning_spans(now, started))]
 }
 
 /// A running tool stays on one compact line: the same tiny spinner plus its
@@ -1627,30 +2177,12 @@ fn composer_caret_span(state: &ViewState, now: Instant) -> Span<'static> {
     let ms = now
         .saturating_duration_since(state.process_started)
         .as_millis() as u64;
-    let on = (ms / CARET_BLINK_MS) % 2 == 0;
+    let on = (ms / CARET_BLINK_MS).is_multiple_of(2);
     if on {
         Span::styled("█".to_string(), p.accent())
     } else {
         Span::styled("█".to_string(), p.chrome())
     }
-}
-
-/// The live "still typing" caret appended to the end of streaming assistant
-/// text while the model generates — the cue Claude Code/Codex show so you can
-/// see where the next token will land. A thin block that blinks (accent ↔ dim)
-/// at the same cadence as the composer caret; solid accent when motion is off.
-fn stream_caret_span(state: &ViewState, now: Instant) -> Span<'static> {
-    let p = theme::palette();
-    if !theme::animations_enabled() {
-        return Span::styled("▋".to_string(), p.accent());
-    }
-    let ms = state
-        .turn_started
-        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-        .unwrap_or(0);
-    let on = (ms / CARET_BLINK_MS) % 2 == 0;
-    let style = if on { p.accent() } else { p.chrome() };
-    Span::styled("▋".to_string(), style)
 }
 
 /// Render the completion popup as an overlay growing upward from the top of
@@ -1676,16 +2208,20 @@ fn draw_menu(frame: &mut Frame, menu: &CompletionMenu, composer_area: Rect) {
         height: h,
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(count);
+    let visible_rows = h.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible_rows);
     let title = match menu.completion.kind {
         crate::complete::MenuKind::File => "files",
         crate::complete::MenuKind::Slash => "commands",
     };
-    let start = menu.selected.min(candidates.len().saturating_sub(1));
-    for (i, cand) in candidates.iter().take(count).enumerate() {
-        let marker = if i == start { "▶ " } else { "  " };
+    let selected = menu.selected.min(candidates.len().saturating_sub(1));
+    let start = selected
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(candidates.len().saturating_sub(visible_rows));
+    for (i, cand) in candidates.iter().enumerate().skip(start).take(visible_rows) {
+        let marker = if i == selected { "▶ " } else { "  " };
         let line = Line::from(format!("{marker}{cand}"));
-        if i == start {
+        if i == selected {
             lines.push(line.style(theme::palette().menu_selected()));
         } else {
             lines.push(line.style(theme::palette().code()));
@@ -1759,7 +2295,10 @@ fn draw_menu_overlay(frame: &mut Frame, menu: &MenuState, area: Rect, now: Insta
     }
     // Keep the selected row on screen: rows beyond the box scroll as a window
     // around the cursor rather than being clipped invisibly.
-    let body_rows = inner.height.saturating_sub(4) as usize;
+    // Two heading lines plus three footer lines (spacer + help/editor + keys)
+    // are structural. Reserve them before selecting the scroll window so a new
+    // setting can never push the controls below the terminal viewport.
+    let body_rows = inner.height.saturating_sub(5) as usize;
     let start = menu.selected.saturating_sub(body_rows.saturating_sub(1));
     for (i, row) in rows.iter().enumerate().skip(start).take(body_rows.max(1)) {
         lines.push(menu_row_line(menu, row, i == menu.selected, now));
@@ -2102,25 +2641,21 @@ mod tests {
         assert!(state.selection_text.is_none());
     }
 
-    /// Capturing the mouse takes select-and-copy away from the terminal, so
-    /// that state has to announce itself — otherwise it reads as the terminal
-    /// having broken. The default (released) says nothing.
     #[test]
-    fn captured_mouse_owns_the_status_hint() {
+    fn mouse_capture_does_not_add_status_chrome() {
         let mut state = ViewState::new("gw-glm-5.2".into());
-        let plain = rendered_sized(&mut state, 78, 10);
-        assert!(
-            !plain.contains("has the mouse"),
-            "the default state is quiet: {plain}"
-        );
-
+        let released = right_hint(&state);
         state.mouse_capture = true;
-        let screen = rendered_sized(&mut state, 78, 10);
-        assert!(screen.contains("has the mouse"), "state shown: {screen}");
-        assert!(
-            screen.contains("Ctrl+O"),
-            "the way back is on screen: {screen}"
-        );
+        let captured = right_hint(&state);
+
+        let text = |spans: &[Span<'static>]| {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(text(&captured), text(&released));
+        assert!(!text(&captured).contains("mouse"));
     }
 
     /// The API-key editor never puts the secret on screen: the buffer renders
@@ -2321,8 +2856,8 @@ mod tests {
 
     /// The persistent chrome reports live state: whether sc is working, where
     /// the session is, and which permission mode is armed. The model is *not*
-    /// here — it is on the welcome card, and this slot goes to the location,
-    /// which is what scrolls away and never comes back.
+    /// here — it has a footer below the composer, while this slot goes to the
+    /// location, which is what scrolls away and never comes back.
     #[test]
     fn status_line_shows_state_location_and_mode() {
         let mut state = ViewState::new("mock-model".into());
@@ -2336,19 +2871,29 @@ mod tests {
             screen.contains("subconscious-code (main)"),
             "location: {screen}"
         );
-        assert!(
-            !screen.contains("mock-model"),
-            "the model does not compete for the state line: {screen}"
-        );
+        let status = screen
+            .lines()
+            .find(|line| line.contains("subconscious-code (main)"))
+            .expect("status row");
+        assert!(!status.contains("mock-model"), "status row: {status}");
     }
 
-    /// Idle draws a colored state glyph rather than only a word, so working vs
-    /// waiting reads without being parsed.
+    /// Idle status starts directly with useful session metadata instead of a
+    /// permanent state glyph and label.
     #[test]
-    fn idle_state_carries_a_glyph() {
+    fn idle_status_omits_the_state_indicator() {
         let mut state = ViewState::new("m".into());
+        state.location = "subconscious-code".into();
         let screen = rendered(&mut state);
-        assert!(screen.contains("● idle"), "idle glyph: {screen}");
+        let status = screen
+            .lines()
+            .find(|line| line.contains("subconscious-code"))
+            .expect("status row");
+        assert!(!status.contains("● idle"), "idle indicator: {status}");
+        assert!(
+            status.trim_start().starts_with("subconscious-code"),
+            "location should be the first field: {status}"
+        );
     }
 
     /// The context figure is the headline number for this agent, so it has to
@@ -2423,7 +2968,7 @@ mod tests {
     }
 
     /// On flush, reasoning collapses to a timed row but its full body remains
-    /// available behind Ctrl+T.
+    /// available by clicking the row.
     #[test]
     fn flush_text_collapses_reasoning_to_a_timed_expandable_summary() {
         let mut state = ViewState::new("m".into());
@@ -2678,19 +3223,30 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_only_stream_shows_one_content_free_thinking_row() {
+    fn reasoning_only_stream_shows_one_content_free_marathoning_row() {
         let mut state = ViewState::new("m".into());
         state.busy = true;
         state.current_reasoning = "private chain of thought must stay hidden".into();
         let screen = rendered(&mut state);
+        let marathoning = screen
+            .lines()
+            .find(|line| line.contains("Marathoning ·"))
+            .expect("marathoning row");
         assert!(
-            screen.contains(theme::DEFAULT_LOGO),
-            "tiny activity mark: {screen}"
+            !marathoning.contains(theme::DEFAULT_LOGO),
+            "marathoning row no longer carries the logo: {marathoning}"
         );
-        assert!(!screen.contains("thinking"), "no animated label: {screen}");
+        assert!(
+            screen.contains("Marathoning ·") && screen.contains('s'),
+            "clear timed activity label: {screen}"
+        );
         assert!(
             !screen.contains("private chain"),
             "streamed reasoning content is never rendered: {screen}"
+        );
+        assert!(
+            !screen.contains('▋'),
+            "the animated thinking logo must not get a second blinking cursor: {screen}"
         );
     }
 
@@ -2706,6 +3262,24 @@ mod tests {
             first.content, next.content,
             "one-cell rotation advances rapidly"
         );
+        assert_ne!(
+            theme::loading_color(0),
+            theme::loading_color(1),
+            "each loading phase also advances through the warm color ramp"
+        );
+    }
+
+    #[test]
+    fn streaming_answer_has_no_trailing_cursor() {
+        let mut state = ViewState::new("m".into());
+        state.busy = true;
+        state.current_text = "answer in progress".into();
+        let screen = rendered(&mut state);
+        assert!(
+            screen.contains("answer in progress"),
+            "stream renders: {screen}"
+        );
+        assert!(!screen.contains('▋'), "no output cursor: {screen}");
     }
 
     #[test]
@@ -2726,7 +3300,156 @@ mod tests {
     }
 
     #[test]
-    fn assistant_output_uses_the_tiny_logo_on_first_visible_line_only() {
+    fn oversized_markdown_table_uses_responsive_rows_without_broken_borders() {
+        let table = crate::markdown::parse_blocks(
+            "| Crate | State |\n|---|---|\n| `runtime` | Declares cache, sampler, and scheduler modules that do not exist yet |",
+        );
+        assert!(
+            table.iter().all(|line| line.width() > 40),
+            "fixture must exercise the narrow path"
+        );
+
+        let narrow: Vec<Line<'static>> = table
+            .clone()
+            .into_iter()
+            .flat_map(|line| responsive_content_lines(line, 40))
+            .collect();
+        let text: Vec<String> = narrow
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+
+        assert!(
+            narrow.iter().all(|line| line.width() == 40),
+            "every physical table row fits exactly: {text:?}"
+        );
+        assert!(
+            text[0].starts_with('┌'),
+            "top border remains boxed: {text:?}"
+        );
+        assert!(text[1].starts_with("│ Crate"), "boxed header: {text:?}");
+        assert!(
+            text[2].starts_with('├'),
+            "middle border remains boxed: {text:?}"
+        );
+        assert!(
+            text[3..text.len() - 1]
+                .iter()
+                .all(|row| row.starts_with('│') && row.ends_with('│')),
+            "wrapped body stays inside the box: {text:?}"
+        );
+        assert!(
+            text.last().is_some_and(|row| row.starts_with('└')),
+            "bottom border remains boxed: {text:?}"
+        );
+
+        let wide = table
+            .clone()
+            .into_iter()
+            .flat_map(|line| responsive_content_lines(line, 200))
+            .collect::<Vec<_>>();
+        assert_eq!(wide, table, "a table that fits keeps its full box");
+    }
+
+    #[test]
+    fn assistant_gutter_does_not_break_responsive_four_column_tables() {
+        let source = "| Path | Type | Crate / Name | Purpose |\n\
+|------|------|-------------|---------|\n\
+| `qwen38-metal/` | workspace | — | From-scratch Qwen3.8-27B inference engine (Rust + MSL, M3 Pro target) |\n\
+| `crates/kernels/src/lib.rs` | file | — | Kernel-name consts: rmsnorm, rope, mrope, gqa_fwd, gdn_fwd, swiglu, matmul_row, dequant_gemv |";
+        let table = parse_assistant_output(source);
+        let raw_top: String = table[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            raw_top.starts_with("✻ ┌"),
+            "fixture reproduces the logo-prefixed top border: {raw_top}"
+        );
+
+        let narrow: Vec<Line<'static>> = table
+            .into_iter()
+            .flat_map(|line| responsive_content_lines(line, 80))
+            .collect();
+        let text: Vec<String> = narrow
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+
+        assert!(
+            narrow.iter().all(|line| line.width() == 80),
+            "logo + constrained box fills the viewport: {text:?}"
+        );
+        assert!(text[0].starts_with("✻ ┌"), "top border remains: {text:?}");
+        assert!(
+            text[1].starts_with("  │ Path"),
+            "header keeps the shared assistant gutter and box: {:?}",
+            text[1]
+        );
+        let body = &text[3..text.len() - 1];
+        assert!(
+            body.iter().all(|row| {
+                (row.starts_with("  │") && row.ends_with('│')) || row.starts_with("  ├")
+            }),
+            "every wrapped body row and separator stays indented and boxed: {text:?}"
+        );
+        assert_eq!(
+            body.iter().filter(|row| row.starts_with("  ├")).count(),
+            1,
+            "the two data rows have a horizontal separator: {text:?}"
+        );
+
+        let separator_columns = |row: &str| {
+            row.chars()
+                .enumerate()
+                .filter_map(|(column, ch)| (ch == '│').then_some(column))
+                .collect::<Vec<_>>()
+        };
+        let expected = separator_columns(&text[1]);
+        for row in body.iter().filter(|row| row.starts_with("  │")) {
+            assert_eq!(separator_columns(row), expected, "aligned cells: {row}");
+        }
+    }
+
+    #[test]
+    fn wrapped_assistant_prose_keeps_the_two_cell_hanging_indent() {
+        let line = parse_assistant_output(
+            "This sentence is deliberately long enough to wrap over several terminal rows.",
+        )
+        .remove(0);
+        let wrapped = responsive_content_lines(line, 24);
+        let text: Vec<String> = wrapped
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+
+        assert!(text.len() > 1, "fixture wraps: {text:?}");
+        assert!(text[0].starts_with("✻ "), "first row keeps logo: {text:?}");
+        assert!(
+            text.iter().skip(1).all(|row| row.starts_with("  ")),
+            "continuations align after the logo: {text:?}"
+        );
+        assert!(wrapped.iter().all(|line| line.width() <= 24));
+    }
+
+    #[test]
+    fn assistant_output_uses_the_logo_then_a_matching_two_cell_gutter() {
         assert_eq!(theme::DEFAULT_LOGO, "✻", "one-cell reduction of logo.svg");
         let lines = parse_assistant_output("\nfirst line\nsecond line");
         let text: Vec<String> = lines
@@ -2740,7 +3463,10 @@ mod tests {
             .collect();
         assert_eq!(text[0], "", "leading whitespace stays unbranded");
         assert_eq!(text[1], "✻ first line", "tiny logo prefixes output");
-        assert_eq!(text[2], "second line", "marker appears only once");
+        assert_eq!(
+            text[2], "  second line",
+            "later output aligns after the marker"
+        );
     }
 
     #[test]
@@ -2822,6 +3548,34 @@ mod tests {
     }
 
     #[test]
+    fn completion_menu_scrolls_to_keep_selection_visible() {
+        let mut state = ViewState::new("m".into());
+        state.composer = "/".into();
+        state.menu = Some(CompletionMenu {
+            completion: Completion {
+                kind: crate::complete::MenuKind::Slash,
+                replace_start: 0,
+                candidates: (0..10).map(|i| format!("/command-{i}")).collect(),
+            },
+            selected: 8,
+        });
+        let screen = rendered_sized(&mut state, 60, 14);
+
+        assert!(
+            screen.lines().any(|line| line.contains("▶ /command-8")),
+            "selected command stays visible: {screen}"
+        );
+        assert!(
+            screen.contains("/command-1"),
+            "window advances one row: {screen}"
+        );
+        assert!(
+            !screen.contains("/command-0"),
+            "old rows scroll out: {screen}"
+        );
+    }
+
+    #[test]
     fn completion_menu_empty_candidates_renders_nothing() {
         // An empty candidate list draws no popup (defensive; complete() returns
         // None in that case, but the view must not panic if state is stale).
@@ -2883,6 +3637,84 @@ mod tests {
     }
 
     #[test]
+    fn composer_spans_the_full_terminal_width() {
+        let mut state = ViewState::new("m".into());
+        state.transcript.push(Line::from("> hello"));
+        let screen = rendered_sized(&mut state, 120, 10);
+        let top_border = screen
+            .lines()
+            .find(|line| line.starts_with('╭') && line.ends_with('╮'))
+            .unwrap_or_else(|| panic!("full-width composer border missing: {screen}"));
+
+        assert_eq!(top_border.chars().count(), 120, "composer width: {screen}");
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.starts_with('╰') && line.ends_with('╯')),
+            "composer has rounded bottom corners: {screen}"
+        );
+    }
+
+    #[test]
+    fn turn_divider_spans_the_full_terminal_width() {
+        let mut state = ViewState::new("m".into());
+        state
+            .transcript
+            .push(turn_divider_line("12.4s".into(), 0, 0));
+        let screen = rendered_sized(&mut state, 120, 10);
+        let divider = screen
+            .lines()
+            .find(|line| line.contains("worked for 12.4s"))
+            .unwrap_or_else(|| panic!("turn divider missing: {screen}"));
+
+        assert_eq!(divider.chars().count(), 120, "divider width: {divider:?}");
+        assert!(
+            divider.starts_with("─ worked for 12.4s · 0 lines changed ─"),
+            "left-aligned duration: {divider:?}"
+        );
+        assert!(divider.contains("0 lines changed"), "{divider:?}");
+        assert!(divider.ends_with('─'), "right terminal edge: {divider:?}");
+    }
+
+    #[test]
+    fn turn_divider_colors_added_and_removed_counts_independently() {
+        let p = theme::palette();
+        let line = turn_divider_line("2.0s".into(), 12, 3);
+        let added = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "+12")
+            .expect("added count");
+        let removed = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "-3")
+            .expect("removed count");
+        assert_eq!(added.style, p.semantic(Color::Green));
+        assert_eq!(removed.style, p.semantic(Color::Red));
+
+        let fitted = full_width_turn_divider(&line, 120).expect("full-width divider");
+        assert_eq!(
+            fitted
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == "+12")
+                .expect("fitted added count")
+                .style,
+            p.semantic(Color::Green)
+        );
+        assert_eq!(
+            fitted
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == "-3")
+                .expect("fitted removed count")
+                .style,
+            p.semantic(Color::Red)
+        );
+    }
+
+    #[test]
     fn multiline_paste_renders_as_a_line_count_without_losing_content() {
         let mut state = ViewState::new("m".into());
         state.composer.push_str("review ");
@@ -2934,7 +3766,7 @@ mod tests {
         // mentions /help and Ctrl+C, and that is the point — one owner each.
         let status = screen
             .lines()
-            .find(|r| r.contains("idle"))
+            .find(|r| r.contains(&state.location))
             .expect("status line on screen");
         assert!(
             !status.contains("Ctrl+C"),
@@ -3009,10 +3841,9 @@ mod tests {
         assert_ne!(first.content, next.content);
     }
 
-    /// Waiting for the first token renders one small symbol, not ASCII art or
-    /// a thinking label.
+    /// Waiting for the first token renders one compact, left-aligned row.
     #[test]
-    fn thinking_loader_is_only_one_small_symbol() {
+    fn marathoning_loader_is_left_aligned_labeled_and_shimmering() {
         let mut state = ViewState::new("m".into());
         state.busy = true;
         let now = Instant::now();
@@ -3020,8 +3851,30 @@ mod tests {
         let lines = thinking_lines(&state, now);
         assert_eq!(lines.len(), 1, "no multi-row art");
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text.trim(), theme::DEFAULT_LOGO);
-        assert!(!text.contains("thinking"));
+        assert_eq!(text, "Marathoning · 0s");
+        assert!(text.starts_with("Marathoning"), "no leading logo: {text:?}");
+        assert!(!text.contains(theme::DEFAULT_LOGO), "no logo: {text:?}");
+
+        let later = thinking_lines(&state, now + Duration::from_secs(3));
+        let later_text: String = later[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(later_text.ends_with("Marathoning · 3s"), "{later_text}");
+
+        let label_len = marathoning_label(now, Some(now)).chars().count();
+        assert!(
+            (0..label_len).any(|index| {
+                shimmer_intensity(index, label_len, Duration::ZERO)
+                    != shimmer_intensity(
+                        index,
+                        label_len,
+                        Duration::from_millis((MARATHON_SHIMMER_PERIOD_MS / 2) as u64),
+                    )
+            }),
+            "the label's foreground colors should complete a sweep in 900ms"
+        );
     }
 
     /// A running tool uses one compact line, never the old ASCII-art block.
@@ -3040,9 +3893,8 @@ mod tests {
         assert!(text.contains("Bash"), "tool name: {text}");
     }
 
-    /// Before the first turn the welcome card carries the onboarding: one
-    /// brand mark, the model, and the key hints. It owns these — the status
-    /// bar deliberately does not repeat them.
+    /// Before the first turn the welcome card carries the brand and key hints;
+    /// model metadata lives in the footer beneath the prompt box.
     #[test]
     fn welcome_card_carries_the_onboarding() {
         let mut state = ViewState::new("gw-glm-5.2".into());
@@ -3051,18 +3903,47 @@ mod tests {
         assert!(screen.contains("gw-glm-5.2"), "model: {screen}");
         assert!(screen.contains("mention a file"), "@ hint: {screen}");
         assert!(screen.contains("Ctrl+C"), "quit hint: {screen}");
+        assert!(
+            screen.contains("███▄  ▄███"),
+            "the welcome screen renders the high-quality logo.svg: {screen}"
+        );
         // The one binding whose effect can't be guessed names its options.
         assert!(
             screen.contains("accept edits"),
             "Shift+Tab names the modes: {screen}"
         );
+
+        let rows: Vec<&str> = screen.lines().collect();
+        let box_bottom = rows
+            .iter()
+            .position(|row| row.starts_with('╰') && row.ends_with('╯'))
+            .expect("composer bottom border");
+        let model_row = rows
+            .iter()
+            .position(|row| row.contains("gw-glm-5.2"))
+            .expect("model footer");
+        assert_eq!(model_row, box_bottom + 1, "model below composer: {screen}");
+        assert!(
+            !rows[model_row].contains("model"),
+            "footer keeps only the model name: {}",
+            rows[model_row]
+        );
+        assert!(!screen.contains("scroll history"), "quiet footer: {screen}");
     }
 
-    /// The card is unbordered and sits directly above the composer, so the
-    /// only outline on screen belongs to the thing you type into and the eye
-    /// doesn't cross an empty screen to get from one to the other.
     #[test]
-    fn welcome_card_is_unbordered_and_meets_the_composer() {
+    fn welcome_logo_matches_the_intro_height() {
+        let logo = welcome_logo(Rect::new(0, 0, 80, 24)).expect("welcome logo");
+        assert_eq!(logo.art, theme::LOGO_ART_SMALL);
+        assert_eq!((logo.width, logo.height), (18, 8));
+
+        assert_eq!(welcome_logo(Rect::new(0, 0, 60, 7)), None);
+    }
+
+    /// The unbordered welcome card begins at the top of a fresh terminal. The
+    /// composer remains the only outlined element at the bottom.
+    #[test]
+    fn welcome_card_is_unbordered_and_starts_at_the_top() {
         let mut state = ViewState::new("m".into());
         let screen = rendered_sized(&mut state, 80, 24);
         let rows: Vec<&str> = screen.lines().collect();
@@ -3072,25 +3953,20 @@ mod tests {
             .expect("wordmark on screen");
         let box_top = rows
             .iter()
-            .position(|r| r.contains("┌"))
+            .position(|r| r.contains("╭"))
             .expect("composer box on screen");
-        let last_hint = rows
+        let logo_top = rows
             .iter()
-            .position(|r| r.contains("Ctrl+C"))
-            .expect("hints on screen");
+            .position(|r| r.contains("███▄  ▄███"))
+            .expect("logo on screen");
         assert!(
             box_top > wordmark,
             "the only bordered box is below the card (the composer): {screen}"
         );
-        // The card ends where the input begins — at most the blank breathing
-        // row and the status line in between, never a screen of void.
-        assert!(
-            box_top - last_hint <= 3,
-            "card meets the input (hint row {last_hint}, box row {box_top}): {screen}"
-        );
+        assert_eq!(logo_top, 0, "logo begins at terminal top: {screen}");
         // Exactly one box: the card contributes no border of its own.
         assert_eq!(
-            rows.iter().filter(|r| r.contains("┌")).count(),
+            rows.iter().filter(|r| r.contains("╭")).count(),
             1,
             "one bordered element on screen: {screen}"
         );
@@ -3121,5 +3997,16 @@ mod tests {
             screen.contains("Subconscious Code"),
             "welcome card after clear: {screen}"
         );
+    }
+
+    #[test]
+    fn wide_chat_uses_almost_the_entire_terminal() {
+        let wide = content_area(Rect::new(0, 0, 200, 24));
+        assert_eq!(wide.x, 1);
+        assert_eq!(wide.width, 198);
+
+        let narrow = content_area(Rect::new(0, 0, 80, 24));
+        assert_eq!(narrow.x, 0);
+        assert_eq!(narrow.width, 80);
     }
 }

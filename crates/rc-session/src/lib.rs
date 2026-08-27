@@ -355,6 +355,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 cost: None,
+                trace: None,
             },
             Turn::ToolResult {
                 call_id: "c1".into(),

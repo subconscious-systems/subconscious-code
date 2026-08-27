@@ -58,8 +58,19 @@ fn glob_description(cap: usize) -> String {
     format!(
         "Find files by glob pattern (e.g. `src/**/*.rs`), respecting .gitignore. \
 Results are absolute paths sorted by modification time (newest first), {limit}. \
-`*` matches one path segment; `**` matches across segments."
+`*` matches one path segment; `**` matches across segments. Hidden paths are \
+searched when the pattern explicitly names a dot-prefixed path segment (for \
+example `.github/workflows/*` or `**/.config/*`)."
     )
+}
+
+/// `ignore` skips hidden paths before the glob matcher sees them. Opt out of
+/// that pruning only when the caller explicitly names a dot-prefixed segment;
+/// broad patterns such as `**/*` should not unexpectedly traverse `.git`.
+fn explicitly_targets_hidden(pattern: &str) -> bool {
+    pattern
+        .split(['/', '\\'])
+        .any(|segment| segment.starts_with('.') && segment != "." && segment != "..")
 }
 
 #[async_trait]
@@ -106,8 +117,13 @@ impl Tool for Glob {
             }
         };
 
+        let mut walker = ignore::WalkBuilder::new(&root);
+        if explicitly_targets_hidden(&inp.pattern) {
+            walker.hidden(false);
+        }
+
         let mut hits: Vec<(PathBuf, SystemTime)> = Vec::new();
-        for entry in ignore::WalkBuilder::new(&root).build() {
+        for entry in walker.build() {
             let Ok(entry) = entry else { continue };
             let Some(ft) = entry.file_type() else {
                 continue;
@@ -195,6 +211,58 @@ mod tests {
                 let new_idx = content.find("new.rs").unwrap();
                 let old_idx = content.find("old.rs").unwrap();
                 assert!(new_idx < old_idx, "newest should be first: {content}");
+            }
+            o => panic!("expected ok, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_dot_segment_searches_hidden_directories() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: ci").unwrap();
+
+        let out = Glob::new()
+            .call(
+                json!({
+                    "pattern": ".github/workflows/*",
+                    "path": dir.path().to_string_lossy().to_string()
+                }),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains(".github/workflows/ci.yml"), "{content}");
+            }
+            o => panic!("expected ok, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn broad_pattern_still_prunes_hidden_directories() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/objects/secret"), "x").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "x").unwrap();
+
+        let out = Glob::new()
+            .call(
+                json!({
+                    "pattern": "**/*",
+                    "path": dir.path().to_string_lossy().to_string()
+                }),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("visible.txt"), "{content}");
+                assert!(!content.contains(".git/objects/secret"), "{content}");
             }
             o => panic!("expected ok, got {o:?}"),
         }

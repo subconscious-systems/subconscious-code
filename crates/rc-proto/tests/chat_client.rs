@@ -57,6 +57,7 @@ async fn completes_a_simple_turn() {
     }];
     let opts = CompleteOpts {
         session_id: Some("session-test-123".into()),
+        reasoning_effort: Some("high".into()),
         ..CompleteOpts::default()
     };
     let resp = client.complete(&messages, &opts).await.unwrap();
@@ -84,9 +85,64 @@ async fn completes_a_simple_turn() {
         "expected compact tail, got: {body}"
     );
     assert!(
+        body.contains(r#""reasoning_effort":"high""#),
+        "reasoning effort must reach the wire: {body}"
+    );
+    assert!(
         !body.contains("\n") && !body.contains(": "),
         "expected compact JSON: {body}"
     );
+}
+
+#[tokio::test]
+async fn gzip_rejection_falls_back_once_and_is_remembered() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("content-encoding", "gzip"))
+        .respond_with(ResponseTemplate::new(415).set_body_string("gzip is not supported"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(sample_response("ok")),
+        )
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "k".into(), "m".into(), None)
+        .unwrap()
+        .with_request_gzip(true);
+    let messages = [WireMessage::User {
+        content: "hello".into(),
+    }];
+    client
+        .complete(&messages, &CompleteOpts::default())
+        .await
+        .unwrap();
+    client
+        .complete(&messages, &CompleteOpts::default())
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "gzip probe + fallback + next request");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip")
+    );
+    assert!(!requests[1].headers.contains_key("content-encoding"));
+    assert!(!requests[2].headers.contains_key("content-encoding"));
+    assert!(std::str::from_utf8(&requests[1].body)
+        .unwrap()
+        .starts_with(r#"{"model":"m""#));
 }
 
 #[tokio::test]

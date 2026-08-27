@@ -62,7 +62,11 @@ fn bench_cmd(args: &[String]) -> ExitCode {
         .collect();
     let orderings = bench::rotations_subset(tasks.len(), rotations.unwrap_or(tasks.len()));
     if orderings.is_empty() {
-        eprintln!("xtask bench: no orderings (got {} tasks, {:?} rotations)", tasks.len(), rotations);
+        eprintln!(
+            "xtask bench: no orderings (got {} tasks, {:?} rotations)",
+            tasks.len(),
+            rotations
+        );
         return ExitCode::from(2);
     }
     let stats = bench::run_bench(&tasks, &orderings);
@@ -94,6 +98,11 @@ fn shorten(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
     } else {
-        &s[..s.char_indices().take(max).last().map(|(i, _)| i).unwrap_or(s.len())]
+        &s[..s
+            .char_indices()
+            .take(max)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(s.len())]
     }
 }

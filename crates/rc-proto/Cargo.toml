@@ -12,11 +12,20 @@ reqwest.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 flate2.workspace = true
+memchr.workspace = true
 tokio = { workspace = true }
 tokio-stream.workspace = true
 tracing.workspace = true
+tempfile = "3"
+tokio-util.workspace = true
+dlr-sidecar.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
 wiremock.workspace = true
 tracing-subscriber = { workspace = true }
+axum = "0.8"
+dlr-core = { path = "../../integrations/dlr/crates/core" }
+dlr-compress = { path = "../../integrations/dlr/crates/compress" }
+dlr-receiver = { path = "../../integrations/dlr/crates/receiver" }

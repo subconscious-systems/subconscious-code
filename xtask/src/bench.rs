@@ -42,9 +42,7 @@ pub fn rotations_subset(n: usize, k: usize) -> Vec<Vec<usize>> {
     }
     let all = cyclic_rotations(n);
     let k = k.min(n);
-    (0..k)
-        .map(|r| all[r * n / k].clone())
-        .collect()
+    (0..k).map(|r| all[r * n / k].clone()).collect()
 }
 
 /// Verify the Latin-square invariant: an n×n array in which each of `n`
@@ -145,7 +143,10 @@ pub fn run_bench(tasks: &[BenchTask], orderings: &[Vec<usize>]) -> Vec<TaskStats
     for order in orderings {
         for &idx in order {
             let start = Instant::now();
-            let _ = Command::new("sh").arg("-c").arg(&tasks[idx].command).status();
+            let _ = Command::new("sh")
+                .arg("-c")
+                .arg(&tasks[idx].command)
+                .status();
             stats[idx].samples.push(start.elapsed());
         }
     }

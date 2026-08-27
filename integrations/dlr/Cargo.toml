@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/coding",
+    "crates/compress",
+    "crates/transport",
+    "crates/shim",
+    "crates/receiver",
+    "crates/prune",
+    "crates/sidecar",
+    "crates/bin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+authors = ["Daniel Suit"]
+
+[workspace.dependencies]
+dlr-core    = { path = "crates/core" }
+dlr-coding  = { path = "crates/coding" }
+dlr-compress = { path = "crates/compress" }
+dlr-transport = { path = "crates/transport" }
+dlr-shim    = { path = "crates/shim" }
+dlr-receiver = { path = "crates/receiver" }
+dlr-prune  = { path = "crates/prune" }
+
+blake3   = "1"
+axum     = "0.8"
+clap     = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+http-body-util = "0.1"
+reqwest  = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+serde    = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio    = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tower    = { version = "0.5", features = ["util"] }
+bytes    = "1"
+thiserror = "1"
+zstd     = { version = "0.13", features = ["experimental"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+ahash    = "0.8"
+dashmap  = "6"
+parking_lot = "0.12"
+rayon    = "1"
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.bench]
+inherits = "release"

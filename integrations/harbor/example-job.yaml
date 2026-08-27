@@ -1,0 +1,27 @@
+job_name: subconscious-code-smoke
+jobs_dir: runs
+n_attempts: 1
+n_concurrent_trials: 1
+
+environment:
+  type: docker
+  delete: true
+
+agents:
+  - import_path: subconscious_harbor.agent:SubconsciousCode
+    model_name: openai/subconscious/glm-5.2
+    env:
+      OPENAI_API_BASE: https://api.subconscious.dev/v1
+      OPENAI_API_KEY: ${SUBCONSCIOUS_API_KEY}
+    kwargs:
+      # Replace with a tagged binary URL for fast cloud runs. For an immediate
+      # local run, use the absolute path produced by build-package.sh instead.
+      source_archive: /absolute/path/to/subconscious-code/integrations/harbor/dist/subconscious-code-source.tar.gz
+      max_tokens: 8192
+      turn_timeout_ms: 540000
+      max_iters: 1000
+      max_retries: 2
+
+datasets:
+  - name: terminal-bench-sample
+    n_tasks: 2

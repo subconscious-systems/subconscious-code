@@ -1,0 +1,73 @@
+job_id,created_at,status,imported,name,harness,model,environment,runtime,n_trials,n_completed,n_resolved,resolution_rate,n_errored,n_cancelled,total_cost_usd,n_input_tokens,n_output_tokens,total_duration_seconds
+c2365ca697c8,2026-08-27T02:37:38Z,cancelled,False,swebenchpro · subconscious-code · openai/subconscious/glm-5.2 · Aug 27 02:37,subconscious-code,subconscious/glm-5.2,e2b,go,28,10,5,0.1786,10,8,,7127767,168975,5142.9
+e7e9304cdc24,2026-08-04T14:49:45+00:00,complete,False,swebenchpro · mini-swe-agent · gw-glm-5.2,mini-swe-agent,gw-glm-5.2,e2b,python,4,4,0,0,0,0,0.8641,4797166,41419,1196.5
+04bd32ce2227,2026-08-03T20:52:23+00:00,complete,False,swebenchpro · mini-swe-agent · gw-glm-5.2,mini-swe-agent,gw-glm-5.2,e2b,python,4,4,0,0,0,0,0.8225,4528690,40280,801.9
+c7c9c0c7fbc8,2026-07-14T20:12:14+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2-nvfp4,claude-code,/mnt/glm-5.2-nvfp4,e2b,python,52,42,26,0.5,2,8,104.7472,111863517,1040165,22325.6
+2f892e769696,2026-07-14T15:24:47+00:00,failed,False,swebenchpro · claude-code · glm-5.2-nvfp4,claude-code,/mnt/glm-5.2-nvfp4,e2b,python,161,143,79,0.4907,18,0,398.7876,451556587,4382754,93216.5
+60b4b2de5be8,2026-07-11T00:28:53+00:00,cancelled,False,swebenchpro-claude-code-glm-5.2-left-from-d56aee28d8c7-no-task-tools-c8,claude-code,subconscious/glm-5.2,daytona,python,70,63,40,0.5714,5,2,164.0897,183485316,1867111,76065.6
+eed41370c828,2026-07-03T08:19:48.592486Z,complete,True,swebenchpro claude-code glm-5.2 aggregate,claude-code,subconscious/glm-5.2,daytona,python,731,709,571,0.7811,18,4,1791.095,1866069028,17907139,602100.9
+d56aee28d8c7,2026-07-10T22:12:41+00:00,cancelled,False,swebenchpro-claude-code-glm-5.2-left-from-25b3305f157b-no-task-tools-serial,claude-code,subconscious/glm-5.2,daytona,python,7,4,4,0.5714,3,0,11.3489,20117580,202976,8098.7
+071205e82b64,2026-07-10T22:09:22+00:00,cancelled,False,swebenchpro-claude-code-glm-5.2-errors-from-25b3305f157b-no-task-tools-serial,claude-code,subconscious/glm-5.2,daytona,python,2,0,0,0,1,1,,172294,1240,95.8
+25b3305f157b,2026-07-10T16:59:56+00:00,cancelled,False,swebenchpro claude-code glm-5.2 errored/unrun rerun (rerun),claude-code,subconscious/glm-5.2,daytona,python,35,24,22,0.6286,9,0,59.8239,74399985,667673,30432.6
+1e522580d76f,2026-07-10T17:45:36+00:00,complete,False,swebenchpro claude-code glm-5.2 errored from 508 serial,claude-code,subconscious/glm-5.2,daytona,python,4,2,2,0.5,2,0,8.6035,8702687,77489,4646.9
+50857c70efe6,2026-07-10T17:00:37+00:00,complete,False,swebenchpro claude-code glm-5.2 errored no task tools (rerun),claude-code,subconscious/glm-5.2,daytona,python,5,1,2,0.4,4,0,3.5153,6556381,49723,4005.7
+c6d0e00018f0,2026-07-10T17:02:41+00:00,cancelled,False,swebenchpro · codex · glm-5.2,codex,subconscious/glm-5.2,e2b,python,2,0,0,0,0,2,,8926241,119694,3909.4
+701591327d1b,2026-07-10T13:33:14+00:00,failed,False,swebenchpro claude-code glm-5.2 errored/unrun rerun,claude-code,subconscious/glm-5.2,daytona,python,15,10,8,0.5333,5,0,21.8102,28324160,307088,16191.4
+097881751dd4,2026-07-10T15:42:58+00:00,failed,False,swebenchpro claude-code glm-5.2 errored no task tools,claude-code,subconscious/glm-5.2,daytona,python,1,0,0,0,1,0,,,,427.2
+6bad56b2f2b0,2026-07-10T14:12:12+00:00,complete,False,swebenchpro claude-code glm-5.2 errored from 701591327d1b,claude-code,subconscious/glm-5.2,daytona,python,4,2,2,0.5,2,0,6.8033,8171752,86056,6046.6
+f2c156087eac,2026-07-10T14:23:21+00:00,complete,False,dashboard swebenchpro pi smoke,pi,subconscious/tim-qwen3.6-27b,daytona,python,1,1,0,0,0,0,,2905691,31031,1848.4
+c3a76a0e54c9,2026-07-10T14:23:21+00:00,complete,False,dashboard swebenchpro opencode smoke,opencode,subconscious/tim-qwen3.6-27b,daytona,python,1,1,0,0,0,0,,2872271,21272,1236.5
+8cda9ccae962,2026-07-10T14:33:48+00:00,complete,False,swebenchpro · codex · glm-5.2,codex,subconscious/glm-5.2,e2b,python,4,0,0,0,4,0,,,,161.9
+52c818d66991,2026-07-10T14:23:21+00:00,complete,False,dashboard swebenchpro codex smoke,codex,subconscious/tim-qwen3.6-27b,daytona,python,1,1,0,0,0,0,,180770,980,565.9
+dbaa616539dc,2026-07-10T14:14:45+00:00,complete,False,swebenchpro · opencode · glm-5.2,opencode,subconscious/glm-5.2,e2b,python,2,0,0,0,2,0,,,,79
+a79a271e31b6,2026-07-09T01:50:38+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,daytona,python,662,565,469,0.7085,93,4,1478.3341,1555075572,14862293,516415.5
+8583797b7428,2026-07-09T13:56:24+00:00,complete,False,swebenchpro claude-code glm-5.2 errored rerun corrected,claude-code,subconscious/glm-5.2,daytona,python,57,49,40,0.7018,8,0,107.6373,145998502,1361860,77911.3
+446f683b2c33,2026-07-09T15:16:41+00:00,cancelled,False,swebenchpro · pi · glm-5.2,pi,subconscious/glm-5.2,daytona,python,68,47,0,0,18,3,,0,0,8342.5
+3c076d8b2b05,2026-07-09T15:04:43+00:00,cancelled,False,swebenchpro · codex · glm-5.2,codex,subconscious/glm-5.2,daytona,python,23,0,0,0,21,2,,,,2602.7
+967837a15309,2026-07-09T14:42:47+00:00,complete,False,codex smoke swebenchpro flipt e2b uv-relay,codex,subconscious/tim-qwen3.6-27b,e2b,python,1,1,0,0,0,0,,18415,356,70.2
+427618eb63b8,2026-07-09T14:39:12+00:00,complete,False,codex smoke swebenchpro e2b uv-relay,codex,subconscious/tim-qwen3.6-27b,e2b,python,1,1,0,0,0,0,,24405,391,45.9
+c9df2c22dd2e,2026-07-09T14:34:28+00:00,complete,False,codex smoke swebenchpro e2b,codex,subconscious/tim-qwen3.6-27b,e2b,python,1,0,0,0,1,0,,,,33.7
+3e138fbc07fb,2026-07-09T03:05:55+00:00,complete,False,swebenchpro · pi · tim-qwen3.6-27b,pi,subconscious/tim-qwen3.6-27b,e2b,python,2,2,1,0.5,0,0,,5276292,62806,2147.4
+2e7f03c75bb7,2026-07-09T03:05:48+00:00,complete,False,swebenchpro · opencode · tim-qwen3.6-27b,opencode,subconscious/tim-qwen3.6-27b,e2b,python,2,2,1,0.5,0,0,,3096985,36869,1239.9
+db3662ca47e1,2026-07-09T03:05:35+00:00,complete,False,swebenchpro · codex · tim-qwen3.6-27b,codex,subconscious/tim-qwen3.6-27b,e2b,python,2,0,0,0,2,0,,,,48.4
+4e189735b051,2026-07-08T21:06:52+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,daytona,python,37,31,27,0.7297,2,4,61.185,80185729,649521,42024.9
+399624f9cd96,2026-07-08T08:21:56+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,glm-5.2,e2b,python,122,106,58,0.4754,12,4,291.7808,414050772,4274754,81741
+c3e516dae0e7,2026-07-08T07:43:03.418703,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,glm-5.2,e2b,python,14,10,4,0.2857,0,4,19.5744,26376590,289169,6333.5
+02314de3dc28,2026-07-08T07:09:50.033969,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,glm-5.2,e2b,python,9,5,3,0.3333,0,4,11.9838,20467678,192815,5482
+18e979aa01bb,2026-07-08T02:59:54.890832,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,glm-5.2,e2b,python,92,81,45,0.4891,7,4,183.5795,206291123,2478470,54272
+74fea6b821ca,2026-07-08T02:13:28.012802,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,glm-5.2,e2b,python,20,16,7,0.35,0,4,33.34,42227397,471301,8331.4
+dd9b38480574,2026-07-08T01:31:35+00:00,cancelled,False,swebenchpro · claude-code · tim-qwen3.6-27b,claude-code,subconscious/tim-qwen3.6-27b,e2b,python,16,12,4,0.25,0,4,221.3036,43728333,242977,9150
+d9a33e7d0f97,2026-07-08T01:29:10+00:00,cancelled,False,swebenchpro · claude-code · tim-qwen3.6-27b,claude-code,subconscious/tim-qwen3.6-27b,e2b,python,4,0,0,0,0,4,,1907686,7405,450.8
+6549794aa34a,2026-07-07T15:07:36+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,e2b,python,16,12,5,0.3125,0,4,20.4833,25213655,334353,5638.6
+630e17a124e3,2026-07-07T14:59:40+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,e2b,python,4,0,0,0,0,4,,,,18.6
+38aaf248cb1a,2026-07-07T14:39:55+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2 (rerun),claude-code,subconscious/glm-5.2,e2b,python,9,5,2,0.2222,0,4,12.1597,23502328,237288,4452.9
+d17f2121f74e,2026-07-07T05:03:38+00:00,failed,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,e2b,python,269,210,88,0.3271,55,4,460.1027,513556433,7735886,135377.5
+2b7ea2b29470,2026-07-07T04:33:40+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,e2b,python,4,2,2,0.5,0,2,10.0749,12117573,297056,3366.1
+fc0b89158604,2026-07-07T04:02:59.881081,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,e2b,python,4,3,1,0.25,0,1,14.184,16929653,298048,4059.2
+092dedda5dab,2026-07-07T04:00:57+00:00,cancelled,False,swebenchpro · claude-code · glm,claude-code,glm,e2b,python,4,0,0,0,4,0,0,0,0,75.3
+614690bef849,2026-07-07T03:56:45+00:00,cancelled,False,swebenchpro · mini-swe-agent · glm,mini-swe-agent,glm,e2b,python,4,3,0,0,0,1,0.4813,3225268,38642,626.1
+91e8ee063f49,2026-07-07T03:40:58.637404,cancelled,False,swebenchpro · mini-swe-agent · glm,mini-swe-agent,glm,e2b,python,4,3,0,0,0,1,0.3925,2502142,33703,601.1
+ee0cc9e4aada,2026-07-07T03:25:13.726113,complete,False,swebenchpro · mini-swe-agent · glm,mini-swe-agent,glm,e2b,python,4,4,0,0,0,0,0.519,3723997,58566,705.1
+4ca4ec925911,2026-07-07T03:12:36+00:00,cancelled,False,swebenchpro · mini-swe-agent · glm,mini-swe-agent,glm,e2b,python,4,3,0,0,0,1,0.9185,5650213,85184,990.6
+84a86efde2f3,2026-07-07T03:12:01+00:00,failed,False,swebenchpro · mini-swe-agent · glm,mini-swe-agent,glm,e2b,python,0,0,0,,0,0,,,,
+a9987422a6bc,2026-07-07T02:50:42+00:00,complete,False,swebenchpro · mini-swe-agent · tim-qwen3.6-27b,mini-swe-agent,subconscious/tim-qwen3.6-27b,e2b,python,4,4,1,0.25,0,0,1.5335,8661105,103064,1298.7
+6e92f5edcf3d,2026-07-07T02:36:32+00:00,cancelled,False,swebenchpro · mini-swe-agent · glm,mini-swe-agent,glm,e2b,python,4,0,0,0,0,4,0.19,797588,23247,692.8
+1d69af3e0d83,2026-07-07T02:06:51+00:00,cancelled,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,4,0,0,0,0,4,0.6326,2983960,63400,731.7
+7eed55f09a21,2026-07-07T02:04:36+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,e2b,python,4,0,0,0,0,4,,906816,13741,270.5
+55b03f849574,2026-07-03T06:37:54+00:00,complete,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,daytona,python,731,52,57,0.078,679,0,149.7769,186401038,1631341,394311.6
+a0967f91009f,2026-07-02T17:16:27+00:00,complete,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,731,637,31,0.0424,94,0,68.0917,466272097,5855845,417327.2
+66aa515bc9bc,2026-07-03T06:33:16+00:00,cancelled,False,swebenchpro · claude-code · glm-5.2,claude-code,subconscious/glm-5.2,daytona,python,1,0,0,0,0,1,,532507,2646,283
+56e3cc80f356,2026-07-02T17:34:32+00:00,complete,False,swebenchpro · mini-swe-agent · tim-qwen3.6-27b,mini-swe-agent,subconscious/tim-qwen3.6-27b,e2b,python,10,10,3,0.3,0,0,7.7085,46379077,211570,6571
+10342db94466,2026-07-02T17:11:43+00:00,complete,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,1,1,0,0,0,0,0.0585,442772,6195,282.7
+cbe231cc23c5,2026-07-02T17:08:18.875726,failed,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,0,0,0,,0,0,,,,
+e5c07d6820e4,2026-07-02T17:07:04.996066,failed,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,0,0,0,,0,0,,,,
+f00aa60ddc36,2026-07-02T17:01:01.197110,failed,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,0,0,0,,0,0,,,,
+85f2affc4245,2026-07-02T16:57:25.857011,failed,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,0,0,0,,0,0,,,,
+30b52c4b8821,2026-07-02T16:55:58.384314,failed,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,e2b,python,0,0,0,,0,0,,,,
+919a8228efe7,2026-07-02T15:01:45+00:00,failed,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,daytona,python,0,0,0,,0,0,,,,
+88a02596362c,2026-07-02T15:01:21+00:00,cancelled,False,swebenchpro · mini-swe-agent · glm-5.2,mini-swe-agent,subconscious/glm-5.2,daytona,python,0,0,0,,0,0,,,,
+2f58c5373fa6,2026-06-10T22:48:48.451095,complete,True,bench-runs_swebenchpro-tim-qwen27b-v2_bench-swebenchpro-tim-qwen27b-v2,mini-swe-agent,subconscious/tim-qwen3.6-27b,e2b,python,540,540,261,0.4833,0,0,155.3544,842969466,8408869,296841.6
+9bf5b1a75ab8,2026-06-17T13:54:12.222105,complete,False,swebenchpro · claude-code · glm-5.2-fp8,claude-code,/mnt/glm-5.2-fp8,local,python,1,1,1,1,0,0,7.0545,1370633,8054,283
+4988575c1b79,2026-06-17T13:37:15.159457,complete,False,swebenchpro · claude-code · glm-5.2-fp8,claude-code,/mnt/glm-5.2-fp8,local,python,1,0,0,0,1,0,0,0,0,413.1
+f01be53ac348,2026-06-11T15:24:05.196046,complete,True,swebenchpro-qwen397-docker-v1,mini-swe-agent-pypi,nex-agi/Nex-N2-Pro,local,python,731,724,374,0.5116,7,0,572.3902,3321077884,29816154,893176.8
+91d939412447,2026-06-11T15:24:05.196046,complete,True,swebenchpro-qwen397-docker-v1,mini-swe-agent-pypi,nex-agi/Nex-N2-Pro,local,python,731,724,374,0.5116,7,0,572.3902,3321077884,29816154,893176.8

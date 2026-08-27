@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rc_core::{AskResponse, Prompter};
 use serde_json::Value;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::oneshot;
 
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, EventSender};
 
 /// Shared table of pending asks: the prompter inserts, the pump resolves or
 /// drains. Held by the prompter and the pump behind an `Arc`.
@@ -58,12 +58,12 @@ impl PendingAsks {
 }
 
 pub(crate) struct RuntimePrompter {
-    events: broadcast::Sender<AgentEvent>,
+    events: EventSender,
     pending: Arc<PendingAsks>,
 }
 
 impl RuntimePrompter {
-    pub(crate) fn new(events: broadcast::Sender<AgentEvent>, pending: Arc<PendingAsks>) -> Self {
+    pub(crate) fn new(events: EventSender, pending: Arc<PendingAsks>) -> Self {
         Self { events, pending }
     }
 }
@@ -72,7 +72,7 @@ impl RuntimePrompter {
 impl Prompter for RuntimePrompter {
     async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse {
         let (id, rx) = self.pending.register();
-        let _ = self.events.send(AgentEvent::PermissionAsk {
+        self.events.send(AgentEvent::PermissionAsk {
             id,
             tool: tool.to_string(),
             input: input.clone(),
@@ -80,7 +80,7 @@ impl Prompter for RuntimePrompter {
         });
         match rx.await {
             Ok(response) => {
-                let _ = self.events.send(AgentEvent::PermissionDecision {
+                self.events.send(AgentEvent::PermissionDecision {
                     id,
                     response: response.clone(),
                 });
@@ -89,7 +89,7 @@ impl Prompter for RuntimePrompter {
             // The sender was dropped (shutdown) — deny so the loop winds down.
             Err(_) => {
                 let denied = AskResponse::Deny("ask cancelled".into());
-                let _ = self.events.send(AgentEvent::PermissionDecision {
+                self.events.send(AgentEvent::PermissionDecision {
                     id,
                     response: denied.clone(),
                 });

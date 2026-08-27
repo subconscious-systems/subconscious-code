@@ -106,7 +106,8 @@ impl RewriteSystem {
     fn first_redex(&self, term: &[Symbol]) -> Option<(usize, usize)> {
         for pos in 0..term.len() {
             for (idx, rule) in self.rules.iter().enumerate() {
-                if rule.lhs.len() <= term.len() - pos && term[pos..pos + rule.lhs.len()] == rule.lhs[..]
+                if rule.lhs.len() <= term.len() - pos
+                    && term[pos..pos + rule.lhs.len()] == rule.lhs[..]
                 {
                     return Some((pos, idx));
                 }
@@ -269,7 +270,10 @@ mod tests {
         let sys = demo_rules();
         let nf1 = sys.normalize(&[W, W, L, R, W, R]);
         let nf2 = sys.normalize(&nf1);
-        assert_eq!(nf1, nf2, "normal form must be stable under re-normalization");
+        assert_eq!(
+            nf1, nf2,
+            "normal form must be stable under re-normalization"
+        );
     }
 
     #[test]

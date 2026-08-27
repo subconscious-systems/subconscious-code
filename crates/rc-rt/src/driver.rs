@@ -4,18 +4,19 @@
 //! owns the per-turn cancel token.
 
 use rc_core::{AgentLoop, AgentMode, EventSink, NoteKind, Session, Turn};
-use rc_session::SessionStore;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, EventSender};
 use crate::prompter::RuntimePrompter;
+use crate::sink::SessionWriter;
 
 /// Commands the pump sends to the driver.
 pub(crate) enum DriverCmd {
     /// Run one turn for `prompt`; `cancel` is the per-turn token the pump also
     /// holds a handle to (so `Cancel` can fire it mid-turn).
     Run {
+        turn_id: u64,
         prompt: String,
         cancel: CancellationToken,
     },
@@ -24,48 +25,64 @@ pub(crate) enum DriverCmd {
     SetMode(AgentMode),
     /// `/rewind` — restore the last `steps` turns of agent file changes.
     Rewind { steps: usize },
+    /// `/compact` — summarize the active context and start projection there.
+    Compact,
+    /// Persist or clear the active `/goal` objective.
+    SetGoal(Option<String>),
+    /// Report the active `/goal` objective without changing it.
+    ShowGoal,
 }
 
-pub(crate) async fn driver_task(
-    agent: std::sync::Arc<AgentLoop>,
-    mut session: Session,
-    mut cmds: mpsc::UnboundedReceiver<DriverCmd>,
-    sink: std::sync::Arc<dyn EventSink>,
-    prompter: RuntimePrompter,
-    events: broadcast::Sender<AgentEvent>,
-    mut store: Option<SessionStore>,
-) {
-    // How many turns are already persisted — append only the new ones after
-    // each `Run` (crash recovery: the file is a valid prefix up to here).
-    let mut persisted = session.messages.len();
+pub(crate) enum DriverFeedback {
+    TurnFinished { turn_id: u64 },
+}
+
+pub(crate) struct DriverTask {
+    pub(crate) agent: std::sync::Arc<AgentLoop>,
+    pub(crate) session: Session,
+    pub(crate) sink: std::sync::Arc<dyn EventSink>,
+    pub(crate) prompter: RuntimePrompter,
+    pub(crate) events: EventSender,
+    pub(crate) store: Option<SessionWriter>,
+    pub(crate) feedback: mpsc::Sender<DriverFeedback>,
+}
+
+pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<DriverCmd>) {
+    let DriverTask {
+        agent,
+        mut session,
+        sink,
+        prompter,
+        events,
+        store,
+        feedback,
+    } = task;
     while let Some(cmd) = cmds.recv().await {
         match cmd {
-            DriverCmd::Run { prompt, cancel } => {
-                let _ = events.send(AgentEvent::Ready);
+            DriverCmd::Run {
+                turn_id,
+                prompt,
+                cancel,
+            } => {
+                events.send(AgentEvent::Ready);
                 let outcome = agent
                     .run(&mut session, prompt, sink.as_ref(), &prompter, cancel)
                     .await;
                 match outcome {
                     Ok(o) => {
-                        let _ = events.send(AgentEvent::Outcome(o));
+                        events.send(AgentEvent::Outcome(o));
                     }
                     Err(e) => {
-                        let _ = events.send(AgentEvent::Error(e.to_string()));
+                        events.send(AgentEvent::Error(e.to_string()));
                     }
                 }
-                // Persist any turns added by this run (User + Assistant + any
-                // ToolResults). A failure to write is logged, not fatal — the
-                // in-memory session is still correct for the rest of the run.
-                if let Some(store) = store.as_mut() {
-                    for turn in &session.messages[persisted..] {
-                        if let Err(e) = store.append_turn(turn) {
-                            tracing::warn!("session persist failed: {e}");
-                            break;
-                        }
-                    }
-                    persisted = session.messages.len();
-                }
-                let _ = events.send(AgentEvent::Idle);
+                // RuntimeSink queues each completed turn to its dedicated
+                // writer. Persistence is incremental without putting disk
+                // flush latency on this driver task.
+                let _ = feedback
+                    .send(DriverFeedback::TurnFinished { turn_id })
+                    .await;
+                events.send(AgentEvent::Idle);
             }
             DriverCmd::SetMode(mode) => {
                 if session.mode != mode {
@@ -77,14 +94,11 @@ pub(crate) async fn driver_task(
                         kind: NoteKind::ModeChange,
                         text: persisted_mode(mode).to_string(),
                     });
-                    if let Some(store) = store.as_mut() {
+                    if let Some(store) = &store {
                         if let Some(turn) = session.messages.last() {
-                            if let Err(e) = store.append_turn(turn) {
-                                tracing::warn!("session persist (mode change) failed: {e}");
-                            }
+                            append_shared(store, turn, "mode change");
                         }
                     }
-                    persisted = session.messages.len();
                 }
             }
             DriverCmd::Rewind { steps } => {
@@ -95,7 +109,7 @@ pub(crate) async fn driver_task(
                             report.turns,
                             report.restored.len()
                         );
-                        let _ = events.send(AgentEvent::Notice(text.clone()));
+                        events.send(AgentEvent::Notice(text.clone()));
                         // Mark the rewind in the transcript so a resumed session
                         // and the model see it. The transcript is append-only,
                         // so the rewound turns stay in history; files are restored.
@@ -103,20 +117,62 @@ pub(crate) async fn driver_task(
                             kind: NoteKind::Notice,
                             text,
                         });
-                        if let Some(store) = store.as_mut() {
+                        if let Some(store) = &store {
                             if let Some(turn) = session.messages.last() {
-                                if let Err(e) = store.append_turn(turn) {
-                                    tracing::warn!("session persist (rewind note) failed: {e}");
-                                }
+                                append_shared(store, turn, "rewind note");
                             }
-                            persisted = session.messages.len();
                         }
                     }
                     Err(e) => {
-                        let _ = events.send(AgentEvent::Error(format!("rewind failed: {e}")));
+                        events.send(AgentEvent::Error(format!("rewind failed: {e}")));
                     }
                 }
-                let _ = events.send(AgentEvent::Idle);
+                events.send(AgentEvent::Idle);
+            }
+            DriverCmd::Compact => {
+                let summary = compaction_summary(&session.messages);
+                let note = Turn::SystemNote {
+                    kind: NoteKind::Compaction,
+                    text: summary,
+                };
+                session.messages.push(note);
+                if let Some(store) = &store {
+                    if let Some(turn) = session.messages.last() {
+                        append_shared(store, turn, "compaction");
+                    }
+                }
+                events.send(AgentEvent::Notice(
+                    "Context compacted; future requests start from the saved summary.".into(),
+                ));
+                events.send(AgentEvent::Idle);
+            }
+            DriverCmd::SetGoal(goal) => {
+                let text = goal.unwrap_or_default();
+                session.messages.push(Turn::SystemNote {
+                    kind: NoteKind::Goal,
+                    text: text.clone(),
+                });
+                if let Some(store) = &store {
+                    if let Some(turn) = session.messages.last() {
+                        append_shared(store, turn, "goal");
+                    }
+                }
+                let notice = if text.is_empty() {
+                    "Session goal cleared.".to_string()
+                } else {
+                    format!("Session goal set: {text}")
+                };
+                events.send(AgentEvent::Notice(notice));
+                events.send(AgentEvent::Idle);
+            }
+            DriverCmd::ShowGoal => {
+                let notice = active_goal(&session.messages)
+                    .map(|goal| format!("Active goal: {goal}"))
+                    .unwrap_or_else(|| {
+                        "No active goal. Set one with /goal <objective>.".to_string()
+                    });
+                events.send(AgentEvent::Notice(notice));
+                events.send(AgentEvent::Idle);
             }
         }
     }
@@ -124,8 +180,116 @@ pub(crate) async fn driver_task(
     // The driver loop has exited (the runtime is shutting down). Kill any
     // background shells so they don't outlive `rc` — std `Child` won't kill on
     // drop, so this must be explicit.
-    if let Ok(mut s) = session.shell_state.lock() {
-        s.shutdown();
+    session
+        .shell_state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .shutdown();
+}
+
+fn append_shared(store: &SessionWriter, turn: &Turn, _kind: &str) {
+    store.append(turn);
+}
+
+fn active_goal(turns: &[Turn]) -> Option<&str> {
+    turns
+        .iter()
+        .rev()
+        .find_map(|turn| match turn {
+            Turn::SystemNote {
+                kind: NoteKind::Goal,
+                text,
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .filter(|goal| !goal.trim().is_empty())
+}
+
+/// Build a bounded, deterministic context checkpoint. Tool bodies and private
+/// reasoning are deliberately omitted; recent user/assistant content is kept
+/// verbatim because it is safer than inventing a lossy semantic summary in the
+/// runtime. The newest entries win when the cap is reached.
+fn compaction_summary(turns: &[Turn]) -> String {
+    const CAP_CHARS: usize = 16_000;
+    let active_start = turns
+        .iter()
+        .rposition(|turn| {
+            matches!(
+                turn,
+                Turn::SystemNote {
+                    kind: NoteKind::Compaction,
+                    ..
+                }
+            )
+        })
+        .unwrap_or(0);
+    let mut entries = Vec::new();
+    for turn in &turns[active_start..] {
+        let entry = match turn {
+            Turn::User { content, .. } => Some(format!("User: {content}")),
+            Turn::Assistant { text, calls, .. } => {
+                let tools = calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match (text.trim().is_empty(), tools.is_empty()) {
+                    (false, true) => Some(format!("Assistant: {text}")),
+                    (false, false) => Some(format!("Assistant: {text}\nTools used: {tools}")),
+                    (true, false) => Some(format!("Tools used: {tools}")),
+                    (true, true) => None,
+                }
+            }
+            Turn::SystemNote {
+                kind: NoteKind::Compaction,
+                text,
+            } => Some(format!("Previous summary: {text}")),
+            Turn::SystemNote {
+                kind: NoteKind::Notice | NoteKind::Recovery,
+                text,
+            } => Some(format!("Note: {text}")),
+            Turn::SystemNote {
+                kind: NoteKind::Goal | NoteKind::ModeChange,
+                ..
+            }
+            | Turn::ToolResult { .. }
+            | Turn::Error { .. }
+            | Turn::Cancelled { .. } => None,
+        };
+        if let Some(entry) = entry {
+            entries.push(entry);
+        }
+    }
+
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for entry in entries.into_iter().rev() {
+        let chars = entry.chars().count();
+        let remaining = CAP_CHARS.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        if chars <= remaining {
+            used += chars;
+            kept.push(entry);
+        } else {
+            let tail = entry
+                .chars()
+                .rev()
+                .take(remaining)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            kept.push(format!("[…older content elided…]{tail}"));
+            break;
+        }
+    }
+    kept.reverse();
+    if kept.is_empty() {
+        "No conversational content preceded this compaction.".into()
+    } else {
+        kept.join("\n\n")
     }
 }
 

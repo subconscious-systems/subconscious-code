@@ -126,7 +126,10 @@ mod tests {
     #[test]
     fn zero_pricing_is_a_noop() {
         let p = Pricing::ZERO;
-        assert_eq!(p.cost_of(&usage(1_000_000, 500_000, None)).as_micro_usd(), 0);
+        assert_eq!(
+            p.cost_of(&usage(1_000_000, 500_000, None)).as_micro_usd(),
+            0
+        );
     }
 
     #[test]

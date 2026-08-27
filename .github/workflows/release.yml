@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  linux-binaries:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Build sc
+        run: cross build --locked --release --target "${{ matrix.target }}" --bin sc
+      - name: Package binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist/package
+          cp "target/$TARGET/release/sc" dist/package/sc
+          tar -C dist/package -czf "dist/sc-$TARGET.tar.gz" sc
+          (cd dist && sha256sum "sc-$TARGET.tar.gz" > "sc-$TARGET.tar.gz.sha256")
+          cosign sign-blob --yes \
+            --bundle "dist/sc-$TARGET.tar.gz.sigstore.json" \
+            "dist/sc-$TARGET.tar.gz"
+          cosign sign-blob --yes \
+            --bundle "dist/sc-$TARGET.tar.gz.sha256.sigstore.json" \
+            "dist/sc-$TARGET.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sc-${{ matrix.target }}.tar.gz
+            dist/sc-${{ matrix.target }}.tar.gz.sha256
+            dist/sc-${{ matrix.target }}.tar.gz.sigstore.json
+            dist/sc-${{ matrix.target }}.tar.gz.sha256.sigstore.json
+
+  harbor-wheel:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Build Harbor adapter
+        run: |
+          uv build integrations/harbor --out-dir dist
+          sha256sum dist/* > dist/SHA256SUMS
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

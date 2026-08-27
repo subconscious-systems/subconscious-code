@@ -11,7 +11,7 @@ live-verification steps, and `sc --doctor` now automates most of Phase 0.
 | --- | --- |
 | Binary / command | `sc` |
 | Product name | Subconscious Code |
-| Default base URL | `https://api-dev.subconscious.dev/v1` |
+| Default base URL | `https://api.subconscious.dev/v1` |
 | Default model | `subconscious/glm-5.2` |
 | API key | `$SC_API_KEY` (user-supplied; never in the repo) |
 | Config dir | `~/.sc/` (settings, sessions, memory, bg logs) |

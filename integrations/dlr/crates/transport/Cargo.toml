@@ -1,0 +1,16 @@
+[package]
+name = "dlr-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dlr-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+crossbeam-channel = "0.5"
+
+[lib]
+path = "src/lib.rs"

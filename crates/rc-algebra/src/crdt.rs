@@ -204,7 +204,10 @@ mod tests {
         s.add(entry(7, 1));
         assert!(s.contains(7));
         s.evict(7, 2);
-        assert!(!s.contains(7), "tombstone at epoch 2 hides entry at epoch 1");
+        assert!(
+            !s.contains(7),
+            "tombstone at epoch 2 hides entry at epoch 1"
+        );
         // Re-add at a strictly higher epoch resurrects it.
         s.add(entry(7, 3));
         assert!(s.contains(7), "a higher-epoch add must beat the tombstone");
@@ -215,7 +218,10 @@ mod tests {
         let mut s = PrefixSet::new();
         s.add(entry(7, 5));
         s.evict(7, 3); // tombstone below the entry epoch
-        assert!(s.contains(7), "low-epoch tombstone must not evict a newer entry");
+        assert!(
+            s.contains(7),
+            "low-epoch tombstone must not evict a newer entry"
+        );
     }
 
     #[test]

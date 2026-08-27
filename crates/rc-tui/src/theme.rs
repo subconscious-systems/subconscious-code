@@ -21,12 +21,39 @@ use std::sync::OnceLock;
 const ACCENT_RGB: Color = Color::Rgb(255, 92, 39);
 /// Dimmer brand orange — deep headings.
 const ACCENT_DIM_RGB: Color = Color::Rgb(184, 74, 30);
+/// Dark tints that read like a translucent diff overlay on the default black
+/// terminal background, rather than saturated ANSI highlight colors.
+pub(crate) const DIFF_ADDED_BG: Color = Color::Rgb(28, 57, 39);
+pub(crate) const DIFF_REMOVED_BG: Color = Color::Rgb(67, 30, 32);
 
 /// One-cell terminal reduction of `logo.svg`'s six-petal flower. `✻` keeps the
 /// same radial/petaled silhouette at the smallest size a terminal can render;
 /// it is used as the tiny assistant-output/activity mark, while the checked-in
 /// raster below preserves the exact SVG at larger sizes.
 pub const DEFAULT_LOGO: &str = "✻";
+
+/// Terminal raster of the checked-in `logo.svg`, sampled into half-block cells
+/// so each terminal row carries two square image pixels. Embedding it keeps
+/// startup independent of terminal image protocols, SVG parsing, and file I/O.
+pub const LOGO_ART_SMALL: &str = include_str!("../assets/logo.txt");
+
+/// Warm loading colors, moving from the brand orange through amber and back.
+/// The glyph changes silhouette at the same time, which keeps the animation
+/// legible in terminals that quantize truecolor.
+const LOADING_RGB: [Color; 8] = [
+    Color::Rgb(255, 92, 39),
+    Color::Rgb(255, 119, 42),
+    Color::Rgb(255, 151, 49),
+    Color::Rgb(255, 190, 69),
+    Color::Rgb(255, 215, 112),
+    Color::Rgb(255, 165, 55),
+    Color::Rgb(255, 112, 39),
+    Color::Rgb(184, 74, 30),
+];
+
+pub(crate) fn loading_color(phase: usize) -> Color {
+    LOADING_RGB[phase % LOADING_RGB.len()]
+}
 
 /// The resolved color budget, constructed once from the environment.
 pub struct Palette {
@@ -57,6 +84,24 @@ impl Palette {
     pub fn accent_dim(&self) -> Style {
         self.paint(ACCENT_DIM_RGB)
     }
+    pub fn loading(&self, phase: usize) -> Style {
+        self.paint(loading_color(phase))
+    }
+    /// One character in the Codex-style activity shimmer. The moving band
+    /// blends quiet grey toward white; bold keeps the sweep legible at small
+    /// terminal font sizes. `NO_COLOR` reduces it to unstyled text.
+    pub fn shimmer(&self, intensity: f32) -> Style {
+        if self.no_color {
+            return Style::new();
+        }
+        let alpha = intensity.clamp(0.0, 1.0) * 0.9;
+        let base = 128.0;
+        let highlight = 255.0;
+        let level = (highlight * alpha + base * (1.0 - alpha)) as u8;
+        Style::new()
+            .fg(Color::Rgb(level, level, level))
+            .add_modifier(Modifier::BOLD)
+    }
     /// Chrome — bullets, dim rules, the gutter, tool glyphs, status labels,
     /// compose hints. 16-color `DarkGray`.
     pub fn chrome(&self) -> Style {
@@ -70,6 +115,16 @@ impl Palette {
     /// Body text — the terminal's default foreground.
     pub fn body(&self) -> Style {
         Style::new()
+    }
+    /// Submitted user turns — a quiet grey bubble that separates prompts from
+    /// assistant output. Reversed video provides the same enclosure when
+    /// `NO_COLOR` is active.
+    pub fn user_prompt(&self) -> Style {
+        if self.no_color {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().fg(Color::White).bg(Color::DarkGray)
+        }
     }
     /// A link — cyan + underlined (underlined only under `NO_COLOR`).
     pub fn link(&self) -> Style {
@@ -97,6 +152,21 @@ impl Palette {
     /// monochrome under `NO_COLOR`, where the glyph/word alone carries meaning.
     pub fn semantic(&self, c: Color) -> Style {
         self.paint(c)
+    }
+    /// A changed file row: retain the terminal's normal foreground over a
+    /// subtle red/green tint. Under `NO_COLOR`, reversed video keeps the row
+    /// visibly highlighted.
+    pub fn diff_highlight(&self, c: Color) -> Style {
+        if self.no_color {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            let background = match c {
+                Color::Green => DIFF_ADDED_BG,
+                Color::Red => DIFF_REMOVED_BG,
+                other => other,
+            };
+            Style::new().bg(background)
+        }
     }
     /// The menu's selected row: brand bg, black text; reversed under `NO_COLOR`.
     pub fn menu_selected(&self) -> Style {
@@ -144,18 +214,22 @@ pub fn animations_enabled() -> bool {
 /// echo "✻" > ~/.sc/logo.txt        # a single Unicode mark
 /// echo "(o)" > ~/.sc/logo.txt      # or a short ASCII token
 /// ```
-pub fn logo_glyph() -> String {
-    let Ok(home) = std::env::var("HOME") else {
-        return DEFAULT_LOGO.to_string();
-    };
-    let path = std::path::Path::new(&home).join(".sc").join("logo.txt");
-    let Ok(s) = std::fs::read_to_string(&path) else {
-        return DEFAULT_LOGO.to_string();
-    };
-    s.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map(|l| l.chars().take(8).collect())
-        .filter(|l: &String| !l.is_empty())
-        .unwrap_or_else(|| DEFAULT_LOGO.to_string())
+pub fn logo_glyph() -> &'static str {
+    static GLYPH: OnceLock<String> = OnceLock::new();
+    GLYPH
+        .get_or_init(|| {
+            let custom = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".sc").join("logo.txt"))
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|body| {
+                    body.lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(|line| line.chars().take(8).collect::<String>())
+                })
+                .filter(|line| !line.is_empty());
+            custom.unwrap_or_else(|| DEFAULT_LOGO.to_string())
+        })
+        .as_str()
 }

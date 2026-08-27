@@ -43,18 +43,14 @@ impl LtHash {
     /// Add `block`'s group element: `self += H(block)` (elementwise u16 add).
     pub fn add_block(&mut self, block: &BlockId) {
         let elem = expand_to_element(block);
-        for (a, b) in self.0.iter_mut().zip(elem.iter()) {
-            *a = a.wrapping_add(*b);
-        }
+        add_assign(&mut self.0, &elem);
     }
 
     /// Remove `block`'s group element: `self -= H(block)` — the group inverse
     /// of [`add_block`]. This is the eviction primitive.
     pub fn remove(&mut self, block: &BlockId) {
         let elem = expand_to_element(block);
-        for (a, b) in self.0.iter_mut().zip(elem.iter()) {
-            *a = a.wrapping_sub(*b);
-        }
+        sub_assign(&mut self.0, &elem);
     }
 
     /// The 2048-byte canonical key (little-endian limbs). Two `ContextSet`s
@@ -82,18 +78,195 @@ impl Monoid for LtHash {
         Self::ZERO
     }
     fn op(&mut self, other: &Self) {
-        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
-            *a = a.wrapping_add(*b);
-        }
+        add_assign(&mut self.0, &other.0);
     }
 }
 
 impl Group for LtHash {
     fn inv_op(&mut self, other: &Self) {
-        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
-            *a = a.wrapping_sub(*b);
-        }
+        sub_assign(&mut self.0, &other.0);
     }
+}
+
+#[inline]
+#[cfg(not(target_arch = "aarch64"))]
+fn add_assign_scalar(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    for (a, b) in lhs.iter_mut().zip(rhs) {
+        *a = a.wrapping_add(*b);
+    }
+}
+
+#[inline]
+#[cfg(not(target_arch = "aarch64"))]
+fn sub_assign_scalar(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    for (a, b) in lhs.iter_mut().zip(rhs) {
+        *a = a.wrapping_sub(*b);
+    }
+}
+
+// AArch64 guarantees NEON, so there is no runtime dispatch on that target.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn add_assign(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    // SAFETY: AArch64 guarantees Advanced SIMD and both operands are fixed at
+    // 2048 bytes, exactly the range consumed by the assembly loop.
+    unsafe { add_assign_neon_asm(lhs, rhs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn sub_assign(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    // SAFETY: same fixed-size and ISA guarantees as `add_assign_neon_asm`.
+    unsafe { sub_assign_neon_asm(lhs, rhs) }
+}
+
+/// Four-vector AArch64/NEON wrapping-add kernel. Keeping the complete loop in
+/// one assembly block fixes the unroll factor and removes bounds, iterator,
+/// and per-vector loop bookkeeping from this 2048-byte primitive.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn add_assign_neon_asm(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    use std::arch::asm;
+
+    let lhs_ptr = lhs.as_mut_ptr();
+    let rhs_ptr = rhs.as_ptr();
+    let end = lhs_ptr.add(1024);
+
+    asm!(
+        "2:",
+        "ldp q0, q1, [{lhs}]",
+        "ldp q2, q3, [{lhs}, #32]",
+        "ldp q4, q5, [{rhs}]",
+        "ldp q6, q7, [{rhs}, #32]",
+        "add v0.8h, v0.8h, v4.8h",
+        "add v1.8h, v1.8h, v5.8h",
+        "add v2.8h, v2.8h, v6.8h",
+        "add v3.8h, v3.8h, v7.8h",
+        "stp q0, q1, [{lhs}]",
+        "stp q2, q3, [{lhs}, #32]",
+        "add {lhs}, {lhs}, #64",
+        "add {rhs}, {rhs}, #64",
+        "cmp {lhs}, {end}",
+        "b.lo 2b",
+        lhs = inout(reg) lhs_ptr => _,
+        rhs = inout(reg) rhs_ptr => _,
+        end = in(reg) end,
+        out("v0") _,
+        out("v1") _,
+        out("v2") _,
+        out("v3") _,
+        out("v4") _,
+        out("v5") _,
+        out("v6") _,
+        out("v7") _,
+        options(nostack),
+    );
+}
+
+/// Four-vector AArch64/NEON wrapping-subtract twin of
+/// [`add_assign_neon_asm`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sub_assign_neon_asm(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    use std::arch::asm;
+
+    let lhs_ptr = lhs.as_mut_ptr();
+    let rhs_ptr = rhs.as_ptr();
+    let end = lhs_ptr.add(1024);
+
+    asm!(
+        "2:",
+        "ldp q0, q1, [{lhs}]",
+        "ldp q2, q3, [{lhs}, #32]",
+        "ldp q4, q5, [{rhs}]",
+        "ldp q6, q7, [{rhs}, #32]",
+        "sub v0.8h, v0.8h, v4.8h",
+        "sub v1.8h, v1.8h, v5.8h",
+        "sub v2.8h, v2.8h, v6.8h",
+        "sub v3.8h, v3.8h, v7.8h",
+        "stp q0, q1, [{lhs}]",
+        "stp q2, q3, [{lhs}, #32]",
+        "add {lhs}, {lhs}, #64",
+        "add {rhs}, {rhs}, #64",
+        "cmp {lhs}, {end}",
+        "b.lo 2b",
+        lhs = inout(reg) lhs_ptr => _,
+        rhs = inout(reg) rhs_ptr => _,
+        end = in(reg) end,
+        out("v0") _,
+        out("v1") _,
+        out("v2") _,
+        out("v3") _,
+        out("v4") _,
+        out("v5") _,
+        out("v6") _,
+        out("v7") _,
+        options(nostack),
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn add_assign(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was detected and the kernel stays inside both arrays.
+        unsafe { add_assign_avx2(lhs, rhs) }
+    } else {
+        add_assign_scalar(lhs, rhs)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sub_assign(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was detected and the kernel stays inside both arrays.
+        unsafe { sub_assign_avx2(lhs, rhs) }
+    } else {
+        sub_assign_scalar(lhs, rhs)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_assign_avx2(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    use std::arch::x86_64::{__m256i, _mm256_add_epi16, _mm256_loadu_si256, _mm256_storeu_si256};
+
+    for i in (0..1024).step_by(16) {
+        let a = _mm256_loadu_si256(lhs.as_ptr().add(i).cast::<__m256i>());
+        let b = _mm256_loadu_si256(rhs.as_ptr().add(i).cast::<__m256i>());
+        _mm256_storeu_si256(
+            lhs.as_mut_ptr().add(i).cast::<__m256i>(),
+            _mm256_add_epi16(a, b),
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sub_assign_avx2(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256, _mm256_sub_epi16};
+
+    for i in (0..1024).step_by(16) {
+        let a = _mm256_loadu_si256(lhs.as_ptr().add(i).cast::<__m256i>());
+        let b = _mm256_loadu_si256(rhs.as_ptr().add(i).cast::<__m256i>());
+        _mm256_storeu_si256(
+            lhs.as_mut_ptr().add(i).cast::<__m256i>(),
+            _mm256_sub_epi16(a, b),
+        );
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline]
+fn add_assign(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    add_assign_scalar(lhs, rhs)
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline]
+fn sub_assign(lhs: &mut [u16; 1024], rhs: &[u16; 1024]) {
+    sub_assign_scalar(lhs, rhs)
 }
 
 /// A content address: the SHA-256 of a block's canonical bytes.
@@ -126,28 +299,17 @@ impl BlockId {
 
 /// Expand a 32-byte [`BlockId`] to a 2048-byte (1024 × u16) group element.
 ///
-/// Runs SHA-256 in CTR mode seeded with the digest: block `k` hashes
-/// `digest || k.to_le_bytes()`, yielding 32 bytes per call; 64 calls fill 2048
-/// bytes, read as 1024 little-endian u16. This is a PRG-ish mapping — distinct
-/// digests spread across the full group — which is what defeats the
-/// duplicate-cancellation of an XOR-fold.
+/// Uses BLAKE3's domain-separated XOF to fill 2048 bytes in one streaming
+/// operation, then reads those bytes as 1024 little-endian u16s. BLAKE3
+/// dispatches to its optimized SIMD/assembly implementation at runtime.
 pub(crate) fn expand_to_element(block: &BlockId) -> [u16; 1024] {
     let mut out = [0u16; 1024];
     let mut buf = [0u8; 2048];
-    let mut counter: u32 = 0;
-    let mut pos = 0;
-    while pos < buf.len() {
-        let mut h = Sha256::new();
-        h.update(block.as_bytes());
-        h.update(counter.to_le_bytes());
-        let digest = h.finalize();
-        let take = (buf.len() - pos).min(digest.len());
-        buf[pos..pos + take].copy_from_slice(&digest[..take]);
-        pos += take;
-        counter += 1;
-    }
-    for (i, chunk) in buf.chunks_exact(2).enumerate() {
-        out[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+    let mut h = blake3::Hasher::new_derive_key("subconscious-code LtHash element v1");
+    h.update(block.as_bytes());
+    h.finalize_xof().fill(&mut buf);
+    for (i, chunk) in buf.as_chunks::<2>().0.iter().enumerate() {
+        out[i] = u16::from_le_bytes(*chunk);
     }
     out
 }
@@ -224,6 +386,62 @@ impl ContextSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    /// Manual release-mode microbenchmark for the two LtHash kernels. Kept
+    /// ignored so ordinary test runs stay deterministic and fast:
+    /// `cargo test -p rc-algebra --release bench_lthash_kernels -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_lthash_kernels() {
+        const EXPAND_ITERS: usize = 20_000;
+        const FOLD_ITERS: usize = 1_000_000;
+        let id = BlockId::from_bytes(b"representative context block");
+
+        let mut expanded = LtHash::ZERO;
+        let start = Instant::now();
+        for _ in 0..EXPAND_ITERS {
+            expanded.add_block(black_box(&id));
+        }
+        let expand_elapsed = start.elapsed();
+
+        let rhs = expanded.clone();
+        let mut folded = LtHash::ZERO;
+        let start = Instant::now();
+        for _ in 0..FOLD_ITERS {
+            folded.op(black_box(&rhs));
+        }
+        let fold_elapsed = start.elapsed();
+
+        black_box((expanded, folded));
+        eprintln!(
+            "LtHash add_block: {:.1} ns/op; fold: {:.1} ns/op",
+            expand_elapsed.as_nanos() as f64 / EXPAND_ITERS as f64,
+            fold_elapsed.as_nanos() as f64 / FOLD_ITERS as f64,
+        );
+    }
+
+    #[test]
+    fn vector_kernels_match_wrapping_scalar_arithmetic() {
+        let mut source = [0u16; 1024];
+        let mut rhs = [0u16; 1024];
+        for i in 0..1024 {
+            source[i] = (i as u16).wrapping_mul(251).wrapping_add(65_000);
+            rhs[i] = (i as u16).wrapping_mul(509).wrapping_add(1_000);
+        }
+
+        let expected_add = std::array::from_fn(|i| source[i].wrapping_add(rhs[i]));
+        let expected_sub = std::array::from_fn(|i| source[i].wrapping_sub(rhs[i]));
+
+        let mut actual = source;
+        add_assign(&mut actual, &rhs);
+        assert_eq!(actual, expected_add);
+
+        actual = source;
+        sub_assign(&mut actual, &rhs);
+        assert_eq!(actual, expected_sub);
+    }
 
     #[test]
     fn add_is_commutative() {
@@ -257,7 +475,11 @@ mod tests {
         let mut s = LtHash::ZERO;
         s.add_block(&a);
         s.add_block(&a);
-        assert_ne!(s, LtHash::ZERO, "additive LtHash must not cancel duplicates");
+        assert_ne!(
+            s,
+            LtHash::ZERO,
+            "additive LtHash must not cancel duplicates"
+        );
     }
 
     #[test]

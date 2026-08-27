@@ -17,6 +17,7 @@
 
 use crate::error::ProtoError;
 use crate::wire::Usage;
+use bytes::BytesMut;
 use serde::Deserialize;
 
 // ---- chunk / delta types ----------------------------------------------------
@@ -105,11 +106,26 @@ impl FinishReason {
 /// (parsed) or as a parse error the loop turns into a `role:tool` error result.
 #[derive(Debug, Clone)]
 pub enum AgentStreamEvent {
+    /// The HTTP body made progress without producing a model event yet.
+    ///
+    /// SSE comments (for example Orange Line's `: heartbeat`) and partial
+    /// `data:` frames are valid transport activity. Surfacing that activity to
+    /// `rc-core` lets its idle timeout measure a quiet socket rather than a
+    /// quiet model, while keeping heartbeats out of the transcript and UI.
+    TransportActivity,
     /// Assistant text delta.
     Text(String),
     /// Reasoning delta (field mode; §3.4). Tag-mode reasoning is split out of
     /// `Text` by rc-core before persistence.
     Reasoning(String),
+    /// Incomplete tool-call metadata/arguments. Diagnostic only: rc-core
+    /// records a bounded snapshot on failure but never executes this event.
+    ToolCallProgress {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    },
     /// A tool call whose arguments parsed. `arguments` is the model's (or
     /// repaired) argument JSON *string* — preserved verbatim so the assistant
     /// message re-sent next turn is byte-identical (§4.6).
@@ -359,7 +375,7 @@ pub fn repair(input: &str) -> String {
 /// `data:` lines yield parsed chunks. `data: [DONE]` sets [`SseDecoder::is_done`].
 #[derive(Default)]
 pub struct SseDecoder {
-    buf: Vec<u8>,
+    buf: BytesMut,
     done: bool,
 }
 
@@ -383,14 +399,16 @@ impl SseDecoder {
         if self.buf.is_empty() {
             return vec![];
         }
-        let line = std::mem::take(&mut self.buf);
+        let line = self.buf.split().freeze();
         self.parse_line(&line)
     }
 
     fn drain_lines(&mut self) -> Vec<Result<ChatCompletionChunk, ProtoError>> {
         let mut out = vec![];
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+        while let Some(nl) = memchr::memchr(b'\n', &self.buf) {
+            // `split_to` advances the buffer without shifting the unread tail;
+            // `freeze` makes the completed line an immutable zero-copy view.
+            let line = self.buf.split_to(nl + 1).freeze();
             out.extend(self.parse_line(&line));
         }
         out
@@ -464,6 +482,21 @@ impl StreamFuser {
                 out.push(AgentStreamEvent::Reasoning(r));
             }
             for tc in &choice.delta.tool_calls {
+                let (name, arguments) = tc.function.as_ref().map_or_else(
+                    || (None, String::new()),
+                    |function| {
+                        (
+                            function.name.clone(),
+                            function.arguments.clone().unwrap_or_default(),
+                        )
+                    },
+                );
+                out.push(AgentStreamEvent::ToolCallProgress {
+                    index: tc.index as usize,
+                    id: tc.id.clone(),
+                    name,
+                    arguments,
+                });
                 self.acc.apply(tc);
             }
             if let Some(fr) = choice.finish_reason {
@@ -536,7 +569,7 @@ mod tests {
     /// A streaming delta that sends `"tool_calls": null` (GLM-class gateways do
     /// this on text/content chunks) must deserialize to an empty vec, not fail
     /// with "invalid type: null, expected a sequence" — observed against the
-    /// real gateway, where it killed tool-calling entirely (`sc --doctor`).
+    /// real gateway, where it killed tool-calling entirely (`sc doctor`).
     #[test]
     fn delta_tolerates_null_tool_calls() {
         let chunk: ChatCompletionChunk = serde_json::from_str(
@@ -773,6 +806,65 @@ mod tests {
             }
         }
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn fuser_assembles_two_interleaved_tool_calls() {
+        let mut f = StreamFuser::new();
+        let first = serde_json::from_str::<ChatCompletionChunk>(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"read-1","function":{"name":"Read","arguments":"{\"file_"}},
+                {"index":1,"id":"grep-1","function":{"name":"Grep","arguments":"{\"pat"}}
+            ]}}]}"#,
+        )
+        .unwrap();
+        let second = serde_json::from_str::<ChatCompletionChunk>(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":1,"function":{"arguments":"tern\":\"needle\"}"}},
+                {"index":0,"function":{"arguments":"path\":\"src/lib.rs\"}"}}
+            ]}}]}"#,
+        )
+        .unwrap();
+        let finish = serde_json::from_str::<ChatCompletionChunk>(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        events.extend(f.apply(first));
+        events.extend(f.apply(second));
+        events.extend(f.apply(finish));
+        let progress: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentStreamEvent::ToolCallProgress {
+                    index, arguments, ..
+                } => Some((*index, arguments.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress.len(), 4);
+        assert!(progress.contains(&(0, r#"{"file_"#)));
+        assert!(progress.contains(&(1, r#"tern":"needle"}"#)));
+        let ready: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentStreamEvent::ToolCallReady {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.as_str(), name.as_str(), arguments.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            ready,
+            vec![
+                ("read-1", "Read", r#"{"file_path":"src/lib.rs"}"#),
+                ("grep-1", "Grep", r#"{"pattern":"needle"}"#),
+            ]
+        );
     }
 
     // ---- completion-gated finalize (§3.3 / F1) ---------------------------------

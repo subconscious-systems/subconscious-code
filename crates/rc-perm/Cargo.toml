@@ -13,3 +13,4 @@ shlex = "1"
 globset = "0.4"
 
 [dev-dependencies]
+tempfile = "3"

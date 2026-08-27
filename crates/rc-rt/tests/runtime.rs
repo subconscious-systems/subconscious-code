@@ -5,13 +5,14 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rc_core::{
-    AgentLoop, AgentMode, AllowAllChecker, AskResponse, Concurrency, EventSink, FinalizedToolCall,
-    FinishReason, LoopOutcome, Mode, Model, ModelError, ModelRequest, ModelResponse,
-    PermissionChecker, PermissionEngine, Session, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome,
-    ToolRegistry, Turn,
+    AgentLoop, AgentMode, AllowAllChecker, Artifact, AskResponse, Concurrency, EventSink,
+    FinalizedToolCall, FinishReason, LoopOutcome, Mode, Model, ModelError, ModelRequest,
+    ModelResponse, PermissionChecker, PermissionEngine, Session, Tool, ToolCall, ToolCtx,
+    ToolError, ToolOutcome, ToolRegistry, Turn,
 };
 use rc_rt::{AgentEvent, EventStream, Runtime, UserAction};
 use serde_json::{json, Value};
@@ -79,8 +80,37 @@ impl Tool for Echo {
     }
 }
 
+struct ChangeFile;
+#[async_trait]
+impl Tool for ChangeFile {
+    fn name(&self) -> &str {
+        "ChangeFile"
+    }
+    fn description(&self) -> &str {
+        "Emit a deterministic file-change artifact for runtime tests."
+    }
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::SerialWrite
+    }
+    async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+        Ok(ToolOutcome::Ok {
+            content: "changed".into(),
+            truncated: false,
+            artifacts: vec![Artifact::FileChange {
+                path: "src/main.rs".into(),
+                before: Some(b"old\n".to_vec().into()),
+                after: Some(b"new\nmore\n".to_vec().into()),
+            }],
+        })
+    }
+}
+
 fn resp_with_call(id: &str, name: &str, args: Value) -> ModelResponse {
-    ModelResponse { retries: 0,
+    ModelResponse {
+        retries: 0,
         text: String::new(),
         reasoning: None,
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -93,7 +123,8 @@ fn resp_with_call(id: &str, name: &str, args: Value) -> ModelResponse {
     }
 }
 fn resp_stop(text: &str) -> ModelResponse {
-    ModelResponse { retries: 0,
+    ModelResponse {
+        retries: 0,
         text: text.to_string(),
         reasoning: None,
         tool_calls: vec![],
@@ -186,7 +217,162 @@ async fn turn_emits_tool_and_outcome_events() {
             .any(|e| matches!(e, AgentEvent::Outcome(LoopOutcome::Stop))),
         "Outcome Stop"
     );
-    rt.shutdown();
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn event_queue_coalesces_a_burst_without_losing_text() {
+    struct BurstModel;
+    #[async_trait]
+    impl Model for BurstModel {
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            for index in 0..1_000 {
+                sink.on_text(&format!("{index},"));
+            }
+            Ok(resp_stop("done"))
+        }
+    }
+
+    let rt = Runtime::new(
+        agent(
+            Arc::new(BurstModel),
+            Arc::new(ToolRegistry::new(vec![])),
+            Arc::new(AllowAllChecker),
+        ),
+        session(),
+        None,
+    );
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Submit("burst".into()));
+    // Deliberately let the producer get ahead of the host. The former
+    // 256-entry broadcast ring lost the first events in this exact shape.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let got = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    let streamed = got
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(streamed.matches(',').count(), 1_000);
+    assert!(streamed.starts_with("0,1,2,"));
+    assert!(streamed.ends_with("999,"));
+    assert!(got
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Outcome(LoopOutcome::Stop))));
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_submit_is_rejected_until_the_active_turn_finishes() {
+    struct GatedModel {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Model for GatedModel {
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            sink.on_text("first turn finished");
+            Ok(resp_stop("first turn finished"))
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let rt = Runtime::new(
+        agent(
+            Arc::new(GatedModel {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Arc::new(ToolRegistry::new(vec![])),
+            Arc::new(AllowAllChecker),
+        ),
+        session(),
+        None,
+    );
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Submit("first".into()));
+    entered.notified().await;
+    rt.action(UserAction::Submit("duplicate".into()));
+
+    let notice = wait_for(&mut rx, |event| {
+        matches!(event, AgentEvent::Notice(message) if message.contains("duplicate submission"))
+    })
+    .await;
+    assert!(matches!(notice, AgentEvent::Notice(_)));
+
+    release.notify_one();
+    let got = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    assert!(got
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Text(text) if text == "first turn finished")));
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn file_change_artifact_arrives_before_its_tool_end() {
+    let tools = Arc::new(ToolRegistry::new(vec![
+        Arc::new(ChangeFile) as Arc<dyn Tool>
+    ]));
+    let model = Arc::new(MockModel::new(vec![
+        resp_with_call("change-1", "ChangeFile", json!({})),
+        resp_stop("done"),
+    ])) as Arc<dyn Model>;
+    let rt = Runtime::new(
+        agent(
+            model,
+            tools,
+            Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+        ),
+        session(),
+        None,
+    );
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Submit("change it".into()));
+
+    let got = drain_until(&mut rx, |e| matches!(e, AgentEvent::Idle)).await;
+    let artifact_at = got
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Artifact { call_id, .. } if call_id == "change-1"))
+        .expect("file artifact");
+    let end_at = got
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolEnd { call_id, .. } if call_id == "change-1"))
+        .expect("tool end");
+    assert!(
+        artifact_at < end_at,
+        "artifact must render before completion"
+    );
+    match &got[artifact_at] {
+        AgentEvent::Artifact {
+            artifact:
+                Artifact::FileChange {
+                    path,
+                    before,
+                    after,
+                },
+            ..
+        } => {
+            assert_eq!(path, std::path::Path::new("src/main.rs"));
+            assert_eq!(before.as_deref(), Some(b"old\n".as_slice()));
+            assert_eq!(after.as_deref(), Some(b"new\nmore\n".as_slice()));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    rt.shutdown().await;
 }
 
 #[tokio::test]
@@ -235,7 +421,7 @@ async fn permission_ask_is_resolved_by_user_action() {
             .any(|e| matches!(e, AgentEvent::Outcome(LoopOutcome::Stop))),
         "Outcome Stop"
     );
-    rt.shutdown();
+    rt.shutdown().await;
 }
 
 #[tokio::test]
@@ -255,28 +441,16 @@ async fn cancel_during_ask_denies_and_ends_turn() {
     rt.action(UserAction::Cancel);
 
     let got = drain_until(&mut rx, |e| matches!(e, AgentEvent::Idle)).await;
-    // Cancel drains the pending ask as Deny → the loop makes a denied result and
-    // the model replies (M4a can't abort the turn mid-stream; it winds to Stop).
-    assert!(
-        got.iter().any(|e| matches!(
-            e,
-            AgentEvent::PermissionDecision {
-                response: AskResponse::Deny(_),
-                ..
-            }
-        )),
-        "PermissionDecision Deny"
-    );
-    assert!(
-        got.iter().any(|e| matches!(e, AgentEvent::ToolEnd { tool, result, .. } if tool == "Edit" && matches!(result, rc_core::ToolResultBody::Denied { .. }))),
-        "ToolEnd Edit Denied"
-    );
+    // Cancellation now interrupts the active permission/tool phase instead of
+    // winding through another model request. The pump may also publish a Deny
+    // decision while clearing the pending prompt, but that event is not needed
+    // to make the turn terminal and invariant-safe.
     assert!(
         got.iter()
-            .any(|e| matches!(e, AgentEvent::Outcome(LoopOutcome::Stop))),
-        "Outcome Stop"
+            .any(|e| matches!(e, AgentEvent::Outcome(LoopOutcome::Cancelled))),
+        "Outcome Cancelled"
     );
-    rt.shutdown();
+    rt.shutdown().await;
 }
 
 #[tokio::test]
@@ -316,7 +490,7 @@ async fn set_mode_bypasses_ask_for_a_mutating_call() {
             .any(|e| matches!(e, AgentEvent::Outcome(LoopOutcome::Stop))),
         "Outcome Stop"
     );
-    rt.shutdown();
+    rt.shutdown().await;
 }
 
 #[tokio::test]
@@ -344,7 +518,7 @@ async fn session_store_persists_turns_after_each_run() {
 
     // Drain to idle so the driver has flushed the turn to the store.
     let _ = drain_until(&mut rx, |e| matches!(e, AgentEvent::Idle)).await;
-    rt.shutdown();
+    rt.shutdown().await;
 
     // The file exists and re-loads the conversation we just ran.
     assert!(path.exists(), "session file was created");
@@ -361,6 +535,69 @@ async fn session_store_persists_turns_after_each_run() {
     );
     // The final assistant turn carries the "done" text.
     assert!(matches!(&loaded.messages[3], Turn::Assistant { text, .. } if text.as_ref() == "done"));
+}
+
+#[tokio::test]
+async fn session_store_is_replayable_while_the_next_request_is_still_running() {
+    use rc_rt::SessionStore;
+
+    struct PausingModel {
+        calls: Mutex<u32>,
+        second_started: Arc<tokio::sync::Notify>,
+        release_second: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl Model for PausingModel {
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            _sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if call == 1 {
+                return Ok(resp_with_call("checkpoint", "Echo", json!({"msg":"saved"})));
+            }
+            self.second_started.notify_one();
+            self.release_second.notified().await;
+            Ok(resp_stop("done"))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("incremental.jsonl");
+    let second_started = Arc::new(tokio::sync::Notify::new());
+    let release_second = Arc::new(tokio::sync::Notify::new());
+    let model = Arc::new(PausingModel {
+        calls: Mutex::new(0),
+        second_started: second_started.clone(),
+        release_second: release_second.clone(),
+    });
+    let initial = session();
+    let store = SessionStore::create(path.clone(), &initial).unwrap();
+    let rt = Runtime::new(
+        agent(
+            model,
+            Arc::new(ToolRegistry::new(vec![Arc::new(Echo)])),
+            Arc::new(AllowAllChecker),
+        ),
+        initial,
+        Some(store),
+    );
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Submit("checkpoint this".into()));
+    second_started.notified().await;
+
+    let loaded = rc_session::load(&path).unwrap();
+    assert_eq!(loaded.messages.len(), 3, "user/call/result must be durable");
+    assert!(matches!(loaded.messages[2], Turn::ToolResult { .. }));
+
+    release_second.notify_one();
+    let _ = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    rt.shutdown().await;
 }
 
 #[tokio::test]
@@ -387,7 +624,7 @@ async fn session_store_persists_the_latest_mode_for_resume() {
     // its append-only metadata note have been handled before Idle arrives.
     rt.action(UserAction::Submit("continue here".into()));
     let _ = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
-    rt.shutdown();
+    rt.shutdown().await;
 
     let loaded = rc_session::load(&path).unwrap();
     assert_eq!(loaded.mode, AgentMode::Auto);
@@ -398,4 +635,126 @@ async fn session_store_persists_the_latest_mode_for_resume() {
             text,
         } if text == "auto"
     )));
+}
+
+#[tokio::test]
+async fn compact_persists_a_summary_and_moves_the_projection_boundary() {
+    use rc_rt::SessionStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compact.jsonl");
+    let model = Arc::new(MockModel::new(vec![])) as Arc<dyn Model>;
+    let tools = Arc::new(ToolRegistry::new(vec![]));
+    let perm = Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>;
+    let mut session = session();
+    session.messages.push(Turn::User {
+        content: "old request with bulky context".into(),
+        ts: std::time::SystemTime::now(),
+    });
+    session.messages.push(Turn::Assistant {
+        text: "important result to retain".into(),
+        reasoning: Some("private reasoning is omitted".into()),
+        calls: vec![],
+        usage: None,
+        cost: None,
+        trace: None,
+    });
+    session.messages.push(Turn::ToolResult {
+        call_id: "old-tool".into(),
+        tool: "Read".into(),
+        result: rc_core::ToolResultBody::Ok {
+            content: "bulky raw tool output must leave context".into(),
+            truncated: false,
+        },
+        duration: Default::default(),
+    });
+
+    let mut store = SessionStore::create(path.clone(), &session).unwrap();
+    for turn in &session.messages {
+        store.append_turn(turn).unwrap();
+    }
+    let rt = Runtime::new(agent(model, tools, perm), session, Some(store));
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Compact);
+    let events = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    rt.shutdown().await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(text) if text.contains("Context compacted")
+    )));
+    let loaded = rc_session::load(&path).unwrap();
+    let summary = loaded
+        .messages
+        .iter()
+        .find_map(|turn| match turn {
+            Turn::SystemNote {
+                kind: rc_core::NoteKind::Compaction,
+                text,
+            } => Some(text),
+            _ => None,
+        })
+        .expect("persisted compaction marker");
+    assert!(summary.contains("important result to retain"));
+    assert!(!summary.contains("private reasoning is omitted"));
+
+    let projected = rc_core::project(&loaded.messages)
+        .into_iter()
+        .map(|message| format!("{message:?}"))
+        .collect::<String>();
+    assert!(!projected.contains("bulky raw tool output must leave context"));
+    assert!(projected.contains("important result to retain"));
+}
+
+#[tokio::test]
+async fn goal_set_show_and_clear_are_persisted_session_state() {
+    use rc_rt::SessionStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("goal.jsonl");
+    let model = Arc::new(MockModel::new(vec![])) as Arc<dyn Model>;
+    let tools = Arc::new(ToolRegistry::new(vec![]));
+    let perm = Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>;
+    let session = session();
+    let store = SessionStore::create(path.clone(), &session).unwrap();
+    let rt = Runtime::new(agent(model, tools, perm), session, Some(store));
+    let mut rx = rt.subscribe();
+
+    rt.action(UserAction::SetGoal(Some("ship the release".into())));
+    let set = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    assert!(set.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(text) if text == "Session goal set: ship the release"
+    )));
+
+    rt.action(UserAction::ShowGoal);
+    let shown = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    assert!(shown.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(text) if text == "Active goal: ship the release"
+    )));
+
+    rt.action(UserAction::SetGoal(None));
+    let _ = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    rt.action(UserAction::ShowGoal);
+    let cleared = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+    rt.shutdown().await;
+    assert!(cleared.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(text) if text.contains("No active goal")
+    )));
+
+    let loaded = rc_session::load(&path).unwrap();
+    let goals = loaded
+        .messages
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::SystemNote {
+                kind: rc_core::NoteKind::Goal,
+                text,
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(goals, vec!["ship the release", ""]);
 }

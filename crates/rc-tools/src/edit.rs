@@ -1,12 +1,13 @@
 //! The `Edit` tool (§6.3): exact-string replace with uniqueness enforcement,
-//! `replace_all`, a CRLF retry, and a helpful fuzzy hint on no match.
+//! `replace_all`, a CRLF retry, a safe unique near-match fallback, and a
+//! helpful fuzzy hint on no match.
 
 use crate::util::{
-    atomic_write, params_schema, preserve_line_endings, record_read, current_read_state,
-    stale_read_error, resolve_within, ReadState,
+    atomic_write, current_read_state, params_schema, preserve_line_endings, record_read,
+    resolve_within, stale_read_error, ReadState,
 };
 use async_trait::async_trait;
-use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
+use rc_core::{Artifact, Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,6 +27,8 @@ pub struct EditInput {
 #[derive(Default)]
 pub struct Edit;
 
+const NEAR_MATCH_THRESHOLD: f32 = 0.97;
+
 impl Edit {
     pub fn new() -> Self {
         Self
@@ -42,8 +45,9 @@ impl Tool for Edit {
         "Replace an exact substring in a file. `old_string` must match byte-for-byte \
 (including indentation and newlines) and occur exactly once unless `replace_all=true`. \
 Line numbers from `Read` are NOT part of the file content — don't include them in \
-`old_string`. On a unique match the edit is applied atomically; on no match you get a \
-hint, on multiple matches you must make `old_string` unique or set `replace_all`."
+`old_string`. Identical old/new text is a successful no-op. On a unique exact match the edit is \
+applied atomically; a unique single-line match at 97% similarity may recover minor whitespace or \
+copy drift. Ambiguous or weaker matches return a hint instead of guessing."
     }
 
     fn schema(&self) -> Value {
@@ -57,9 +61,10 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
         let inp: EditInput = serde_json::from_value(input)?;
         if inp.old_string == inp.new_string {
-            return Ok(ToolOutcome::Error {
-                message: "old_string and new_string are identical".to_string(),
-                retryable: false,
+            return Ok(ToolOutcome::Ok {
+                content: "no changes needed: old_string and new_string are identical".to_string(),
+                truncated: false,
+                artifacts: Vec::new(),
             });
         }
 
@@ -97,6 +102,7 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
 
         let mut old_string = inp.old_string.clone();
         let mut count = old_content.matches(&old_string).count();
+        let mut near_match_note = None;
         // CRLF retry (§6.3 / gotcha #13): models never emit CRLF; if the file is
         // CRLF and old_string is LF, retry the match with \n -> \r\n.
         if count == 0 && old_content.contains("\r\n") {
@@ -105,6 +111,22 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
             if c > 0 {
                 old_string = crlf;
                 count = c;
+            }
+        }
+
+        // Recover a tiny amount of copy/whitespace drift, but only when the
+        // requested old text is one line and exactly one file line clears a
+        // deliberately high similarity threshold. Never guess between peers.
+        if count == 0 {
+            if let Some((candidate, line, ratio)) =
+                unique_near_line_match(&old_content, &inp.old_string)
+            {
+                old_string = candidate;
+                count = 1;
+                near_match_note = Some(format!(
+                    "applied unique near-match at line {line} ({:.0}% similar)",
+                    ratio * 100.0
+                ));
             }
         }
 
@@ -136,9 +158,22 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
         };
         let new_content = preserve_line_endings(Some(&old_content), &new_content);
 
+        if new_content == old_content {
+            let mut message = "no changes needed: replacement already matches the file".to_string();
+            if let Some(note) = near_match_note {
+                message.push_str(&format!("\n\n({note})"));
+            }
+            return Ok(ToolOutcome::Ok {
+                content: message,
+                truncated: false,
+                artifacts: Vec::new(),
+            });
+        }
+
         // M7: snapshot the prior contents for `/rewind` before mutating. Edit
         // always targets an existing file, so prior is `Some`.
-        let prior = Some(old_content.clone().into_bytes());
+        let prior: Option<std::sync::Arc<[u8]>> =
+            Some(std::sync::Arc::from(old_content.as_bytes()));
 
         if let Err(e) = atomic_write(&canon, &new_content) {
             return Ok(ToolOutcome::Error {
@@ -148,18 +183,51 @@ hint, on multiple matches you must make `old_string` unique or set `replace_all`
         }
         record_read(ctx, &canon);
         if let Ok(mut journal) = ctx.change_journal.lock() {
-            journal.record(canon.clone(), prior);
+            journal.record(canon.clone(), prior.clone());
         }
 
         let mut msg = snippet_around(&new_content, &inp.new_string, 5);
+        if let Some(note) = near_match_note {
+            msg.push_str(&format!("\n({note})"));
+        }
         if auto_read {
             msg.push_str(&format!(
                 "\n\n(auto-read {} — read files before editing next time)",
                 canon.display()
             ));
         }
-        Ok(ToolOutcome::ok(msg))
+        Ok(ToolOutcome::Ok {
+            content: msg,
+            truncated: false,
+            artifacts: vec![Artifact::FileChange {
+                path: canon,
+                before: prior,
+                after: Some(std::sync::Arc::from(new_content.into_bytes())),
+            }],
+        })
     }
+}
+
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Return one high-confidence single-line replacement candidate. More than
+/// one candidate above the threshold is ambiguous and therefore rejected.
+fn unique_near_line_match(content: &str, needle: &str) -> Option<(String, usize, f32)> {
+    if needle.contains(['\r', '\n']) || needle.trim().is_empty() {
+        return None;
+    }
+    let needle = normalize_whitespace(needle);
+    let mut candidates = content.lines().enumerate().filter_map(|(index, line)| {
+        let ratio = similar::TextDiff::from_chars(&normalize_whitespace(line), &needle).ratio();
+        (ratio >= NEAR_MATCH_THRESHOLD).then(|| (line.to_string(), index + 1, ratio))
+    });
+    let one = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(one)
 }
 
 /// Line numbers (1-based) of each occurrence of `needle` in `content`.
@@ -173,12 +241,11 @@ fn occurrence_lines(content: &str, needle: &str) -> Vec<usize> {
 /// A best-effort "did you mean" hint (§6.3): find the line most similar to the
 /// needle (whitespace-normalized) and, if close, show it.
 fn fuzzy_hint(content: &str, needle: &str) -> String {
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let nneedle = norm(needle);
+    let nneedle = normalize_whitespace(needle);
     let mut best: Option<(f64, usize, String)> = None;
     for (i, line) in content.lines().enumerate() {
-        let r = similar::TextDiff::from_chars(&norm(line), &nneedle).ratio() as f64;
-        if best.as_ref().map_or(true, |(b, _, _)| r > *b) {
+        let r = similar::TextDiff::from_chars(&normalize_whitespace(line), &nneedle).ratio() as f64;
+        if best.as_ref().is_none_or(|(b, _, _)| r > *b) {
             best = Some((r, i + 1, line.to_string()));
         }
     }
@@ -245,7 +312,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, ToolOutcome::Ok { .. }), "{out:?}");
+        match &out {
+            ToolOutcome::Ok { artifacts, .. } => match artifacts.as_slice() {
+                [Artifact::FileChange { before, after, .. }] => {
+                    assert_eq!(before.as_deref(), Some(b"alpha\nbeta\ngamma\n".as_slice()));
+                    assert_eq!(after.as_deref(), Some(b"alpha\nBETA\ngamma\n".as_slice()));
+                }
+                other => panic!("expected one file-change artifact, got {other:?}"),
+            },
+            other => panic!("expected success, got {other:?}"),
+        }
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "alpha\nBETA\ngamma\n"
@@ -364,7 +440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_old_new_errors() {
+    async fn identical_old_new_is_a_successful_noop() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("e.txt");
         std::fs::write(&path, "alpha\n").unwrap();
@@ -378,10 +454,45 @@ mod tests {
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => {
-                assert!(message.contains("identical"), "{message}")
+            ToolOutcome::Ok {
+                content, artifacts, ..
+            } => {
+                assert!(content.contains("no changes needed"), "{content}");
+                assert!(artifacts.is_empty());
             }
-            o => panic!("expected identical error, got {o:?}"),
+            o => panic!("expected a successful no-op, got {o:?}"),
         }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "alpha\n");
+    }
+
+    #[tokio::test]
+    async fn unique_high_confidence_near_match_is_applied() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("imports.rs");
+        std::fs::write(
+            &path,
+            "use bench::roofline::{bench_decode, M3_PRO_ROOFLINE_GBPS};\nfn main() {}\n",
+        )
+        .unwrap();
+        let out = Edit::new()
+            .call(
+                json!({
+                    "file_path": path.to_string_lossy().to_string(),
+                    "old_string": "use bench::roofline::{bench_decode,M3_PRO_ROOFLINE_GBPS};",
+                    "new_string": "use bench::roofline::{bench_decode, bench_prefill, M3_PRO_ROOFLINE_GBPS};"
+                }),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("unique near-match"), "{content}")
+            }
+            other => panic!("expected near-match recovery, got {other:?}"),
+        }
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("bench_decode, bench_prefill"));
     }
 }

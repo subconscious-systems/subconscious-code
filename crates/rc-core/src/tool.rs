@@ -4,6 +4,7 @@ use crate::state::{SharedChangeJournal, SharedReadRegistry, SharedShellState};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// How a tool may run relative to others in the same batch (§4.3).
@@ -23,7 +24,8 @@ pub enum ToolOutcome {
     Ok {
         content: String,
         truncated: bool,
-        /// M1 leaves artifacts empty; the TUI uses them for diff previews (M2).
+        /// Host-only side effects such as exact file-change snapshots. These
+        /// reach the TUI event stream but are omitted from model context.
         artifacts: Vec<Artifact>,
     },
     Denied {
@@ -52,10 +54,21 @@ impl ToolOutcome {
     }
 }
 
+/// A host-visible side effect produced by a successful tool call. Artifacts are
+/// deliberately separate from the model-facing result text: the TUI can render
+/// a full diff without paying to resend that diff to the model on every later
+/// request.
 #[derive(Debug, Clone)]
-pub struct Artifact {
-    pub kind: String,
-    pub path: Option<PathBuf>,
+pub enum Artifact {
+    /// The exact before/after bytes of a text-file mutation. `None` means the
+    /// file did not exist on that side (create/delete). `Write` and `Edit` are
+    /// text tools, but bytes keep the event lossless and make binary detection a
+    /// presentation concern rather than an orchestration concern.
+    FileChange {
+        path: PathBuf,
+        before: Option<Arc<[u8]>>,
+        after: Option<Arc<[u8]>>,
+    },
 }
 
 #[derive(thiserror::Error, Debug)]

@@ -35,11 +35,15 @@ pub(crate) fn restore_files(records: &[rc_core::state::ChangeRecord]) -> Vec<Pat
     let mut restored = Vec::new();
     for r in records {
         match &r.prior {
-            Some(bytes) => {
+            Some(snapshot) => {
                 if let Some(parent) = r.path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if std::fs::write(&r.path, bytes).is_ok() {
+                if snapshot
+                    .read()
+                    .and_then(|bytes| std::fs::write(&r.path, bytes))
+                    .is_ok()
+                {
                     restored.push(r.path.clone());
                 }
             }
@@ -103,7 +107,7 @@ mod tests {
             .change_journal
             .lock()
             .unwrap()
-            .record(path.clone(), Some(b"original".to_vec()));
+            .record(path.clone(), Some(b"original".to_vec().into()));
         fs::write(&path, "changed").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
 
@@ -149,7 +153,7 @@ mod tests {
             .change_journal
             .lock()
             .unwrap()
-            .record(a.clone(), Some(b"a0".to_vec()));
+            .record(a.clone(), Some(b"a0".to_vec().into()));
         fs::write(&a, "a1").unwrap();
 
         // Turn 2: change b.
@@ -158,7 +162,7 @@ mod tests {
             .change_journal
             .lock()
             .unwrap()
-            .record(b.clone(), Some(b"b0".to_vec()));
+            .record(b.clone(), Some(b"b0".to_vec().into()));
         fs::write(&b, "b1").unwrap();
 
         // Rewind only the last 1 turn → b restored, a stays changed.
@@ -192,7 +196,7 @@ mod tests {
         let records = vec![
             ChangeRecord {
                 path: path.clone(),
-                prior: Some(b"created".to_vec()),
+                prior: Some(rc_core::state::FileSnapshot::inline(b"created".to_vec())),
                 turn: 1,
             },
             ChangeRecord {

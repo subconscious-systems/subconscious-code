@@ -8,9 +8,8 @@ use rc_core::{AgentMode, AskResponse};
 pub enum UserAction {
     /// Submit a user prompt; the driver runs one turn.
     Submit(String),
-    /// Cancel the in-flight turn (denies any pending ask; cancels in-flight
-    /// tools). The current model stream still runs to completion — interrupting
-    /// it is a later milestone (see the M4a plan's known limitations).
+    /// Cancel the in-flight turn, including its model/tool cancellation budget,
+    /// and deny any pending permission prompt so the turn can terminate.
     Cancel,
     /// Cycle the permission mode (applies to the engine immediately).
     SetMode(AgentMode),
@@ -20,6 +19,15 @@ pub enum UserAction {
     /// from the change journal (Write/Edit snapshots). Bash side-effects are
     /// not rolled back. `steps` defaults to 1.
     Rewind { steps: usize },
+    /// `/compact` — append a bounded summary marker. Future model projection
+    /// starts at that marker, so prior tool output and turns leave context while
+    /// the durable session file remains append-only.
+    Compact,
+    /// `/goal <objective>` (or `/goal clear`) — persist the active session
+    /// objective. `None` is an explicit clear marker.
+    SetGoal(Option<String>),
+    /// Bare `/goal` — report the currently active session objective.
+    ShowGoal,
     /// Stop the runtime (also cancels any in-flight turn).
     Quit,
 }

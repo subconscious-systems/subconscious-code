@@ -9,11 +9,10 @@
 //! - **`@file` mention expansion**: `@path` tokens in a user turn are inlined
 //!   as fenced file blocks before the turn is projected, so the model sees the
 //!   file's contents without a `Read` round-trip (§8.3).
-//! - **Tool-output truncation** (the microcompaction seam, §8.5): a per-result
-//!   cap with a tail sentinel, so one giant `Read`/`Bash` can be bounded for a
-//!   small-context model. **Off by default** ([`Caps::unlimited`]) — Subconscious
-//!   Code sends tool results whole. The seam is where full compaction (a summary
-//!   turn that evicts superseded reads) would attach in a later milestone.
+//! - **Cache-stable tool-output projection** (§8.5): a configurable per-result
+//!   cap bounds giant results from the first request that contains them. Older
+//!   results are never rewritten in response to a later edit/read, preserving
+//!   the provider's reusable prompt prefix.
 //!
 //! `Turn` remains the source of truth; this crate only reads it and produces
 //! the wire form for the next request. It never mutates session state.
@@ -197,8 +196,29 @@ direct. When you have enough information, answer in plain text.";
 
 /// The agent's tool-use posture, appended after the environment/memory block.
 const POSTURE: &str = "# Instructions\n\nRead files before editing them. Prefer the smallest \
-change that solves the problem. When you have enough information to answer, stop calling tools \
-and answer in plain text.";
+change that solves the problem. Minimize model round trips: use one comprehensive read-only call \
+instead of sequential discovery when possible. Before recursively inventorying a working directory \
+that is not itself a repository, list its direct children and identify the intended project. For \
+folder inventories or ‘everything in this folder’, call `List` once on that specific folder with \
+`recursive: true` instead of probing with repeated `ls`, `find`, or `Glob` calls. If that inventory \
+needs descriptions from file contents, follow it with exactly \
+one `ReadMany` call containing every relevant text file, then answer; do not read those files one at \
+a time. When several independent searches are known, use one `GrepMany` call. For other independent \
+reads, use one `ReadMany` call or issue them together in one parallel tool batch. Spend at most three \
+consecutive tool rounds investigating before consolidating what is \
+known, listing every remaining unknown, and fetching those unknowns together. Before emitting any \
+read-only call, collect every independent path or query already known \
+and include all of those calls in the same assistant response; do not narrate and then emit only the \
+first one. For a long generated document, create it in bounded `Append` chunks and use each \
+reported `new_size` as the next `expected_size`; do not attempt one completion-sized `Write`. \
+Independent `Write`, `Append`, or `Edit` calls may also share a response. The runtime runs safe reads \
+concurrently and serializes file edits in model order. Never batch calls when a later call depends on \
+an earlier call's result. While editing, run the narrowest relevant test or check. Run the full \
+workspace test suite once, at the end; rerun it only if that final run fails and you have applied a \
+fix. Do not repeat an unchanged passing test command. When you have enough information to answer, \
+stop calling tools and answer in plain text. Keep private reasoning proportional to the task; once \
+the next observable action is known, call the tool or answer instead of spending the completion \
+budget rehearsing it.";
 
 /// Assemble the §4.6 system prompt: identity → environment block → memory
 /// chain → posture. This is what `ContextAssembler` hands to
@@ -278,8 +298,9 @@ impl ContextAssembler {
     }
 
     /// Assemble the full wire message list for the next request (§4.1 + §4.6):
-    /// expand `@file` mentions in the *most recent* user turn, truncate large
-    /// tool-result bodies, then project with this assembler's system prompt.
+    /// expand `@file` mentions in the *most recent* user turn, apply the stable
+    /// per-result projection cap, then project with this assembler's system
+    /// prompt.
     ///
     /// `turns` is the session's turn list; the mention expansion applies to the
     /// last `Turn::User` only (the one driving this request) so earlier turns
@@ -329,10 +350,11 @@ impl rc_core::ContextAssembler for ContextAssembler {
     }
 }
 
-/// Produce a turn list with the last user turn's `@file` mentions expanded and
-/// oversized tool-result bodies truncated. Earlier turns are left untouched
-/// (prefix stability); only the suffix from the last user turn onward is
-/// re-derived. Returns a new `Vec`; the input is not mutated.
+/// Produce a model-facing turn list with the last user turn's `@file` mentions
+/// expanded and oversized tool results capped. The source session is never
+/// mutated, and an older projected turn never changes merely because a later
+/// edit/read occurred; that prefix stability is more valuable than reclaiming
+/// a few already-cached tool-result tokens retroactively.
 fn prepare_turns(turns: &[Turn], root: &Path, caps: Caps) -> Vec<Turn> {
     // Find the last user turn — everything before it is the stable prefix.
     let last_user = turns.iter().rposition(|t| matches!(t, Turn::User { .. }));
@@ -445,10 +467,10 @@ fn inline_file(rel: &str, root: &Path, cap: usize) -> String {
 }
 
 /// Truncate oversized tool-result bodies in `turns` to `cap` bytes (§8.5
-/// microcompaction seam). Only `ToolResult` turns with an `Ok` body over the cap
-/// are affected; the body is head-truncated and a tail sentinel records the
-/// elision. This is a bounded per-result cap, not the full summary-turn
-/// compaction that evicts superseded reads — that lands in a later milestone.
+/// stable-projection seam). Only `ToolResult` turns with an `Ok` body over the
+/// cap are affected; the body is head-truncated and a tail sentinel records the
+/// elision. The decision depends only on that result and the configured cap,
+/// never on future turns, so cached prefixes remain byte-stable.
 ///
 /// `cap == 0` (the shipped default) is a no-op clone: every tool result reaches
 /// the model whole, however large.
@@ -480,7 +502,7 @@ fn truncate_tool_results(turns: &[Turn], cap: usize) -> Vec<Turn> {
 
 /// Largest index `≤ cap` that lands on a UTF-8 char boundary in `s`, so a
 /// byte-based truncation yields valid UTF-8. Walks back at most 3 bytes. (Std
-/// gained `str::floor_char_boundary` in 1.80; this workspace targets 1.75.)
+/// kept local so context truncation retains its exact byte-boundary policy.)
 fn floor_char_boundary(s: &str, cap: usize) -> usize {
     let cap = cap.min(s.len());
     let mut i = cap;
@@ -495,6 +517,7 @@ mod tests {
     use super::*;
     use rc_core::ContextAssembler as _;
     use rc_core::ToolResultBody;
+    use serde_json::Value;
     use std::time::SystemTime;
     use tempfile::tempdir;
 
@@ -511,14 +534,33 @@ mod tests {
     }
 
     fn tool_ok(call_id: &str, content: &str) -> Turn {
+        tool_named_ok(call_id, "Read", content)
+    }
+
+    fn tool_named_ok(call_id: &str, tool: &str, content: &str) -> Turn {
         Turn::ToolResult {
             call_id: call_id.into(),
-            tool: "Read".into(),
+            tool: tool.into(),
             result: ToolResultBody::Ok {
                 content: content.into(),
                 truncated: false,
             },
             duration: Default::default(),
+        }
+    }
+
+    fn assistant_tool(call_id: &str, tool: &str, args: Value) -> Turn {
+        Turn::Assistant {
+            text: "".into(),
+            reasoning: None,
+            calls: vec![rc_core::ToolCall {
+                id: call_id.into(),
+                name: tool.into(),
+                arguments: args.to_string().into(),
+            }],
+            usage: None,
+            cost: None,
+            trace: None,
         }
     }
 
@@ -537,6 +579,19 @@ mod tests {
         assert!(prompt.contains("Date: Monday Jul 28, 2026"));
         assert!(prompt.contains("Git branch: main"));
         assert!(prompt.contains("# Instructions"));
+        assert!(prompt.contains("identify the intended project"));
+        assert!(prompt.contains("`recursive: true`"));
+        assert!(prompt.contains("exactly one `ReadMany` call"));
+        assert!(prompt.contains("then answer"));
+        assert!(prompt.contains("one parallel tool batch"));
+        assert!(prompt.contains("collect every independent path or query"));
+        assert!(prompt.contains("same assistant response"));
+        assert!(prompt.contains("serializes file edits in model order"));
+        assert!(prompt.contains("narrowest relevant test or check"));
+        assert!(prompt.contains("full workspace test suite once"));
+        assert!(prompt.contains("Do not repeat an unchanged passing test command"));
+        assert!(prompt.contains("Keep private reasoning proportional to the task"));
+        assert!(prompt.contains("once the next observable action is known"));
     }
 
     #[test]
@@ -709,6 +764,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_projection_recovers_an_existing_oversized_session_result() {
+        const SAFE_CAP: usize = 256 * 1024;
+        // Mirrors the Spark failure: a recursive home inventory persisted a
+        // multi-megabyte result, then every later request inherited it.
+        let giant = "path\ttype\tsize_bytes\n".to_string() + &"x".repeat(3_840_000);
+        let turns = vec![user("inspect"), tool_ok("list-1", &giant), user("continue")];
+        let out = truncate_tool_results(&turns, SAFE_CAP);
+        let Turn::ToolResult { result, .. } = &out[1] else {
+            panic!("expected retained tool result")
+        };
+        let ToolResultBody::Ok { content, truncated } = result else {
+            panic!("expected successful tool result")
+        };
+        assert!(*truncated);
+        assert!(content.len() < SAFE_CAP + 128, "{} bytes", content.len());
+        assert!(content.contains("bytes truncated"));
+    }
+
+    #[test]
+    fn later_edits_never_rewrite_an_older_projected_result() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        let prefix = vec![
+            assistant_tool("read-1", "Read", serde_json::json!({"file_path": path})),
+            tool_named_ok("read-1", "Read", "old source"),
+        ];
+        let before = prepare_turns(&prefix, dir.path(), Caps::bounded());
+
+        let mut with_edit = prefix;
+        with_edit.extend([
+            assistant_tool(
+                "edit-1",
+                "Edit",
+                serde_json::json!({
+                    "file_path": path,
+                    "old_string": "old",
+                    "new_string": "new"
+                }),
+            ),
+            tool_named_ok("edit-1", "Edit", "updated source"),
+        ]);
+        let after = prepare_turns(&with_edit, dir.path(), Caps::bounded());
+
+        assert_eq!(
+            serde_json::to_vec(&before).unwrap(),
+            serde_json::to_vec(&after[..before.len()]).unwrap(),
+            "a later mutation must not invalidate the cached model prefix"
+        );
+        rc_core::verify_invariant(&rc_core::project_with(&after, "sys")).unwrap();
+    }
+
+    #[test]
+    fn repeated_reads_keep_their_original_stable_projection() {
+        let dir = tempdir().unwrap();
+        let args = serde_json::json!({"file_path": dir.path().join("a.rs")});
+        let turns = vec![
+            assistant_tool("a-old", "Read", args.clone()),
+            tool_named_ok("a-old", "Read", "old a"),
+            assistant_tool("a-new", "Read", args),
+            tool_named_ok("a-new", "Read", "latest a"),
+        ];
+        let out = prepare_turns(&turns, dir.path(), Caps::bounded());
+        let contents: Vec<&str> = out
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::ToolResult {
+                    result: ToolResultBody::Ok { content, .. },
+                    ..
+                } => Some(content.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents, ["old a", "latest a"]);
+    }
+
     /// The assembler's default is unlimited, so a default-constructed one never
     /// shrinks a tool result. Guards against reintroducing a silent 16 KB cap.
     #[test]
@@ -834,6 +965,7 @@ mod tests {
                 .collect(),
             usage: None,
             cost: None,
+            trace: None,
         }
     }
 
@@ -864,7 +996,10 @@ mod tests {
             asm.prefix_fingerprint(&turns)
         );
         let more = vec![user("hello"), user("more")];
-        assert_ne!(asm.prefix_fingerprint(&turns), asm.prefix_fingerprint(&more));
+        assert_ne!(
+            asm.prefix_fingerprint(&turns),
+            asm.prefix_fingerprint(&more)
+        );
     }
 
     #[test]
@@ -892,7 +1027,10 @@ mod tests {
         let pf_a = asm.prefix_fingerprint(&order_a).unwrap();
         let pf_b = asm.prefix_fingerprint(&order_b).unwrap();
         // Sets upstairs: same multiset of blocks → same key, despite reordering.
-        assert_eq!(key_a, key_b, "multiset context key must be order-independent");
+        assert_eq!(
+            key_a, key_b,
+            "multiset context key must be order-independent"
+        );
         // Sequences downstairs: different order → different KV-state fingerprint.
         assert_ne!(
             pf_a, pf_b,

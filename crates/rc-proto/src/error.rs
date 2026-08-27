@@ -24,6 +24,12 @@ pub enum ProtoError {
     #[error("gzip error: {0}")]
     Gzip(std::io::Error),
 
+    #[error("request spool I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("DLR transport error: {0}")]
+    Dlr(String),
+
     /// T2: the streaming body produced no chunk for the idle window (a stall).
     /// Distinct from `Http` (the total request timeout) so a caller can tell a
     /// mid-stream stall from a connection / total-timeout failure.

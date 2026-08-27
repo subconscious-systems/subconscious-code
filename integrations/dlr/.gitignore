@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+**/target
+
+# Cargo lockfile is tracked for this binary workspace
+# (see Cargo.lock). Do not ignore it.
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Local env / secrets
+.env
+.env.local
+
+# Local sidecar receiver state
+*.wal

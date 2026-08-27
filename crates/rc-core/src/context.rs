@@ -12,6 +12,7 @@ use crate::turn::Turn;
 use rc_algebra::multiset::ContextKey;
 use rc_algebra::seqhash::PrefixFingerprint;
 use rc_proto::WireMessage;
+use std::path::Path;
 
 /// Assemble the wire messages for the next model request (§4.1 + §4.6).
 ///
@@ -22,6 +23,13 @@ use rc_proto::WireMessage;
 pub trait ContextAssembler: Send + Sync {
     /// Project `turns` to the wire messages for the next request.
     fn assemble(&self, turns: &[Turn]) -> Vec<WireMessage>;
+
+    /// Project using the live session working directory. Implementations that
+    /// embed cwd/git/memory state may refresh it here; legacy/static assemblers
+    /// keep their existing behavior through this default.
+    fn assemble_for(&self, turns: &[Turn], _cwd: &Path) -> Vec<WireMessage> {
+        self.assemble(turns)
+    }
 
     /// The assembled §4.6 system prompt, if this assembler produces one.
     /// Exposed for display (the TUI status line) and debugging; the loop does

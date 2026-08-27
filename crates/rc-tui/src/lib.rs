@@ -64,11 +64,9 @@ pub fn run(
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    // Off unless asked for. Capturing the mouse takes drag-to-select away from
-    // the terminal, and a terminal program that can't be copied out of is
-    // broken in a way no feature makes up for. `ui.mouse` (or Ctrl+O) turns on
-    // sc's own selection, which copies on release but needs a terminal that
-    // accepts OSC 52.
+    // On by default so wheel/trackpad history works immediately. While captured,
+    // sc owns selection and copies on release via OSC 52; Ctrl+O (or ui.mouse =
+    // false) hands selection back to the terminal.
     if mouse {
         execute!(stdout, EnableMouseCapture)?;
     }

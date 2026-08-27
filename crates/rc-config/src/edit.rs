@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::Settings;
+use crate::{RequestTransport, Settings};
 
 /// How a field's value is entered, so the page can pick an editing affordance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,7 @@ pub struct FieldSpec {
 /// `bypassPermissions` is still *accepted* by `Mode::parse` for existing
 /// config files, but isn't offered here — `auto` is the spelling now.
 const MODES: &[&str] = &["ask", "default", "acceptEdits", "plan", "auto"];
+const REASONING_EFFORTS: &[&str] = &["high", "max", "off"];
 
 /// The settings `/menu` can edit — every one a key
 /// [`SettingsFile`](crate::SettingsFile) actually reads back.
@@ -104,21 +105,49 @@ pub const EDITABLE: &[FieldSpec] = &[
         path: &["provider", "max_retries"],
         env: "SC_MAX_RETRIES",
         kind: FieldKind::Number,
-        help: "Retries on transient 429/5xx (0 = off).",
+        help: "Retries on transient 429/5xx (0 = off; gateway owns retries).",
     },
     FieldSpec {
         name: "request_gzip",
         path: &["provider", "request_gzip"],
         env: "SC_REQUEST_GZIP",
         kind: FieldKind::Bool,
-        help: "gzip the request body; the gateway must honor Content-Encoding.",
+        help: "gzip requests; incompatible gateways fall back once and stay uncompressed.",
+    },
+    FieldSpec {
+        name: "dlr_enabled",
+        path: &["provider", "dlr_enabled"],
+        env: "SC_DLR_ENABLED",
+        kind: FieldKind::Bool,
+        help: "Try DLR first; if unavailable before activation, fall back to normal JSON.",
+    },
+    FieldSpec {
+        name: "dlr_url",
+        path: &["provider", "dlr_url"],
+        env: "SC_DLR_URL",
+        kind: FieldKind::Text,
+        help: "DLR sidecar base URL (the gateway URL remains unchanged).",
+    },
+    FieldSpec {
+        name: "dlr_repair_margin_pct",
+        path: &["provider", "dlr_repair_margin_pct"],
+        env: "SC_DLR_REPAIR_MARGIN_PCT",
+        kind: FieldKind::Number,
+        help: "Extra repair data sent during state resynchronization.",
+    },
+    FieldSpec {
+        name: "reasoning_effort",
+        path: &["provider", "reasoning_effort"],
+        env: "SC_REASONING_EFFORT",
+        kind: FieldKind::Choice(REASONING_EFFORTS),
+        help: "Reasoning budget: high is the fast coding default; max is slower; off omits it.",
     },
     FieldSpec {
         name: "mouse",
         path: &["ui", "mouse"],
         env: "SC_MOUSE",
         kind: FieldKind::Bool,
-        help: "Let sc capture the mouse: in-app drag-to-copy and wheel scroll, but your terminal can no longer select text.",
+        help: "Capture the mouse for wheel history and in-app copy; disable it or press Ctrl+O for native terminal selection.",
     },
     FieldSpec {
         name: "tool_result_cap",
@@ -162,6 +191,10 @@ impl FieldSpec {
             "idle_timeout_ms" => s.idle_timeout_ms.to_string(),
             "max_retries" => s.max_retries.to_string(),
             "request_gzip" => s.request_gzip.to_string(),
+            "dlr_enabled" => (s.request_transport != RequestTransport::Json).to_string(),
+            "dlr_url" => s.dlr_url.clone(),
+            "dlr_repair_margin_pct" => s.dlr_repair_margin_pct.to_string(),
+            "reasoning_effort" => s.reasoning_effort.clone().unwrap_or_else(|| "off".into()),
             "mouse" => s.mouse.to_string(),
             "tool_result_cap" => s.context.tool_result_cap.to_string(),
             "read_default_limit" => s.context.read_default_limit.to_string(),
@@ -372,6 +405,10 @@ mod tests {
             &["provider", "idle_timeout_ms"],
             &["provider", "max_retries"],
             &["provider", "request_gzip"],
+            &["provider", "dlr_enabled"],
+            &["provider", "dlr_url"],
+            &["provider", "dlr_repair_margin_pct"],
+            &["provider", "reasoning_effort"],
             &["permissions", "default_mode"],
             &["ui", "mouse"],
             &["context", "tool_result_cap"],
@@ -395,6 +432,15 @@ mod tests {
         assert!(s.parse("-1").is_err());
         assert_eq!(s.parse("0").unwrap(), serde_json::json!(0));
         assert_eq!(s.parse(" 7 ").unwrap(), serde_json::json!(7));
+    }
+
+    #[test]
+    fn dlr_toggle_parses_as_a_boolean() {
+        let toggle = spec("dlr_enabled");
+        assert_eq!(toggle.kind, FieldKind::Bool);
+        assert_eq!(toggle.parse("true").unwrap(), serde_json::json!(true));
+        assert_eq!(toggle.parse("false").unwrap(), serde_json::json!(false));
+        assert!(toggle.parse("auto").is_err());
     }
 
     #[test]
@@ -442,6 +488,10 @@ mod tests {
         assert_eq!(
             spec("request_gzip").cycle("false", 1, &s).as_deref(),
             Some("true")
+        );
+        assert_eq!(
+            spec("dlr_enabled").cycle("true", 1, &s).as_deref(),
+            Some("false")
         );
         // A free-text field has nothing to cycle.
         assert_eq!(spec("small_model").cycle("x", 1, &s), None);

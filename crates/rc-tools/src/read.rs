@@ -1,10 +1,10 @@
 //! The `Read` tool (§6.1). Output is `cat -n`, 1-based. By default the whole
 //! file comes back with lines untruncated — see [`Read::with_limits`] to bound
-//! it for a small-context model. Empty file → sentinel; binary (NUL in first
-//! 8KB) → refused. Reads record into the shared registry (via `util`) so later
-//! `Write`/`Edit` can enforce "read before mutate".
+//! it for a small-context model. Empty or missing file → sentinel; binary (NUL
+//! in first 8KB) → refused. Reads record into the shared registry (via `util`)
+//! so later `Write`/`Edit` can enforce "read before mutate".
 
-use crate::util::{params_schema, record_read, resolve_within};
+use crate::util::{params_schema, record_read, resolve_within_loose};
 use async_trait::async_trait;
 use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 use schemars::JsonSchema;
@@ -72,9 +72,10 @@ fn read_description(default_limit: u32, max_line_chars: usize) -> String {
     format!(
         "Read a file from the local filesystem. {lines} with 1-based line numbers in \
 `cat -n` format (`<lineno>\\t<line>`). Use absolute paths. `offset` is 1-based; `limit` \
-caps the line count. {long}. An empty file returns a sentinel; binary files are refused \
+caps the line count. {long}. An empty or missing file returns a sentinel; binary files are refused \
 with type info. The line numbers are for your reference ONLY — when calling `Edit`, pass \
-`old_string` WITHOUT the line-number prefix."
+`old_string` WITHOUT the line-number prefix. For two or more independent files, use one \
+`ReadMany` call instead of sequential `Read` calls."
     )
 }
 
@@ -99,7 +100,10 @@ impl Tool for Read {
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
         let inp: ReadInput = serde_json::from_value(input)?;
 
-        let canon = match resolve_within(&ctx.allowed_roots, &ctx.cwd, &inp.file_path) {
+        // Resolve the parent even when the leaf is absent so a missing file can
+        // be returned as information while the usual allowed-root/symlink
+        // containment check remains in force.
+        let canon = match resolve_within_loose(&ctx.allowed_roots, &ctx.cwd, &inp.file_path) {
             Ok(p) => p,
             Err(msg) => {
                 return Ok(ToolOutcome::Error {
@@ -111,10 +115,22 @@ impl Tool for Read {
 
         let bytes = match std::fs::read(&canon) {
             Ok(b) => b,
+            // File absence is often the useful answer to an exploratory read
+            // (for example, checking whether a declared Rust module has been
+            // implemented). Report that observation normally instead of
+            // painting it as a tool crash in the transcript. We deliberately
+            // do not register a missing path as read: a later mutation must
+            // still follow the existing new-file/read-before-write rules.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ToolOutcome::ok(format!(
+                    "<file does not exist: {}>",
+                    canon.display()
+                )));
+            }
             Err(e) => {
                 return Ok(ToolOutcome::Error {
                     message: format!("{}: {e}", canon.display()),
-                    retryable: !matches!(e.kind(), std::io::ErrorKind::NotFound),
+                    retryable: true,
                 });
             }
         };
@@ -256,6 +272,26 @@ mod tests {
         match out {
             ToolOutcome::Ok { content, .. } => assert_eq!(content, "<file is empty>"),
             o => panic!("expected ok sentinel, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_file_returns_an_observation_instead_of_a_failed_call() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-implemented.rs");
+        let out = Read::new()
+            .call(
+                json!({"file_path": path.to_string_lossy().to_string()}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("file does not exist"), "{content}");
+                assert!(content.contains("not-implemented.rs"), "{content}");
+            }
+            o => panic!("expected a missing-file observation, got {o:?}"),
         }
     }
 
