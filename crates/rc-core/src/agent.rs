@@ -360,7 +360,7 @@ fn looks_like_implicit_length(response: &ModelResponse, configured_max: Option<u
         || response
             .reasoning
             .as_deref()
-            .map_or(true, |reasoning| reasoning.trim().is_empty())
+            .is_none_or(|reasoning| reasoning.trim().is_empty())
     {
         return false;
     }

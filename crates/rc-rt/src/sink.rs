@@ -53,7 +53,7 @@ impl SessionWriter {
             .unwrap_or_else(|error| error.into_inner());
         if sender
             .as_ref()
-            .map_or(true, |sender| sender.send(turn.clone()).is_err())
+            .is_none_or(|sender| sender.send(turn.clone()).is_err())
         {
             tracing::warn!("session writer unavailable; completed turn was not persisted");
         }

@@ -335,7 +335,6 @@ impl ChatClient {
     /// Route request bodies through a stateful DLR sidecar. The sidecar
     /// reconstructs ordinary OpenAI JSON next to the gateway; the gateway and
     /// model runtime require no changes.
-    #[must_use]
     pub fn with_dlr(
         mut self,
         sidecar_url: String,
@@ -367,27 +366,24 @@ impl ChatClient {
         if let Some(dlr) = &self.dlr {
             let metadata = serde_json::to_value(metadata)
                 .map_err(|error| (ProtoError::Json(error), 0, RequestPayloadStats::default()))?;
-            match dlr
+            if let Some((response, payload)) = dlr
                 .send(session_id, messages, metadata, &self.api_key)
                 .await
                 .map_err(|error| (error, 0, RequestPayloadStats::default()))?
             {
-                Some((response, payload)) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        return Ok((response, 0, payload));
-                    }
-                    let body = response.text().await.unwrap_or_default();
-                    return Err((
-                        ProtoError::Status {
-                            status: status.as_u16(),
-                            body,
-                        },
-                        0,
-                        payload,
-                    ));
+                let status = response.status();
+                if status.is_success() {
+                    return Ok((response, 0, payload));
                 }
-                None => {}
+                let body = response.text().await.unwrap_or_default();
+                return Err((
+                    ProtoError::Status {
+                        status: status.as_u16(),
+                        body,
+                    },
+                    0,
+                    payload,
+                ));
             }
         }
         self.encode_and_send(url, request, session_id, streaming)

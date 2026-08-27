@@ -334,7 +334,7 @@ mod tests {
     /// GLM-class gateways send `"tool_calls": null` in text-only responses.
     /// `#[serde(default)]` only covers the *absent* field; an explicit null must
     /// collapse to an empty vec, not fail with "invalid type: null, expected a
-    /// sequence" (observed against the real gateway via `sc --doctor`).
+    /// sequence" (observed against the real gateway via `sc doctor`).
     #[test]
     fn response_message_tolerates_null_tool_calls() {
         let with_null: ResponseMessage =

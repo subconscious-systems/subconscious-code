@@ -502,7 +502,7 @@ fn truncate_tool_results(turns: &[Turn], cap: usize) -> Vec<Turn> {
 
 /// Largest index `≤ cap` that lands on a UTF-8 char boundary in `s`, so a
 /// byte-based truncation yields valid UTF-8. Walks back at most 3 bytes. (Std
-/// gained `str::floor_char_boundary` in 1.80; this workspace targets 1.75.)
+/// kept local so context truncation retains its exact byte-boundary policy.)
 fn floor_char_boundary(s: &str, cap: usize) -> usize {
     let cap = cap.min(s.len());
     let mut i = cap;

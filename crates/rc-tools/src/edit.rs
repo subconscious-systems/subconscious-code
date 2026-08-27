@@ -245,7 +245,7 @@ fn fuzzy_hint(content: &str, needle: &str) -> String {
     let mut best: Option<(f64, usize, String)> = None;
     for (i, line) in content.lines().enumerate() {
         let r = similar::TextDiff::from_chars(&normalize_whitespace(line), &nneedle).ratio() as f64;
-        if best.as_ref().map_or(true, |(b, _, _)| r > *b) {
+        if best.as_ref().is_none_or(|(b, _, _)| r > *b) {
             best = Some((r, i + 1, line.to_string()));
         }
     }

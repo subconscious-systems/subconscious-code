@@ -691,7 +691,7 @@ impl ChangeJournal {
         }
         // The earliest turn to undo: turn > (current_turn - n).
         let earliest = self.turn.saturating_sub(n as u64) + 1;
-        // Partition out the records in the window (MSRV 1.75: no Vec::extract_if).
+        // Partition out the records in the window while preserving record order.
         let mut taken: Vec<ChangeRecord> = Vec::new();
         let mut keep: Vec<ChangeRecord> = Vec::new();
         for r in std::mem::take(&mut self.records) {

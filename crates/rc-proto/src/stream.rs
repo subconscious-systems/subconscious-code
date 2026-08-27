@@ -569,7 +569,7 @@ mod tests {
     /// A streaming delta that sends `"tool_calls": null` (GLM-class gateways do
     /// this on text/content chunks) must deserialize to an empty vec, not fail
     /// with "invalid type: null, expected a sequence" — observed against the
-    /// real gateway, where it killed tool-calling entirely (`sc --doctor`).
+    /// real gateway, where it killed tool-calling entirely (`sc doctor`).
     #[test]
     fn delta_tolerates_null_tool_calls() {
         let chunk: ChatCompletionChunk = serde_json::from_str(

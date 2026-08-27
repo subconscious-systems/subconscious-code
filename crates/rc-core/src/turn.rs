@@ -524,7 +524,7 @@ mod duration_millis {
 /// Largest index `≤ cap` that lands on a UTF-8 char boundary in `s`, so a
 /// byte-based truncation yields valid UTF-8. Walks back at most 3 bytes (the
 /// max lead-byte length). `cap` is clamped to `s.len()`. (Std gained
-/// `str::floor_char_boundary` in 1.80, but this workspace targets 1.75.)
+/// kept local so projection truncation retains its exact byte-boundary policy.)
 fn floor_char_boundary(s: &str, cap: usize) -> usize {
     let cap = cap.min(s.len());
     let mut i = cap;

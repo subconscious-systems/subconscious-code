@@ -1,0 +1,69 @@
+name: Bug report
+description: Report reproducible behavior that is incorrect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Remove API keys, private prompts, source code,
+        and session contents before submitting. Security issues belong in a
+        private vulnerability report, not here.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `sc --version` or the commit SHA.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, and terminal.
+      placeholder: macOS 15, arm64, Ghostty
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest sequence that consistently reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include relevant logs or `sc doctor` output after removing sensitive values.
+  - type: dropdown
+    id: dlr
+    attributes:
+      label: DLR behavior
+      options:
+        - Reproduces with SC_DLR_ENABLED=false
+        - Only reproduces with DLR enabled
+        - Not tested
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials and sensitive project or session content.
+          required: true
+        - label: This is not a privately reportable security vulnerability.
+          required: true

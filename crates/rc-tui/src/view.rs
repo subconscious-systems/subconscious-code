@@ -1028,7 +1028,7 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
         let mut fitted_sources = Vec::new();
         for (source, line) in line_sources.into_iter().zip(lines) {
             let rows = responsive_content_lines(line, w);
-            fitted_sources.extend(std::iter::repeat(source).take(rows.len()));
+            fitted_sources.extend(std::iter::repeat_n(source, rows.len()));
             fitted.extend(rows);
         }
         lines = fitted;
@@ -1310,7 +1310,7 @@ fn render_constrained_border(
         if index > 0 {
             border.push(middle);
         }
-        border.extend(std::iter::repeat('─').take(width + 2));
+        border.extend(std::iter::repeat_n('─', width + 2));
     }
     border.push(right);
     let mut spans = Vec::with_capacity(2);
@@ -2177,7 +2177,7 @@ fn composer_caret_span(state: &ViewState, now: Instant) -> Span<'static> {
     let ms = now
         .saturating_duration_since(state.process_started)
         .as_millis() as u64;
-    let on = (ms / CARET_BLINK_MS) % 2 == 0;
+    let on = (ms / CARET_BLINK_MS).is_multiple_of(2);
     if on {
         Span::styled("█".to_string(), p.accent())
     } else {

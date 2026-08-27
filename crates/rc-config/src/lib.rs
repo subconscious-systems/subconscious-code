@@ -109,6 +109,10 @@ pub struct Settings {
     /// Request transport. DLR affects only the hop to the sidecar; the
     /// sidecar forwards ordinary JSON to the configured provider.
     pub request_transport: RequestTransport,
+    /// Whether a file or environment variable explicitly selected DLR or its
+    /// URL. Kept private so CLI base-URL overrides can preserve the safe rule:
+    /// custom providers use JSON unless the user deliberately configures DLR.
+    dlr_explicitly_configured: bool,
     /// Base URL of the independently deployed DLR sidecar.
     pub dlr_url: String,
     /// Optional sidecar ingress secret, resolved from an env var and never
@@ -325,6 +329,7 @@ impl Settings {
         // DLR is attempted first. Until `/v1/dlr/*` is deployed, the bounded
         // capability probe fails and `auto` safely uses normal JSON.
         let mut request_transport = RequestTransport::default();
+        let mut dlr_explicitly_configured = false;
         let mut dlr_url = DEFAULT_DLR_URL.to_string();
         let mut dlr_ingress_token_env = "SC_DLR_INGRESS_TOKEN".to_string();
         let mut dlr_repair_margin_pct = 5u32;
@@ -369,14 +374,17 @@ impl Settings {
                         }
                         if let Some(transport) = p.request_transport {
                             request_transport = transport;
+                            dlr_explicitly_configured = true;
                         }
                         // The simple switch is the current public setting and
                         // wins over a legacy transport value in the same layer.
                         if let Some(enabled) = p.dlr_enabled {
                             request_transport = transport_for_dlr_enabled(enabled);
+                            dlr_explicitly_configured = true;
                         }
                         if let Some(url) = p.dlr_url {
                             dlr_url = url;
+                            dlr_explicitly_configured = true;
                         }
                         if let Some(env) = p.dlr_ingress_token_env {
                             dlr_ingress_token_env = env;
@@ -488,21 +496,26 @@ impl Settings {
             request_gzip_configured = true;
         }
         if let Ok(v) = std::env::var("SC_REQUEST_TRANSPORT") {
-            request_transport = match v.trim().to_ascii_lowercase().as_str() {
-                "dlr" => RequestTransport::Dlr,
-                "auto" => RequestTransport::Auto,
-                "json" => RequestTransport::Json,
-                _ => request_transport,
-            };
+            if let Some(transport) = match v.trim().to_ascii_lowercase().as_str() {
+                "dlr" => Some(RequestTransport::Dlr),
+                "auto" => Some(RequestTransport::Auto),
+                "json" => Some(RequestTransport::Json),
+                _ => None,
+            } {
+                request_transport = transport;
+                dlr_explicitly_configured = true;
+            }
         }
         // The boolean switch is the public override and therefore wins over
         // the legacy/expert SC_REQUEST_TRANSPORT value when both are present.
         if let Some(enabled) = env_bool("SC_DLR_ENABLED") {
             request_transport = transport_for_dlr_enabled(enabled);
+            dlr_explicitly_configured = true;
         }
         if let Ok(v) = std::env::var("SC_DLR_URL") {
             if !v.trim().is_empty() {
                 dlr_url = v;
+                dlr_explicitly_configured = true;
             }
         }
         if let Ok(v) = std::env::var("SC_DLR_REPAIR_MARGIN_PCT") {
@@ -561,7 +574,14 @@ impl Settings {
             .ok()
             .filter(|value| !value.is_empty());
 
-        if !request_gzip_configured && base_url.contains("api.subconscious.dev") {
+        // Never send a custom provider's request or credential to the default
+        // Subconscious DLR endpoint. A custom provider uses ordinary JSON
+        // unless its DLR transport or URL was explicitly selected.
+        if !dlr_explicitly_configured && !is_subconscious_endpoint(&base_url) {
+            request_transport = RequestTransport::Json;
+        }
+
+        if !request_gzip_configured && is_subconscious_endpoint(&base_url) {
             request_gzip = true;
         }
 
@@ -597,6 +617,7 @@ impl Settings {
             context,
             request_gzip,
             request_transport,
+            dlr_explicitly_configured,
             dlr_url,
             dlr_ingress_token,
             dlr_ingress_token_env,
@@ -604,6 +625,33 @@ impl Settings {
             mouse,
         }
     }
+
+    /// Apply a CLI base-URL override while preserving the same custom-provider
+    /// DLR safety rule used by the layered loader.
+    pub fn apply_base_url_override(&mut self, base_url: String) {
+        self.base_url = base_url;
+        if !self.dlr_explicitly_configured {
+            self.request_transport = if is_subconscious_endpoint(&self.base_url) {
+                RequestTransport::Auto
+            } else {
+                RequestTransport::Json
+            };
+        }
+    }
+}
+
+fn is_subconscious_endpoint(base_url: &str) -> bool {
+    let without_scheme = base_url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| base_url.trim().strip_prefix("http://"));
+    let Some(rest) = without_scheme else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = host_port.split(':').next().unwrap_or_default();
+    host.eq_ignore_ascii_case("api.subconscious.dev")
 }
 
 fn transport_for_dlr_enabled(enabled: bool) -> RequestTransport {
@@ -788,6 +836,29 @@ mod tests {
         assert_eq!(RequestTransport::default(), RequestTransport::Auto);
         assert_eq!(normalize_reasoning_effort(" OFF "), None);
         assert_eq!(normalize_reasoning_effort("High").as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn custom_cli_endpoint_disables_implicit_dlr_but_preserves_explicit_dlr() {
+        let mut settings = Settings::load(Path::new("/nonexistent-project-dir"));
+        settings.dlr_explicitly_configured = false;
+        settings.request_transport = RequestTransport::Auto;
+        settings.apply_base_url_override("https://provider.example/v1".into());
+        assert_eq!(settings.request_transport, RequestTransport::Json);
+
+        settings.dlr_explicitly_configured = true;
+        settings.request_transport = RequestTransport::Auto;
+        settings.apply_base_url_override("https://provider.example/v1".into());
+        assert_eq!(settings.request_transport, RequestTransport::Auto);
+    }
+
+    #[test]
+    fn official_endpoint_detection_requires_an_exact_host() {
+        assert!(is_subconscious_endpoint("https://api.subconscious.dev/v1"));
+        assert!(!is_subconscious_endpoint(
+            "https://api.subconscious.dev.attacker.example/v1"
+        ));
+        assert!(!is_subconscious_endpoint("https://example.com/v1"));
     }
 
     #[test]

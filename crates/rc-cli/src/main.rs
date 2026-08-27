@@ -173,7 +173,7 @@ async fn run(cli: Cli) -> Result<()> {
         settings.model = m;
     }
     if let Some(u) = base_url_override.clone() {
-        settings.base_url = u;
+        settings.apply_base_url_override(u);
     }
 
     tracing::debug!(model = %settings.model, base_url = %settings.base_url, "settings loaded");
@@ -360,7 +360,7 @@ async fn run(cli: Cli) -> Result<()> {
             )?
             .with_retry(retry)
             .with_request_gzip(settings.request_gzip);
-            let client = Arc::new(configure_request_transport(client, &settings)?);
+            let client = Arc::new(configure_request_transport(client, settings)?);
             let model = Arc::new(ChatModel::new(client)) as Arc<dyn Model>;
             Ok(AgentLoop::new(model, tools.clone(), permission.clone())
                 .with_assembler(build_assembler(session, &caps))
@@ -447,7 +447,7 @@ async fn run(cli: Cli) -> Result<()> {
                 settings.model = model;
             }
             if let Some(url) = base_url_override.clone() {
-                settings.base_url = url;
+                settings.apply_base_url_override(url);
             }
         }
         if model_override.is_some() {

@@ -1,13 +1,95 @@
 # sc — Subconscious Code
 
-A terminal coding agent in first-party Rust, speaking any OpenAI-compatible
-`/v1/chat/completions` endpoint. Single static binary; no Python, no Node.
+![CI](https://github.com/subconscious-systems/subconscious-code/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+![Rust](https://img.shields.io/badge/rust-1.89%2B-orange)
 
-`sc` keeps large-context operation configurable while respecting the model's
-real provider window. Individual tool results are projected into model context
-with a provider-safe default cap; the session record and live file-change
-artifacts remain separate, so an accidental recursive inventory cannot poison
-the next request or hide an edit.
+A fast, native terminal coding agent for OpenAI-compatible chat-completions
+endpoints. `sc` provides an interactive TUI, resumable sessions, permissioned
+tools, large-request streaming, and an optional delta transport for long agent
+conversations. The client is a single Rust binary with no Python or Node runtime.
+
+> Project status: active development. The core agent, terminal UI, session
+> persistence, tools, permissions, and HTTP DLR sidecar are implemented and
+> tested. MCP, hooks, and skills crates are placeholders and are not yet part of
+> the user-facing product.
+
+## Why `sc`
+
+- Interactive terminal UI and headless automation from the same binary.
+- Works with compatible self-hosted or hosted `/v1/chat/completions` APIs.
+- Resumable JSONL sessions with crash-safe incremental persistence.
+- Read, search, edit, append, and shell tools with explicit permission modes.
+- Large bodies are serialized once and streamed from memory or disk on retry.
+- DLR can send only new conversation blocks while safely falling back to JSON.
+- Linux sandbox and process-tree resource containment are available when needed.
+
+## Quick start
+
+### Requirements
+
+- Git
+- Rust 1.89 or newer, installed with [rustup](https://rustup.rs/)
+- An API key and model exposed through an OpenAI-compatible Chat Completions API
+  with streaming and tool-call support
+
+### Install from source
+
+```sh
+git clone https://github.com/subconscious-systems/subconscious-code.git
+cd subconscious-code
+cargo install --locked --path crates/rc-cli
+```
+
+Configure the default Subconscious endpoint:
+
+```sh
+export SC_API_KEY="your-api-key"
+sc doctor
+cd /path/to/your/project
+sc
+```
+
+For another compatible provider, set its base URL and model. Custom providers
+use ordinary JSON unless you explicitly configure a DLR endpoint:
+
+```sh
+export SC_API_KEY="your-provider-key"
+export SC_BASE_URL="https://provider.example/v1"
+export SC_MODEL="provider/model-name"
+sc doctor
+sc
+```
+
+Inside the TUI, type a request normally. Use `@path` to include a file, `/menu`
+to edit settings or resume a session, `Shift+Tab` to change permission mode,
+`Esc` to interrupt a turn, and `Ctrl+C` to quit.
+
+For a non-interactive read-only task:
+
+```sh
+sc -p "explain the architecture and identify the main entry point"
+```
+
+Headless writes and shell commands fail closed unless allowed in project
+settings or explicitly bypassed. Read [Permissions](#permissions) before using
+headless mode for code changes.
+
+## Documentation
+
+| Guide | Use it for |
+| --- | --- |
+| [Getting started](docs/GETTING_STARTED.md) | Installation, first run, provider setup, and terminal controls |
+| [Configuration](docs/CONFIGURATION.md) | Settings files, environment variables, permissions, DLR, and examples |
+| [Architecture](docs/ARCHITECTURE.md) | Crate boundaries, request flow, persistence, and transport design |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Endpoint, terminal, context-size, DLR, and sandbox problems |
+| [Benchmarks](docs/BENCHMARKS.md) | What the checked-in benchmark artifacts measure and how to reproduce them |
+| [DLR sidecar](integrations/dlr/README.md) | Protocol status, local testing, deployment, and internals |
+| [Harbor adapter](integrations/harbor/README.md) | Reproducible benchmark integration |
+| [Contributing](CONTRIBUTING.md) | Development setup, tests, review expectations, and PR workflow |
+
+Please report vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md), not in a public issue.
 
 ## How It Works
 
@@ -48,7 +130,7 @@ Large requests are the key. The assembly pipeline:
 - **Memory** — `AGENTS.md` files (global + project-local + repo-local), loaded
   in order and merged into the context
 - **Inline expansions** — `@file` paths in the user prompt are read and inlined
-- **Tool results** — projected with a 256 KiB per-result default; configurable
+- **Tool results** — projected with a 64 KiB per-result default; configurable
 
 The assembled context is borrowed directly by the wire request and serialized
 **exactly once**. Bodies through 8 MiB stay in refcounted `Bytes`; larger bodies
@@ -95,13 +177,13 @@ every tool-loop request from that session into one Conversation on the gateway
 side — a resumed session keeps its original ID, so the grouping survives
 `--continue`.
 
-## Install
+## Provider and transport configuration
 
-```sh
-cargo install --path crates/rc-cli    # puts `sc` on your PATH
-export SC_API_KEY=...                 # your gateway key
-sc --doctor                             # verify the endpoint before trusting it
-```
+Defaults target `https://api.subconscious.dev/v1` with model
+`subconscious/glm-5.2`. Override these per invocation with `--base-url` and
+`--model`, per shell with `SC_BASE_URL` and `SC_MODEL`, or persistently in
+`~/.sc/settings.json`. See [Configuration](docs/CONFIGURATION.md) for precedence
+and complete examples.
 
 ### Optional DLR sidecar
 
@@ -122,15 +204,16 @@ export DLR_INGRESS_TOKEN='replace-with-a-secret'
 integrations/dlr/target/release/dlr-sidecar --listen 0.0.0.0:32180
 ```
 
-Subconscious Code tries DLR first by default and leaves `SC_BASE_URL` as the
-normal JSON endpoint used for fallback. The shipped DLR URL is
+For the default Subconscious provider, Subconscious Code tries DLR first and
+leaves `SC_BASE_URL` as the normal JSON endpoint used for fallback. Custom
+providers use JSON unless DLR is explicitly configured. The shipped DLR URL is
 `https://api.subconscious.dev`, ready for the gateway's `/v1/dlr/*` routes. To
 test against the local sidecar before those routes are deployed, override it:
 
 ```sh
 export SC_DLR_URL=http://127.0.0.1:32180
 export SC_DLR_INGRESS_TOKEN="$DLR_INGRESS_TOKEN"
-sc --doctor
+sc doctor
 ```
 
 The setting `provider.dlr_enabled` (also available under `/menu` → Settings)
@@ -173,17 +256,13 @@ single large message.
 The benchmark includes upload, sidecar reconstruction, its local full-JSON
 forward, and first SSE bytes; it intentionally excludes model queue and prefill.
 
-Defaults point at `https://api.subconscious.dev/v1` with model
-`subconscious/glm-5.2`. Override per-invocation with `--base-url` / `--model`, per-shell
-with `SC_BASE_URL` / `SC_MODEL`, or persistently in `~/.sc/settings.json`.
-
 ## Use
 
 ```sh
 sc                       # interactive TUI
 sc --continue            # resume the most recent session
 sc -p "explain src/"     # headless one-shot, prints the answer to stdout
-sc --doctor --body-ladder  # measure the gateway's real maximum request size
+sc doctor --body-ladder    # measure the gateway's real maximum request size
 ```
 
 ### Harbor benchmarks
@@ -250,9 +329,11 @@ carries on. That's deliberate, but it means `sc -p "fix the bug"` won't modify
 anything until you either grant rules or bypass:
 
 ```json
-// ./.sc/settings.json — grant what this project needs
 { "permissions": { "allow": ["Write", "Append", "Edit", "Bash(cargo:*)", "Bash(git:*)"] } }
 ```
+
+Save that object as `./.sc/settings.json` to grant only this project those
+headless permissions.
 
 Or `sc -p "..." --dangerously-skip-permissions` (still hard-denies catastrophic
 commands; refuses to run in CI without `SC_DANGEROUS=1`).
@@ -281,7 +362,7 @@ All remain configurable; only tool-result projection is bounded by default:
 
 | Setting | Default | Was | Enforced in |
 | --- | --- | --- | --- |
-| `context.tool_result_cap` | 256 KiB | 16 KB per tool result | Context assembler |
+| `context.tool_result_cap` | 64 KiB | 16 KB per tool result | Context assembler |
 | `context.inline_file_cap` | unlimited | 8 KB per `@file` mention | Context assembler |
 | `context.bash_output_cap` | unlimited model projection | 30 KB of stdout+stderr | `Bash` tool |
 | `context.grep_output_cap` | unlimited | 30 KB of matches | `Grep` tool |
@@ -383,7 +464,7 @@ The critical optimization that makes large context feasible:
 - The dominant copy was the `Turn` → `WireMessage` projection; that's now gone
   (refcount bumps instead)
 - Expect the real multiple to be **lower**, but budget to the old number until
-  you measure on the Linux box: `sc --doctor --body-ladder` with a real ≥12 MB file
+  you measure on the Linux box: `sc doctor --body-ladder` with a real ≥12 MB file
 
 ### Other Size-Related Choices
 
@@ -468,11 +549,11 @@ active turn before the kernel's hard OOM boundary.
 ### Gateway Ceiling — Measure This First
 
 **The client is not the bottleneck — the gateway is.** A 12 MB request is
-possible on the wire, but the gateway may reject it. Measure with `sc --doctor
+possible on the wire, but the gateway may reject it. Measure with `sc doctor
 --body-ladder`:
 
 ```sh
-sc --doctor --body-ladder
+sc doctor --body-ladder
 ```
 
 This uploads 1 / 10 / 32 / 100 / 500 MB bodies until one is refused, then names
@@ -529,7 +610,7 @@ Read as a table:
 | `rc-session` | `rc-core` | JSONL persistence, resume, `/rewind` |
 | `rc-rt` | `rc-core`, `rc-session` | Bounded/coalesced event transport, action ownership, async persistence |
 | `rc-tui` | `rc-rt`, `rc-core`, `rc-session`, `rc-config` | The ratatui frontend |
-| `rc-cli` | all of the above | Entry point, wiring, `--doctor` |
+| `rc-cli` | all of the above | Entry point, wiring, `doctor` |
 
 Note `rc-core` depends on neither `rc-tools` nor `rc-ctx` — it takes a
 `ToolRegistry` and an optional `ContextAssembler` as trait objects, so the loop
@@ -567,7 +648,7 @@ rc-core::AgentLoop::run() — the main loop:
     │  ├─ rc-tools executes (Bash, Read, Write, etc.)
     │  └─ rc-core appends result to Turn
     │
-    ├─ Save the turn to ~rc-session JSONL
+    ├─ Save the turn to ~/.sc/sessions/<id>.jsonl
     │
     └─ Loop if model asked for tool results, else stop
         ↓
@@ -588,7 +669,8 @@ library with no UI dependencies. The loop:
 handles SSE framing, buffers `delta` chunks into complete tool calls (which can
 span 5–10 chunks), retries on transient errors, and tracks usage.
 
-**rc-tools** — Six tools. Each checks caps, truncates output if needed, and
+**rc-tools** — The built-in read, search, write, append, listing, and shell
+tools. Each checks caps, truncates output if needed, and
 returns a `ToolOutcome`. `Bash` additionally respects the sandbox (if enabled).
 
 **rc-perm** — Permission checking. Rules are:
@@ -682,7 +764,8 @@ explicit retry re-sends the same `Bytes` or spool rather than rebuilding it.
 
 ```sh
 cargo build --workspace
-cargo test  --workspace          # 367 tests, 0 failures
+cargo test --workspace
+cargo test --manifest-path integrations/dlr/Cargo.toml --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -696,5 +779,5 @@ cargo check -p rc-sandbox --target x86_64-unknown-linux-gnu --all-targets
 Milestones: chat completions (M0), streaming + tool loop (M1), core tools (M2),
 permissions (M3), TUI (M4), session persistence (M5), context assembly (M6),
 background shells + sandbox + rewind (M7), and the large-context/request
-track plus `sc --doctor` (M8). Still ahead: MCP, hooks, skills, and full
+track plus `sc doctor` (M8). Still ahead: MCP, hooks, skills, and full
 compaction — see `working-cli-plan.md`.
