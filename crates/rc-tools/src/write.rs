@@ -1,14 +1,15 @@
 //! The `Write` tool (§6.2): full overwrite, atomic, requires a prior `Read`
 //! of an existing file (the registry rule that prevents overwriting
 //! hallucinated content), and a content/mtime check so an externally-changed
-//! file must be re-read.
+//! file must be re-read. Missing parent directories are created after the
+//! resolved destination passes the allowed-root check.
 
 use crate::util::{
-    atomic_write, params_schema, preserve_line_endings, record_read, current_read_state,
-    stale_read_error, resolve_within_loose, ReadState,
+    atomic_write, current_read_state, params_schema, preserve_line_endings, record_read,
+    resolve_within_loose, stale_read_error, ReadState,
 };
 use async_trait::async_trait;
-use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
+use rc_core::{Artifact, Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -38,8 +39,8 @@ impl Tool for Write {
 
     fn description(&self) -> &str {
         "Write a file's full contents, overwriting it entirely. If the file already exists \
-you MUST have read it with `Read` first; if it changed since the read, re-read it. Parent \
-directories must already exist (create them with `Bash` mkdir -p if needed). The file's \
+you MUST have read it with `Read` first; if it changed since the read, re-read it. Missing parent \
+directories inside an allowed root are created automatically. The file's \
 line-ending style and trailing newline are preserved. Prefer `Edit` for targeted changes; \
 use `Write` only for new files or complete rewrites."
     }
@@ -78,22 +79,33 @@ use `Write` only for new files or complete rewrites."
                 ReadState::Current => {}
             }
         }
-        // For a new file, a missing parent dir is already refused by
-        // resolve_within_loose (with a "create it first" hint) — explicit beats
-        // magic (§6.2).
+        let mut created_parent = false;
+        if let Some(parent) = canon.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return Ok(ToolOutcome::Error {
+                        message: format!("could not create parent {}: {e}", parent.display()),
+                        retryable: true,
+                    });
+                }
+                created_parent = true;
+            }
+        }
 
         let old = std::fs::read_to_string(&canon).ok();
         let content = preserve_line_endings(old.as_deref(), &inp.content);
 
         // M7: snapshot the prior contents for `/rewind` before mutating.
-        let prior = std::fs::read(&canon).ok();
+        let prior: Option<std::sync::Arc<[u8]>> = old
+            .as_ref()
+            .map(|contents| std::sync::Arc::from(contents.as_bytes()));
 
         match atomic_write(&canon, &content) {
             Ok(()) => {
                 // A write counts as having "read" the file for a follow-up Edit.
                 record_read(ctx, &canon);
                 if let Ok(mut journal) = ctx.change_journal.lock() {
-                    journal.record(canon.clone(), prior);
+                    journal.record(canon.clone(), prior.clone());
                 }
                 let mut msg = format!("wrote {} ({} bytes)", canon.display(), content.len());
                 if auto_read {
@@ -102,7 +114,18 @@ use `Write` only for new files or complete rewrites."
                         canon.display()
                     ));
                 }
-                Ok(ToolOutcome::ok(msg))
+                if created_parent {
+                    msg.push_str("\n\n(created missing parent directories)");
+                }
+                Ok(ToolOutcome::Ok {
+                    content: msg,
+                    truncated: false,
+                    artifacts: vec![Artifact::FileChange {
+                        path: canon,
+                        before: prior,
+                        after: Some(std::sync::Arc::from(content.into_bytes())),
+                    }],
+                })
             }
             Err(e) => Ok(ToolOutcome::Error {
                 message: format!("write failed: {e}"),
@@ -130,7 +153,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(out, ToolOutcome::Ok { .. }), "{out:?}");
+        match &out {
+            ToolOutcome::Ok { artifacts, .. } => match artifacts.as_slice() {
+                [Artifact::FileChange {
+                    path: changed,
+                    before,
+                    after,
+                }] => {
+                    assert_eq!(changed, &std::fs::canonicalize(&path).unwrap());
+                    assert!(before.is_none());
+                    assert_eq!(after.as_deref(), Some(b"hello\n".as_slice()));
+                }
+                other => panic!("expected one file-change artifact, got {other:?}"),
+            },
+            other => panic!("expected success, got {other:?}"),
+        }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
     }
 
@@ -213,7 +250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_when_parent_dir_missing() {
+    async fn creates_missing_parent_directories() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested/deep.txt");
         let out = Write::new()
@@ -224,8 +261,11 @@ mod tests {
             .await
             .unwrap();
         match out {
-            ToolOutcome::Error { message, .. } => assert!(message.contains("parent"), "{message}"),
-            o => panic!("expected a missing-parent refusal, got {o:?}"),
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("created missing parent"), "{content}")
+            }
+            o => panic!("expected nested file creation, got {o:?}"),
         }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "x\n");
     }
 }

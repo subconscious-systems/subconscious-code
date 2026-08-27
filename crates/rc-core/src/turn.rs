@@ -27,6 +27,94 @@ pub struct ToolCall {
     pub arguments: Arc<str>,
 }
 
+/// Persisted observability for one model request. Millisecond scalar fields
+/// keep JSONL easy to inspect with jq and remain backward-compatible: older
+/// assistant/error records simply deserialize with `trace: None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTrace {
+    /// Wall-clock request boundaries (Unix epoch milliseconds).
+    pub started_ms: u64,
+    pub completed_ms: u64,
+    /// End-to-end model call latency, including body encoding, retries, and the
+    /// streamed response body.
+    pub total_ms: u64,
+    /// Time until HTTP response headers, when the wire client reached them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers_ms: Option<u64>,
+    /// Time until the first visible text/reasoning/tool event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    /// Time spent consuming the body after response headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_ms: Option<u64>,
+    /// Canonical JSON size before compression and bytes actually uploaded.
+    #[serde(default)]
+    pub request_bytes: usize,
+    #[serde(default)]
+    pub wire_bytes: usize,
+    /// Context size measured before request serialization.
+    #[serde(default)]
+    pub context_chars: usize,
+    #[serde(default)]
+    pub context_tokens_estimate: usize,
+    #[serde(default)]
+    pub retries: u32,
+    /// What the provider reported versus what the loop acted on. They differ
+    /// when an empty response at the completion ceiling is recovered as an
+    /// implicit `length` finish.
+    #[serde(default)]
+    pub reported_finish_reason: String,
+    #[serde(default)]
+    pub effective_finish_reason: String,
+    #[serde(default)]
+    pub implicit_length: bool,
+    /// Raw response-body and semantic model progress. These remain useful on a
+    /// failed stream, where provider usage is unavailable and TTFT alone cannot
+    /// distinguish a dead socket from a model that stopped producing deltas.
+    #[serde(default)]
+    pub transport_events: u64,
+    #[serde(default)]
+    pub semantic_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transport_activity_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_semantic_activity_ms: Option<u64>,
+    #[serde(default)]
+    pub partial_text_chars: usize,
+    #[serde(default)]
+    pub partial_reasoning_chars: usize,
+    #[serde(default)]
+    pub partial_tool_argument_chars: usize,
+}
+
+/// A bounded snapshot of a response that failed after streaming began. It is
+/// persisted only in the private session JSONL and is never projected back to
+/// the model or copied into benchmark trajectories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialStreamResponse {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<PartialToolCall>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialToolCall {
+    pub index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arguments: String,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 /// A conversation turn (§4.1). `Turn` is the source of truth; the wire form is
 /// a fresh [`crate::project::project`] projection per request, never stored.
 /// Serialized to JSONL for session persistence (M5) via the `type` tag.
@@ -52,6 +140,10 @@ pub enum Turn {
         /// time. `#[serde(default)]` keeps old session files readable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost: Option<Cost>,
+        /// Request timing/payload/finish metadata. This is never projected back
+        /// to the model; it exists solely for trace diagnosis.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<ModelTrace>,
     },
     ToolResult {
         call_id: String,
@@ -79,6 +171,12 @@ pub enum Turn {
         /// `None` when the failure wasn't retried / the count is unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retries: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace: Option<ModelTrace>,
+        /// Bounded partial output from a failed stream. Kept out of model
+        /// projection and ATIF export; diagnostic only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial: Option<PartialStreamResponse>,
         #[serde(with = "epoch_millis", default = "epoch_millis::zero")]
         ts: SystemTime,
     },
@@ -117,7 +215,7 @@ impl ToolResultBody {
             ToolResultBody::Ok { content, .. } => content.clone(),
             ToolResultBody::Error { message, .. } => Arc::from(format!("[tool error: {message}]")),
             ToolResultBody::Denied { reason } => Arc::from(format!("[denied: {reason}]")),
-            ToolResultBody::Interrupted => Arc::from("[interrupted by user]"),
+            ToolResultBody::Interrupted => Arc::from("[tool call interrupted before execution]"),
         }
     }
 
@@ -174,6 +272,13 @@ impl From<crate::tool::ToolOutcome> for ToolResultBody {
 #[serde(rename_all = "snake_case")]
 pub enum NoteKind {
     Compaction,
+    /// Persistent session objective set by `/goal`. An empty value is an
+    /// explicit clear marker, so append-only session history stays honest.
+    Goal,
+    /// Harness-authored control guidance after a truncated model response.
+    /// This is intentionally distinct from `Turn::User`: transcript and ATIF
+    /// consumers must not attribute synthetic recovery text to the user.
+    Recovery,
     ModeChange,
     Notice,
 }
@@ -343,6 +448,14 @@ mod tests {
                 }],
                 usage: Some(Usage::default()),
                 cost: None,
+                trace: Some(ModelTrace {
+                    started_ms: 1,
+                    completed_ms: 2,
+                    total_ms: 1,
+                    reported_finish_reason: "tool_calls".into(),
+                    effective_finish_reason: "tool_calls".into(),
+                    ..ModelTrace::default()
+                }),
             },
             Turn::ToolResult {
                 call_id: "c1".into(),

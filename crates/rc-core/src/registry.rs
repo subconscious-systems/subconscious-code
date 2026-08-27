@@ -113,7 +113,10 @@ mod tests {
         let mut b = set_b.clone();
         canonical_representative(&mut a, def_key);
         canonical_representative(&mut b, def_key);
-        assert_eq!(canonical::to_bytes(&a).unwrap(), canonical::to_bytes(&b).unwrap());
+        assert_eq!(
+            canonical::to_bytes(&a).unwrap(),
+            canonical::to_bytes(&b).unwrap()
+        );
     }
 
     #[test]

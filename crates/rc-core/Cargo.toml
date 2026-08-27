@@ -12,12 +12,15 @@ rc-perm = { path = "../rc-perm" }
 rc-algebra = { path = "../rc-algebra" }
 serde.workspace = true
 serde_json.workspace = true
+tempfile = "3"
 thiserror.workspace = true
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing.workspace = true
 tokio-util = { workspace = true }
 tokio-stream.workspace = true
+libc.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -2,18 +2,21 @@
 //! `cd` *does* persist across calls (M7): after a successful, contained `cd`,
 //! the live working directory in the shared [`ShellState`] is updated, and the
 //! agent loop syncs it into `ctx.cwd`/`session.cwd` for subsequent calls. stdin
-//! is closed so commands don't block on input; output is returned in full by
-//! default (ANSI stripped, exit code first) — see [`Bash::with_cap`] to bound it
-//! for a small-context model.
+//! is closed so commands don't block on input. The model-facing result is
+//! unlimited by default, but transport capture always retains a bounded
+//! head+tail window so a noisy child cannot exhaust the editor's memory; see
+//! [`Bash::with_cap`] for an additional small-context result cap.
 //!
-//! Env hygiene (M7/§6.6): the shell is `bash --noprofile --norc` when available
-//! (no interactive rc), and toolchain bin dirs (nvm/pyenv/conda/`~/.local/bin`)
-//! are prepended to `PATH` via `Command::env` — never by rewriting the command
-//! text, so the permission layer still parses the verbatim `command`.
+//! Env hygiene (M7/§6.6): the shell is
+//! `bash --noprofile --norc -o pipefail` when available (no interactive rc and
+//! no false-success pipelines), and toolchain bin dirs
+//! (nvm/pyenv/conda/`~/.local/bin`) are prepended to `PATH` via `Command::env`
+//! — never by rewriting the command text, so the permission layer still parses
+//! the verbatim `command`.
 //!
-//! Background shells (`run_in_background`) are fire-and-forget: stdout+stderr go
-//! to a log file the agent can `Read`, and the child is held in `ShellState` so
-//! it's killed on session shutdown.
+//! Background shells (`run_in_background`) are fire-and-forget: merged output
+//! is published to a bounded rotating log the agent can `Read`, and the child
+//! is held in `ShellState` so it's killed on session shutdown.
 //!
 //! The catastrophic-command deny-list here is a *safety floor* (over-refuses);
 //! M3 replaces it with real command parsing + interactive prompts.
@@ -21,20 +24,24 @@
 use crate::env_hygiene;
 use crate::util::{cap_output, dangerous_command, params_schema, strip_ansi};
 use async_trait::async_trait;
-use rc_core::state::BgShell;
+use rc_core::state::{BgShell, BgShellStatus};
 use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 use rc_perm::{parse_bash, resolve_within};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::os::unix::process::CommandExt as StdCommandExt;
+use std::collections::VecDeque;
+use std::os::unix::process::{CommandExt as StdCommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+/// Independent of the model-facing result cap: never let a noisy child grow
+/// an in-memory `Vec` until the cgroup kills the whole editor.
+const FOREGROUND_CAPTURE_BYTES_PER_STREAM: usize = 2 * 1024 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
 pub struct BashInput {
@@ -65,7 +72,8 @@ impl Default for Bash {
 }
 
 impl Bash {
-    /// A `Bash` with unlimited output.
+    /// A `Bash` with no additional model-facing cap. The independent transport
+    /// capture ceiling still applies.
     pub fn new() -> Self {
         Self::with_cap(0)
     }
@@ -88,7 +96,8 @@ impl Bash {
 /// The tool description, with the output-limit sentence matched to `cap`.
 fn bash_description(cap: usize) -> String {
     let limit = if cap == 0 {
-        "stdout+stderr are captured in full (ANSI stripped) with no size limit".to_string()
+        "stdout+stderr are ANSI stripped and returned from a bounded head+tail capture window"
+            .to_string()
     } else {
         format!(
             "stdout+stderr are captured, ANSI stripped, and capped at {} chars (head {} + tail {})",
@@ -101,8 +110,10 @@ fn bash_description(cap: usize) -> String {
         "Run a shell command. `cd` persists across calls (a successful, in-workspace `cd` \
 updates the session's working directory). {limit}; the exit code is shown first. Default \
 timeout 120s, max 600s. stdin is closed — commands that read input see EOF; use \
-non-interactive flags (`-y`, `--no-pager`, `git --no-pager`). Set `run_in_background: true` \
-for long-running servers; output goes to a log file you can `Read` to check progress."
+non-interactive flags (`-y`, `--no-pager`, `git --no-pager`). Pipelines use `pipefail`, so \
+any failed stage makes the reported exit non-zero; avoid piping builds or tests to `head`/`tail`. \
+Set `run_in_background: true` \
+for long-running servers; output goes to a bounded rotating log file you can `Read` to check progress."
     )
 }
 
@@ -152,6 +163,7 @@ impl Tool for Bash {
         cmd.kill_on_drop(true); // a timeout must kill the child, not orphan it
         apply_env_hygiene(&mut cmd);
         cmd.env("PATH", env_hygiene::rehydrated_path_env());
+        install_process_group(&mut cmd);
 
         // M7: opt-in kernel confinement (Landlock + seccomp on Linux). The
         // guard is held across the spawn/wait so the parent-side ruleset fd
@@ -163,8 +175,8 @@ impl Tool for Bash {
 
         // Spawn the child and drain stdout+stderr concurrently, racing the drain
         // against the timeout. On a timeout we kill the child and surface the
-        // partial output captured so far (`read_to_end` appends incrementally,
-        // so the buffers survive the dropped drain future) — otherwise a hung
+        // partial output captured so far (bounded drains update incrementally,
+        // so the captures survive the dropped drain future) — otherwise a hung
         // command's output is discarded and the model must re-run to find where
         // it stopped.
         let mut child = match cmd.spawn() {
@@ -176,15 +188,16 @@ impl Tool for Bash {
                 })
             }
         };
+        let mut process_group = ProcessGroupGuard::new(child.id());
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
-        let mut out_buf: Vec<u8> = Vec::new();
-        let mut err_buf: Vec<u8> = Vec::new();
+        let mut out_buf = BoundedCapture::new(FOREGROUND_CAPTURE_BYTES_PER_STREAM);
+        let mut err_buf = BoundedCapture::new(FOREGROUND_CAPTURE_BYTES_PER_STREAM);
 
         let drain = async {
             let (o, e) = tokio::join!(
-                stdout.read_to_end(&mut out_buf),
-                stderr.read_to_end(&mut err_buf),
+                drain_bounded(&mut stdout, &mut out_buf),
+                drain_bounded(&mut stderr, &mut err_buf),
             );
             let _ = (o, e);
             child.wait().await
@@ -192,19 +205,29 @@ impl Tool for Bash {
 
         match tokio::time::timeout(timeout, drain).await {
             Ok(Ok(status)) => {
-                let stdout = strip_ansi(&String::from_utf8_lossy(&out_buf));
-                let stderr = strip_ansi(&String::from_utf8_lossy(&err_buf));
+                // The shell has exited, but a command may have daemonized a
+                // grandchild after redirecting its pipes. Foreground calls do
+                // not own detached work, so clean any survivors in the group.
+                process_group.kill();
+                let (stdout_capture_truncated, stdout) = out_buf.render();
+                let (stderr_capture_truncated, stderr) = err_buf.render();
+                let stdout = strip_ansi(&stdout);
+                let stderr = strip_ansi(&stderr);
                 let mut combined = stdout;
                 if !stderr.is_empty() {
                     combined.push_str("\n--- stderr ---\n");
                     combined.push_str(&stderr);
                 }
                 let (head, tail) = self.head_tail();
-                let (truncated, body) = cap_output(&combined, self.cap, head, tail);
-                let exit = status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "<signal>".to_string());
+                let (result_truncated, body) = cap_output(&combined, self.cap, head, tail);
+                let truncated =
+                    stdout_capture_truncated || stderr_capture_truncated || result_truncated;
+                let exit = status.code().map(|c| c.to_string()).unwrap_or_else(|| {
+                    status
+                        .signal()
+                        .map(|signal| format!("signal {signal}"))
+                        .unwrap_or_else(|| "<signal>".to_string())
+                });
 
                 // M7: persist a successful, in-workspace `cd` into the live shell state.
                 // The agent loop syncs this back into ctx.cwd/session.cwd for later calls.
@@ -236,10 +259,13 @@ impl Tool for Bash {
                 // Timed out: kill the child (closing its pipes) and reap it, then
                 // surface the partial output captured before the timeout so the
                 // model can see where the command hung without re-running it.
+                process_group.kill();
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let stdout = strip_ansi(&String::from_utf8_lossy(&out_buf));
-                let stderr = strip_ansi(&String::from_utf8_lossy(&err_buf));
+                let (_, stdout) = out_buf.render();
+                let (_, stderr) = err_buf.render();
+                let stdout = strip_ansi(&stdout);
+                let stderr = strip_ansi(&stderr);
                 let mut combined = stdout;
                 if !stderr.is_empty() {
                     combined.push_str("\n--- stderr ---\n");
@@ -306,38 +332,30 @@ impl Bash {
             });
         }
 
-        let log = match std::fs::OpenOptions::new()
+        if let Err(e) = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&log_path)
         {
-            Ok(f) => f,
-            Err(e) => {
-                return Ok(ToolOutcome::Error {
-                    message: format!("could not open bg log {}: {e}", log_path.display()),
-                    retryable: false,
-                })
-            }
-        };
-        let log_err = match log.try_clone() {
-            Ok(f) => f,
-            Err(e) => {
-                return Ok(ToolOutcome::Error {
-                    message: format!("could not dup bg log: {e}"),
-                    retryable: false,
-                })
-            }
-        };
+            return Ok(ToolOutcome::Error {
+                message: format!("could not open bg log {}: {e}", log_path.display()),
+                retryable: false,
+            });
+        }
 
         let mut cmd = Command::new(&shell);
-        cmd.args(&shell_args).arg("-c").arg(&inp.command);
+        // Merge stderr inside the child shell so one bounded drain owns log
+        // ordering and no pair of writer threads can race the same file.
+        let merged_command = format!("exec 2>&1\n{}", inp.command);
+        cmd.args(&shell_args).arg("-c").arg(merged_command);
         cmd.current_dir(&cwd);
         cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::from(log));
-        cmd.stderr(Stdio::from(log_err));
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
         apply_env_hygiene_std(&mut cmd);
         cmd.env("PATH", env_hygiene::rehydrated_path_env());
+        install_process_group_std(&mut cmd);
 
         // M7: opt-in kernel confinement for background shells too.
         let _sandbox_guard = match install_sandbox_std(&mut cmd, ctx) {
@@ -345,7 +363,7 @@ impl Bash {
             Err(outcome) => return Ok(outcome), // fail-closed
         };
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolOutcome::Error {
@@ -354,14 +372,33 @@ impl Bash {
                 })
             }
         };
+        let pgid = i32::try_from(child.id()).ok();
+        let stdout = child.stdout.take().expect("background stdout was piped");
 
         let shell_id = id.clone();
-        if let Ok(mut s) = ctx.shell_state.lock() {
-            s.bg.push(BgShell {
-                id: id.clone(),
-                log_path: log_path.clone(),
+        // A poisoned mutex still contains the only owner capable of cleaning
+        // up this child. Recover the inner state instead of leaking an
+        // untracked server process.
+        let status = std::sync::Arc::new(std::sync::Mutex::new(BgShellStatus::Running));
+        let supervised = ctx
+            .shell_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .supervise_background(
+                BgShell {
+                    id: id.clone(),
+                    log_path: log_path.clone(),
+                    started: SystemTime::now(),
+                    status,
+                },
                 child,
-                started: SystemTime::now(),
+                stdout,
+                pgid,
+            );
+        if let Err(error) = supervised {
+            return Ok(ToolOutcome::Error {
+                message: format!("could not supervise background shell: {error}"),
+                retryable: false,
             });
         }
 
@@ -369,6 +406,69 @@ impl Bash {
             "Background shell {shell_id} started. Output log: {} (read it with `Read` to check progress).",
             log_path.display()
         )))
+    }
+}
+
+/// Retain an exact prefix and suffix while counting every byte consumed. The
+/// middle is discarded as it arrives, so memory is bounded independently of
+/// how much output a child produces.
+struct BoundedCapture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    head_cap: usize,
+    tail_cap: usize,
+    total: u64,
+}
+
+impl BoundedCapture {
+    fn new(cap: usize) -> Self {
+        let head_cap = cap / 3;
+        Self {
+            head: Vec::with_capacity(head_cap),
+            tail: VecDeque::with_capacity(cap - head_cap),
+            head_cap,
+            tail_cap: cap - head_cap,
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len() as u64);
+        let head_needed = self.head_cap.saturating_sub(self.head.len());
+        let head_take = head_needed.min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_take]);
+        self.tail.extend(&bytes[head_take..]);
+        if self.tail.len() > self.tail_cap {
+            let excess = self.tail.len() - self.tail_cap;
+            self.tail.drain(..excess);
+        }
+    }
+
+    fn render(&self) -> (bool, String) {
+        let retained = self.head.len().saturating_add(self.tail.len());
+        let truncated = self.total > retained as u64;
+        let mut bytes = Vec::with_capacity(retained.saturating_add(96));
+        bytes.extend_from_slice(&self.head);
+        if truncated {
+            let omitted = self.total.saturating_sub(retained as u64);
+            bytes.extend_from_slice(format!("\n[… {omitted} output bytes omitted …]\n").as_bytes());
+        }
+        bytes.extend(self.tail.iter().copied());
+        (truncated, String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+async fn drain_bounded<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    capture: &mut BoundedCapture,
+) -> std::io::Result<()> {
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        capture.push(&chunk[..read]);
     }
 }
 
@@ -403,6 +503,67 @@ fn apply_env_hygiene_std(cmd: &mut Command) {
         .env("NO_COLOR", "1")
         .env("CI", "1")
         .env("SC_SESSION", "1");
+}
+
+/// Put every shell in a new session/process group. A `kill_on_drop` only
+/// targets the direct child; this group is what lets cancellation stop cargo
+/// workers, test runners, and other descendants as one owned process tree.
+fn install_process_group(cmd: &mut tokio::process::Command) {
+    // SAFETY: `setsid` is async-signal-safe and the closure performs no heap
+    // allocation between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+fn install_process_group_std(cmd: &mut Command) {
+    // SAFETY: same as `install_process_group` above.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+/// Kills the whole process group when a tool future is dropped by a turn
+/// deadline or cancellation. Explicit completion calls `kill` first, making
+/// Drop a no-op.
+struct ProcessGroupGuard {
+    pgid: Option<i32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pgid: pid.and_then(|pid| i32::try_from(pid).ok()),
+        }
+    }
+
+    fn kill(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            // SAFETY: the negative id addresses the process group created by
+            // `setsid`, not an arbitrary process tree.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// The `pre_exec` closure type accepted by both `tokio::process::Command` and
@@ -579,6 +740,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_failure_from_any_pipeline_stage() {
+        let dir = tempdir().unwrap();
+        let out = Bash::new()
+            .call(json!({"command": "false | true"}), &test_ctx(dir.path()))
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Ok { content, .. } => assert!(content.starts_with("exit: 1"), "{content}"),
+            other => panic!("expected shell result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn strips_ansi() {
         let dir = tempdir().unwrap();
         let out = Bash::new()
@@ -634,10 +808,100 @@ mod tests {
         match out {
             ToolOutcome::Error { message, .. } => {
                 assert!(message.contains("timed out"), "{message}");
-                assert!(message.contains("partial"), "partial output missing: {message}");
+                assert!(
+                    message.contains("partial"),
+                    "partial output missing: {message}"
+                );
             }
             o => panic!("expected a timeout error, got {o:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn noisy_output_is_retained_as_a_bounded_head_and_tail() {
+        let dir = tempdir().unwrap();
+        let out = Bash::new()
+            .call(
+                json!({"command": "yes 0123456789 | head -c 3145728"}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Ok {
+                content, truncated, ..
+            } => {
+                assert!(truncated);
+                assert!(content.contains("output bytes omitted"), "{content}");
+                assert!(
+                    content.len() < FOREGROUND_CAPTURE_BYTES_PER_STREAM + 256,
+                    "bounded capture grew to {} bytes",
+                    content.len()
+                );
+            }
+            other => panic!("expected bounded output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_descendant_processes() {
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let command = format!("sleep 30 & echo $! > {}; wait", pid_file.to_string_lossy());
+        let out = Bash::new()
+            .call(
+                json!({"command": command, "timeout_ms": 200}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out, ToolOutcome::Error { .. }));
+
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        for _ in 0..50 {
+            // SAFETY: signal 0 is a read-only existence probe.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("descendant process {pid} survived Bash timeout");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_tool_future_kills_descendant_processes() {
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("cancelled-descendant.pid");
+        let command = format!("sleep 30 & echo $! > {}; wait", pid_file.to_string_lossy());
+        let bash = Bash::new();
+        let ctx = test_ctx(dir.path());
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            bash.call(json!({"command": command, "timeout_ms": 30_000}), &ctx),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "outer deadline should drop the tool future"
+        );
+
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        for _ in 0..50 {
+            // SAFETY: signal 0 is a read-only existence probe.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("descendant process {pid} survived dropped Bash future");
     }
 
     #[tokio::test]
@@ -830,6 +1094,40 @@ mod tests {
             .unwrap()
             .contains("hi-from-bg"));
         // shutdown kills it (and reaps so no zombie).
+        ctx.shell_state.lock().unwrap().shutdown();
+    }
+
+    #[tokio::test]
+    async fn background_log_is_rotated_to_a_fixed_ceiling() {
+        let dir = tempdir().unwrap();
+        let ctx = bg_ctx(dir.path());
+        Bash::new()
+            .call(
+                json!({
+                    "command": "yes background-noise | head -c 10485760",
+                    "run_in_background": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let (log_path, status) = {
+            let state = ctx.shell_state.lock().unwrap();
+            (state.bg[0].log_path.clone(), state.bg[0].status.clone())
+        };
+        let rotated = PathBuf::from(format!("{}.1", log_path.display()));
+        for _ in 0..300 {
+            if *status.lock().unwrap() != BgShellStatus::Running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(*status.lock().unwrap(), BgShellStatus::Running);
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("log rotated"));
+        let total = std::fs::metadata(&log_path).unwrap().len()
+            + std::fs::metadata(&rotated).unwrap().len();
+        assert!(total < 8 * 1024 * 1024 + 64 * 1024, "{total}");
         ctx.shell_state.lock().unwrap().shutdown();
     }
 

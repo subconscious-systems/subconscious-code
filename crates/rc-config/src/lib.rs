@@ -16,13 +16,36 @@
 //! M3 adds the `permissions` block (§7.1/§10.2): allow/ask/deny rule lists,
 //! `defaultMode`, and `additionalDirectories`.
 //!
-//! M8 adds the `context` block: the per-item truncation caps. Subconscious Code
-//! ships them **unlimited** by default — that is the product. They exist so a
-//! user on a small-context model can dial them back in.
+//! M8 adds the `context` block: the per-item truncation caps. Most remain
+//! unlimited by default; tool results use a provider-safe projection cap so a
+//! runaway result cannot invalidate the next request.
 
 use std::path::{Path, PathBuf};
 
 pub mod edit;
+
+/// Request-body transport between Subconscious Code and its HTTP endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestTransport {
+    /// Ordinary OpenAI-compatible JSON.
+    Json,
+    /// Require the DLR sidecar; fail closed if it is unavailable.
+    Dlr,
+    /// Prefer DLR, falling back to JSON only before DLR becomes active.
+    #[default]
+    Auto,
+}
+
+impl std::fmt::Display for RequestTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Json => "json",
+            Self::Dlr => "dlr",
+            Self::Auto => "auto",
+        })
+    }
+}
 
 /// Resolved settings ready to drive a chat client + the permission engine.
 #[derive(Debug, Clone)]
@@ -50,8 +73,9 @@ pub struct Settings {
     /// `SC_IDLE_TIMEOUT_MS`. This is the real liveness check now that
     /// `timeout_ms` defaults off.
     pub idle_timeout_ms: u64,
-    /// Retry: max retries on transient HTTP errors 429/5xx (0 = off). Env
-    /// `SC_MAX_RETRIES`.
+    /// Retry: max retries on transient HTTP errors 429/5xx (0 = off, the
+    /// default). The Subconscious gateway owns upstream retries, so enabling
+    /// another client retry layer is opt-in. Env `SC_MAX_RETRIES`.
     pub max_retries: u32,
     /// Retry: base backoff (ms) for the first retry; doubles each attempt. Env
     /// `SC_RETRY_BASE_MS`.
@@ -60,24 +84,43 @@ pub struct Settings {
     pub retry_max_ms: u64,
     /// T3: wall-clock budget for a turn in ms (0 = off). Env `SC_TURN_TIMEOUT_MS`.
     pub turn_timeout_ms: u64,
-    /// M4: per-response completion-token cap (0 = provider default). Env
-    /// `SC_MAX_TOKENS`. Bounds each reply's length.
+    /// M4: per-response completion-token cap (8192 by default; 0 = provider
+    /// default). Env `SC_MAX_TOKENS`. The explicit default avoids the GLM
+    /// route's observed 4096-token implicit ceiling cutting tool calls.
     pub max_tokens: u32,
     /// Sampling temperature (None = provider default). Env `SC_TEMPERATURE`.
     pub temperature: Option<f32>,
+    /// Provider-native reasoning effort. The Subconscious GLM route maps
+    /// `high` to its lower-latency coding posture; omitting the field selects
+    /// `max`, which the Spark traces showed spending most turn time in hidden
+    /// reasoning. Set `off`/`none`/an empty value to omit the wire field. Env
+    /// `SC_REASONING_EFFORT`.
+    pub reasoning_effort: Option<String>,
     pub permissions: PermissionsConfig,
     /// M7: opt-in kernel sandbox for `Bash` (§7.6). Off by default.
     pub sandbox: SandboxConfig,
-    /// M8: per-item context caps. Unlimited by default.
+    /// M8: per-item context caps. Tool results have a provider-safe default;
+    /// the remaining caps are unlimited unless configured.
     pub context: ContextConfig,
-    /// M8: gzip the request body (`Content-Encoding: gzip`). Off by default —
-    /// the gateway must advertise support. Env `SC_REQUEST_GZIP`.
+    /// M8: gzip the request body (`Content-Encoding: gzip`). Enabled by default
+    /// for `api.subconscious.dev`; an incompatible gateway is detected once and
+    /// the request is safely retried uncompressed. Env `SC_REQUEST_GZIP`.
     pub request_gzip: bool,
-    /// Whether the TUI grabs the mouse. Off by default: with the mouse
-    /// captured the terminal never sees a drag, so its own select-and-copy
-    /// stops working — the behavior users expect from every other terminal
-    /// program. On, `sc` does its own selection and copies on release (which
-    /// needs a terminal that accepts OSC 52) and the wheel scrolls precisely.
+    /// Request transport. DLR affects only the hop to the sidecar; the
+    /// sidecar forwards ordinary JSON to the configured provider.
+    pub request_transport: RequestTransport,
+    /// Base URL of the independently deployed DLR sidecar.
+    pub dlr_url: String,
+    /// Optional sidecar ingress secret, resolved from an env var and never
+    /// persisted as a literal in settings.
+    pub dlr_ingress_token: Option<String>,
+    pub dlr_ingress_token_env: String,
+    /// Extra repair symbols requested during a RESYNC/MISSING exchange.
+    pub dlr_repair_margin_pct: u32,
+    /// Whether the TUI grabs the mouse. On by default so the wheel and trackpad
+    /// scroll conversation history immediately. `sc` performs selection and
+    /// copies on release while captured; Ctrl+O releases the mouse when native
+    /// terminal selection is preferred.
     pub mouse: bool,
 }
 
@@ -110,10 +153,10 @@ pub struct SandboxConfig {
 /// The `context` block: every per-item truncation cap in the harness, in bytes
 /// (or lines/paths where noted). **`0` means unlimited** everywhere.
 ///
-/// Subconscious Code's thesis is that the model can take the whole thing, so
-/// the shipped defaults are all unlimited. The truncation code paths remain in
-/// place behind the `0` check, both so a small-context model can be served and
-/// so the §8.5 microcompaction seam stays available for future strategies.
+/// Most shipped defaults remain unlimited. Tool results default to a bounded
+/// projection because providers enforce a real token window: one accidental
+/// recursive inventory must not make the next request invalid. The full
+/// session remains available on disk and the cap can still be configured.
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(default)]
 pub struct ContextConfig {
@@ -136,11 +179,17 @@ pub struct ContextConfig {
     pub max_iters: u32,
 }
 
+/// Model-facing bytes retained from each tool result by default. Results remain
+/// complete in the persisted session (up to the separate 1 MiB emergency
+/// backstop); this smaller stable projection prevents one read from dominating
+/// request latency without retroactively rewriting cached history.
+pub const DEFAULT_TOOL_RESULT_CAP: usize = 64 * 1024;
+
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             inline_file_cap: 0,
-            tool_result_cap: 0,
+            tool_result_cap: DEFAULT_TOOL_RESULT_CAP,
             bash_output_cap: 0,
             grep_output_cap: 0,
             read_default_limit: 0,
@@ -187,10 +236,22 @@ struct ProviderFile {
     idle_timeout_ms: Option<u64>,
     max_retries: Option<u32>,
     request_gzip: Option<bool>,
+    reasoning_effort: Option<String>,
+    /// User-facing DLR switch. `true` selects safe DLR-first (`auto`) mode;
+    /// `false` selects ordinary JSON. The older `request_transport` setting is
+    /// retained below for compatibility and for its expert fail-closed mode.
+    dlr_enabled: Option<bool>,
+    request_transport: Option<RequestTransport>,
+    dlr_url: Option<String>,
+    dlr_ingress_token_env: Option<String>,
+    dlr_repair_margin_pct: Option<u32>,
 }
 
 // Defaults from §10.2. All overridable via env (§5.6 G3) or settings files.
-const DEFAULT_BASE_URL: &str = "https://api-dev.subconscious.dev/v1";
+const DEFAULT_BASE_URL: &str = "https://api.subconscious.dev/v1";
+// DLR appends `/v1/dlr/*` itself, so this is the origin rather than the
+// OpenAI-compatible `/v1` base used by ordinary JSON requests.
+const DEFAULT_DLR_URL: &str = "https://api.subconscious.dev";
 const DEFAULT_MODEL: &str = "subconscious/glm-5.2";
 const DEFAULT_SMALL_MODEL: &str = "subconscious/glm-5.2";
 /// Off: see [`Settings::timeout_ms`].
@@ -198,9 +259,14 @@ const DEFAULT_TIMEOUT_MS: u64 = 0;
 /// The liveness backstop that replaces the total timeout. Two minutes with no
 /// stream chunk means something is wrong.
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 120_000;
-/// Transient 429/5xx happen; the body is a refcounted `Bytes` so a retry is
-/// cheap even on a huge request.
-const DEFAULT_MAX_RETRIES: u32 = 2;
+/// The gateway/router owns retries and worker failover. Retrying again in SC
+/// multiplies one logical request across every upstream retry layer and can
+/// hold a router circuit open. Custom direct endpoints may opt back in.
+const DEFAULT_MAX_RETRIES: u32 = 0;
+/// The observed GLM route otherwise defaults to 4096 completion tokens, which
+/// is frequently consumed entirely by reasoning before a tool call is closed.
+const DEFAULT_MAX_TOKENS: u32 = 8_192;
+const DEFAULT_REASONING_EFFORT: &str = "high";
 
 /// Non-fatal problems found while loading settings: a malformed
 /// `settings.json` parse error, or a secret-shaped string in one. `Settings::load`
@@ -245,8 +311,9 @@ impl Settings {
         let mut retry_base_ms: u64 = 200;
         let mut retry_max_ms: u64 = 10_000;
         let mut turn_timeout_ms: u64 = 0;
-        let mut max_tokens: u32 = 0;
+        let mut max_tokens: u32 = DEFAULT_MAX_TOKENS;
         let mut temperature: Option<f32> = None;
+        let mut reasoning_effort = Some(DEFAULT_REASONING_EFFORT.to_string());
         let mut model = DEFAULT_MODEL.to_string();
         let mut models: Vec<String> = Vec::new();
         let mut small_model = DEFAULT_SMALL_MODEL.to_string();
@@ -254,10 +321,17 @@ impl Settings {
         let mut sandbox = SandboxConfig::default();
         let mut context = ContextConfig::default();
         let mut request_gzip = false;
-        // Default off, matching every other terminal program: selection and
-        // copy keep working out of the box, and a user who wants in-app
-        // selection or wheel scrolling opts in (settings, SC_MOUSE, Ctrl+O).
-        let mut mouse = false;
+        let mut request_gzip_configured = false;
+        // DLR is attempted first. Until `/v1/dlr/*` is deployed, the bounded
+        // capability probe fails and `auto` safely uses normal JSON.
+        let mut request_transport = RequestTransport::default();
+        let mut dlr_url = DEFAULT_DLR_URL.to_string();
+        let mut dlr_ingress_token_env = "SC_DLR_INGRESS_TOKEN".to_string();
+        let mut dlr_repair_margin_pct = 5u32;
+        // Scrollback is a primary conversation action, so wheel/trackpad events
+        // work on first launch. Ctrl+O hands the mouse back to the terminal for
+        // native selection whenever that is preferable.
+        let mut mouse = true;
 
         // Later layers override earlier ones. User before project so a
         // committed project file beats a user global — matches §10.1 (project
@@ -288,6 +362,27 @@ impl Settings {
                         }
                         if let Some(g) = p.request_gzip {
                             request_gzip = g;
+                            request_gzip_configured = true;
+                        }
+                        if let Some(effort) = p.reasoning_effort {
+                            reasoning_effort = normalize_reasoning_effort(&effort);
+                        }
+                        if let Some(transport) = p.request_transport {
+                            request_transport = transport;
+                        }
+                        // The simple switch is the current public setting and
+                        // wins over a legacy transport value in the same layer.
+                        if let Some(enabled) = p.dlr_enabled {
+                            request_transport = transport_for_dlr_enabled(enabled);
+                        }
+                        if let Some(url) = p.dlr_url {
+                            dlr_url = url;
+                        }
+                        if let Some(env) = p.dlr_ingress_token_env {
+                            dlr_ingress_token_env = env;
+                        }
+                        if let Some(margin) = p.dlr_repair_margin_pct {
+                            dlr_repair_margin_pct = margin;
                         }
                     }
                     if let Some(ui) = file.ui {
@@ -374,6 +469,9 @@ impl Settings {
                 temperature = Some(t);
             }
         }
+        if let Ok(v) = std::env::var("SC_REASONING_EFFORT") {
+            reasoning_effort = normalize_reasoning_effort(&v);
+        }
         if let Ok(v) = std::env::var("SC_DEFAULT_MODE") {
             if !v.is_empty() {
                 permissions.default_mode = v;
@@ -387,6 +485,30 @@ impl Settings {
         }
         if let Some(b) = env_bool("SC_REQUEST_GZIP") {
             request_gzip = b;
+            request_gzip_configured = true;
+        }
+        if let Ok(v) = std::env::var("SC_REQUEST_TRANSPORT") {
+            request_transport = match v.trim().to_ascii_lowercase().as_str() {
+                "dlr" => RequestTransport::Dlr,
+                "auto" => RequestTransport::Auto,
+                "json" => RequestTransport::Json,
+                _ => request_transport,
+            };
+        }
+        // The boolean switch is the public override and therefore wins over
+        // the legacy/expert SC_REQUEST_TRANSPORT value when both are present.
+        if let Some(enabled) = env_bool("SC_DLR_ENABLED") {
+            request_transport = transport_for_dlr_enabled(enabled);
+        }
+        if let Ok(v) = std::env::var("SC_DLR_URL") {
+            if !v.trim().is_empty() {
+                dlr_url = v;
+            }
+        }
+        if let Ok(v) = std::env::var("SC_DLR_REPAIR_MARGIN_PCT") {
+            if let Ok(value) = v.parse::<u32>() {
+                dlr_repair_margin_pct = value;
+            }
         }
         if let Some(b) = env_bool("SC_MOUSE") {
             mouse = b;
@@ -435,6 +557,13 @@ impl Settings {
         }
 
         let api_key = resolve_api_key(&api_key_env);
+        let dlr_ingress_token = std::env::var(&dlr_ingress_token_env)
+            .ok()
+            .filter(|value| !value.is_empty());
+
+        if !request_gzip_configured && base_url.contains("api.subconscious.dev") {
+            request_gzip = true;
+        }
 
         Settings {
             base_url,
@@ -462,12 +591,35 @@ impl Settings {
             turn_timeout_ms,
             max_tokens,
             temperature,
+            reasoning_effort,
             permissions,
             sandbox,
             context,
             request_gzip,
+            request_transport,
+            dlr_url,
+            dlr_ingress_token,
+            dlr_ingress_token_env,
+            dlr_repair_margin_pct,
             mouse,
         }
+    }
+}
+
+fn transport_for_dlr_enabled(enabled: bool) -> RequestTransport {
+    if enabled {
+        RequestTransport::Auto
+    } else {
+        RequestTransport::Json
+    }
+}
+
+fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(value.to_ascii_lowercase())
     }
 }
 
@@ -627,18 +779,53 @@ pub fn scan_for_secret(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The shipped defaults are the product: every context cap unlimited.
     #[test]
-    fn context_defaults_are_unlimited() {
+    fn provider_defaults_leave_retry_ownership_upstream() {
+        assert_eq!(DEFAULT_MAX_RETRIES, 0);
+        assert_eq!(DEFAULT_MAX_TOKENS, 8_192);
+        assert_eq!(DEFAULT_REASONING_EFFORT, "high");
+        assert_eq!(DEFAULT_DLR_URL, "https://api.subconscious.dev");
+        assert_eq!(RequestTransport::default(), RequestTransport::Auto);
+        assert_eq!(normalize_reasoning_effort(" OFF "), None);
+        assert_eq!(normalize_reasoning_effort("High").as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn dlr_provider_settings_parse_without_storing_the_secret() {
+        let file: SettingsFile = serde_json::from_str(
+            r#"{"provider":{"dlr_enabled":true,"request_transport":"dlr","dlr_url":"https://sidecar.internal","dlr_ingress_token_env":"MY_DLR_TOKEN","dlr_repair_margin_pct":9}}"#,
+        )
+        .unwrap();
+        let provider = file.provider.unwrap();
+        assert_eq!(provider.dlr_enabled, Some(true));
+        assert_eq!(provider.request_transport, Some(RequestTransport::Dlr));
+        assert_eq!(
+            provider.dlr_url.as_deref(),
+            Some("https://sidecar.internal")
+        );
+        assert_eq!(
+            provider.dlr_ingress_token_env.as_deref(),
+            Some("MY_DLR_TOKEN")
+        );
+        assert_eq!(provider.dlr_repair_margin_pct, Some(9));
+        assert_eq!(RequestTransport::default(), RequestTransport::Auto);
+        assert_eq!(transport_for_dlr_enabled(true), RequestTransport::Auto);
+        assert_eq!(transport_for_dlr_enabled(false), RequestTransport::Json);
+    }
+
+    /// Only model-facing tool output is bounded by default; direct file reads,
+    /// searches, and mentions retain their previous unlimited behavior.
+    #[test]
+    fn context_defaults_keep_tool_results_provider_safe() {
         let c = ContextConfig::default();
         assert_eq!(c.inline_file_cap, 0);
-        assert_eq!(c.tool_result_cap, 0);
+        assert_eq!(c.tool_result_cap, DEFAULT_TOOL_RESULT_CAP);
         assert_eq!(c.bash_output_cap, 0);
         assert_eq!(c.grep_output_cap, 0);
         assert_eq!(c.read_default_limit, 0);
         assert_eq!(c.read_max_line_chars, 0);
         assert_eq!(c.glob_cap, 0);
-        // The runaway backstop is the one non-zero default.
+        // Iterations retain their independent runaway backstop.
         assert_eq!(c.max_iters, 1000);
     }
 
@@ -650,7 +837,7 @@ mod tests {
         let c: ContextConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.tool_result_cap, 16384);
         assert_eq!(c.read_default_limit, 2000);
-        // Unmentioned fields keep the unlimited default.
+        // Unmentioned fields keep their defaults.
         assert_eq!(c.bash_output_cap, 0);
         assert_eq!(c.max_iters, 1000);
     }
@@ -688,12 +875,12 @@ mod tests {
         );
     }
 
-    /// The mouse is released by default: `sc` must not break the terminal's
-    /// own select-and-copy for a user who never asked it to.
+    /// Scrollback works with the wheel on first launch. Ctrl+O remains the
+    /// explicit escape hatch for native terminal selection.
     #[test]
-    fn mouse_capture_is_off_unless_asked_for() {
+    fn mouse_capture_is_on_for_scrollback_by_default() {
         let s = Settings::load(Path::new("/nonexistent-project-dir"));
-        assert!(!s.mouse, "default must leave the mouse to the terminal");
+        assert!(s.mouse, "default must enable wheel scrollback");
     }
 
     /// With the env var unset, the resolver is exactly the saved key — the

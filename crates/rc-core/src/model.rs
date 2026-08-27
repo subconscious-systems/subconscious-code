@@ -5,7 +5,8 @@
 //! network (§13). `ChatModel` streams internally, accumulates the assistant
 //! turn, and forwards deltas to the sink.
 
-use crate::turn::{ToolCall, ToolResultBody};
+use crate::tool::Artifact;
+use crate::turn::{ToolCall, ToolResultBody, Turn};
 use async_trait::async_trait;
 use rc_proto::stream::AgentStreamEvent;
 use rc_proto::{
@@ -14,7 +15,7 @@ use rc_proto::{
 };
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_stream::{Stream, StreamExt};
 
 /// What the loop sends to a model.
@@ -89,16 +90,39 @@ pub trait EventSink: Send + Sync {
     /// One terminal result per batch item. `tool` is the call's tool name
     /// (carried so the host can render a result line without holding the call).
     fn on_tool_end(&self, _call_id: &str, _tool: &str, _result: &ToolResultBody) {}
+    /// A successful tool side effect, emitted immediately before that call's
+    /// `on_tool_end`. Hosts use this for live diffs and per-turn change totals;
+    /// it is not inserted into model context.
+    fn on_artifact(&self, _call_id: &str, _tool: &str, _artifact: &Artifact) {}
     fn on_iter(&self, _count: u32, _max: u32) {}
     fn on_usage(&self, _usage: &Usage) {}
     /// The request succeeded after `retries` wire-layer retries (429/5xx).
     /// Fired once at the start of `ChatModel::complete` when `retries > 0`, so
     /// the host can surface "retried N×" live. Wire retries are otherwise silent.
     fn on_retry(&self, _retries: u32) {}
+    /// A raw SSE comment or partial frame arrived without a semantic delta.
+    fn on_transport_activity(&self) {}
+    /// A streamed tool-call fragment arrived but is not yet safe to execute.
+    fn on_tool_delta(
+        &self,
+        _index: usize,
+        _id: Option<&str>,
+        _name: Option<&str>,
+        _arguments: &str,
+    ) {
+    }
+    /// Canonical JSON bytes and actual uploaded bytes for this request.
+    fn on_request_payload(&self, _json_bytes: usize, _wire_bytes: usize) {}
+    /// Elapsed time from model-call start until HTTP response headers arrived.
+    fn on_response_headers(&self, _elapsed: Duration) {}
     /// M8: the size of the context about to be sent — its char length and the
     /// calibrated token estimate. Purely informational (there is no window to
     /// exceed); a UI shows it so the operator can watch the context grow.
     fn on_context(&self, _chars: usize, _est_tokens: usize) {}
+    /// A completed source-of-truth turn was appended to the session. Hosts use
+    /// this boundary for crash-safe incremental persistence; unlike streaming
+    /// deltas, a turn is complete and safe to replay.
+    fn on_turn(&self, _turn: &Turn) {}
 }
 
 #[derive(Default)]
@@ -140,11 +164,20 @@ impl Model for ChatModel {
         req: ModelRequest,
         sink: &dyn EventSink,
     ) -> Result<ModelResponse, ModelError> {
-        let (stream, retries) = self
+        let started = Instant::now();
+        let (stream, retries, payload) = match self
             .client
             .stream(&req.messages, &req.opts, &req.tools)
             .await
-            .map_err(|(error, retries)| ModelError::Proto { error, retries })?;
+        {
+            Ok(response) => response,
+            Err((error, retries, payload)) => {
+                sink.on_request_payload(payload.json_bytes, payload.wire_bytes);
+                return Err(ModelError::Proto { error, retries });
+            }
+        };
+        sink.on_request_payload(payload.json_bytes, payload.wire_bytes);
+        sink.on_response_headers(started.elapsed());
         if retries > 0 {
             sink.on_retry(retries);
         }
@@ -195,6 +228,10 @@ async fn consume_stream(
             break;
         };
         match ev? {
+            // A comment or partial SSE frame proves the response body is still
+            // moving. Reaching this match already reset the per-event timeout;
+            // it intentionally has no user-visible or persisted representation.
+            AgentStreamEvent::TransportActivity => sink.on_transport_activity(),
             AgentStreamEvent::Text(t) => {
                 sink.on_text(&t);
                 text.push_str(&t);
@@ -203,6 +240,12 @@ async fn consume_stream(
                 sink.on_reasoning(&r);
                 reasoning.push_str(&r);
             }
+            AgentStreamEvent::ToolCallProgress {
+                index,
+                id,
+                name,
+                arguments,
+            } => sink.on_tool_delta(index, id.as_deref(), name.as_deref(), &arguments),
             AgentStreamEvent::ToolCallReady {
                 id,
                 name,
@@ -357,7 +400,13 @@ mod tests {
         let elapsed = start.elapsed().unwrap_or_default();
         drop(tx); // held open through the await above
         assert!(
-            matches!(res, Err(ModelError::Proto { error: ProtoError::Idle(_), .. })),
+            matches!(
+                res,
+                Err(ModelError::Proto {
+                    error: ProtoError::Idle(_),
+                    ..
+                })
+            ),
             "stalled stream should hit Idle, got {res:?}"
         );
         assert!(
@@ -378,6 +427,36 @@ mod tests {
         let resp = res.expect("normal stream completes");
         assert_eq!(resp.text, "hi");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn transport_activity_resets_idle_timeout_without_becoming_output() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentStreamEvent, ProtoError>>(8);
+        let stream: Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>> =
+            Box::pin(ReceiverStream::new(rx));
+        let producer = tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                tx.send(Ok(AgentStreamEvent::TransportActivity))
+                    .await
+                    .unwrap();
+            }
+            tx.send(Ok(AgentStreamEvent::Text("alive".into())))
+                .await
+                .unwrap();
+            tx.send(Ok(AgentStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }))
+            .await
+            .unwrap();
+        });
+
+        let response = consume_stream(stream, Some(Duration::from_millis(35)), None, 0, &NullSink)
+            .await
+            .expect("heartbeats keep the live stream inside the idle window");
+        producer.await.unwrap();
+        assert_eq!(response.text, "alive");
+        assert_eq!(response.finish_reason, FinishReason::Stop);
     }
 
     #[tokio::test]

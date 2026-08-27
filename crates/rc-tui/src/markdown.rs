@@ -277,8 +277,14 @@ fn render_table(header: &[String], rows: &[Vec<String>]) -> Vec<Line<'static>> {
         border_line(&widths, '├', '┼', '┤'),
         p.chrome(),
     ));
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         out.push(table_row_line(row, &widths, false));
+        if index + 1 < rows.len() {
+            out.push(Line::styled(
+                border_line(&widths, '├', '┼', '┤'),
+                p.chrome(),
+            ));
+        }
     }
     out.push(Line::styled(
         border_line(&widths, '└', '┴', '┘'),
@@ -701,8 +707,9 @@ mod tests {
         let src = "| Name | Role |\n|------|------|\n| Ada | author |\n| Grace | engineer |";
         let l = parse_blocks(src);
         let text = plain(&l);
-        // Top border, header, separator, two rows, bottom border.
-        assert_eq!(text.len(), 6, "table is 6 lines: {text:?}");
+        // Top border, header separator, a separator between body rows, and the
+        // bottom border.
+        assert_eq!(text.len(), 7, "table is 7 lines: {text:?}");
         assert!(text[0].starts_with('┌'), "top border: {text:?}");
         assert!(text[0].ends_with('┐'), "top border corner: {text:?}");
         assert!(
@@ -716,6 +723,11 @@ mod tests {
         assert!(
             text.contains(&"│ Grace │ engineer │".to_string()),
             "row padded: {text:?}"
+        );
+        assert_eq!(
+            text.iter().filter(|row| row.starts_with('├')).count(),
+            2,
+            "header and every data row are visually separated: {text:?}"
         );
         assert!(
             text.last().unwrap().starts_with('└'),

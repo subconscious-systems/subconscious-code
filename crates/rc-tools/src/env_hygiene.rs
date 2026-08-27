@@ -1,9 +1,11 @@
 //! Env hygiene for the `Bash` tool (M7 / §6.6).
 //!
 //! Two concerns:
-//! - **Strip rc**: run `bash --noprofile --norc` when bash is available so the
-//!   shell doesn't load the user's interactive rc (nvm/conda/pyenv shims in
-//!   `.bashrc` would otherwise leak in opaquely).
+//! - **Strip rc + honest pipelines**: run
+//!   `bash --noprofile --norc -o pipefail` when bash is available so the shell
+//!   doesn't load the user's interactive rc (nvm/conda/pyenv shims in `.bashrc`
+//!   would otherwise leak in opaquely) and a failed pipeline stage cannot be
+//!   masked by a successful final command.
 //! - **Rehydrate toolchains**: prepend the detected toolchain bin dirs (nvm
 //!   default, pyenv shims, conda, `~/.local/bin`) to `PATH` so the agent still
 //!   finds `node`/`python`/etc. without sourcing rc files.
@@ -18,15 +20,24 @@ use std::sync::OnceLock;
 
 /// Resolve the shell to invoke and its non-interactive args.
 ///
-/// Prefers `bash` (with `--noprofile --norc`) since those flags are bash-only;
-/// falls back to `$SHELL` (inheriting its rc) and then `/bin/sh`. Cached for the
-/// process lifetime — the choice doesn't change mid-run.
+/// Prefers `bash` (with `--noprofile --norc -o pipefail`) since those options
+/// are bash-specific; falls back to `$SHELL` (inheriting its rc) and then
+/// `/bin/sh`. Cached for the process lifetime — the choice doesn't change
+/// mid-run.
 pub fn resolve_shell() -> (PathBuf, Vec<String>) {
     static SHELL: OnceLock<(PathBuf, Vec<String>)> = OnceLock::new();
     SHELL
         .get_or_init(|| {
             if let Some(bash) = find_in_path("bash") {
-                return (bash, vec!["--noprofile".into(), "--norc".into()]);
+                return (
+                    bash,
+                    vec![
+                        "--noprofile".into(),
+                        "--norc".into(),
+                        "-o".into(),
+                        "pipefail".into(),
+                    ],
+                );
             }
             if let Ok(shell) = std::env::var("SHELL") {
                 let p = PathBuf::from(&shell);

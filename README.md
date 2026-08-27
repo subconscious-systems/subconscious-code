@@ -3,21 +3,21 @@
 A terminal coding agent in first-party Rust, speaking any OpenAI-compatible
 `/v1/chat/completions` endpoint. Single static binary; no Python, no Node.
 
-**The defining feature: no context-window limit and no request-size cap.**
-Claude Code caps a request at 32 MB and truncates tool output to protect a fixed
-window. `sc` does neither. Every per-item truncation cap is configurable and
-ships at `0` — unlimited — because the model behind it is built to ingest entire
-conversations and arbitrarily large files.
+`sc` keeps large-context operation configurable while respecting the model's
+real provider window. Individual tool results are projected into model context
+with a provider-safe default cap; the session record and live file-change
+artifacts remain separate, so an accidental recursive inventory cannot poison
+the next request or hide an edit.
 
 ## How It Works
 
 ### Core Philosophy
 
-`sc` is built on a simple inversion: instead of a client that guards a small
-context window and truncates aggressively, it's a client that trusts the model.
-The agent loop does not police the context — it assembles it faithfully and sends
-everything. Truncation is still *possible* (cap any field in `~/.sc/settings.json`),
-but the defaults let the model see the whole picture.
+`sc` is built for models with large context windows rather than aggressively
+shrinking every read. Most inputs remain unlimited. Tool results alone have a
+conservative model-facing default because provider token limits are real and a
+single broad command can otherwise make the next request fail before the model
+can recover.
 
 ### The Agent Loop
 
@@ -48,12 +48,14 @@ Large requests are the key. The assembly pipeline:
 - **Memory** — `AGENTS.md` files (global + project-local + repo-local), loaded
   in order and merged into the context
 - **Inline expansions** — `@file` paths in the user prompt are read and inlined
-- **Tool results** — truncated only if a cap is set (default: unlimited)
+- **Tool results** — projected with a 256 KiB per-result default; configurable
 
-The assembled context is serialized **exactly once** to bytes, then wrapped in a
-refcounted `Arc<Bytes>`. Retries don't re-serialize — they just clone the refcount.
-This is why a 12 MB body doesn't balloon the process memory: one copy for the wire,
-not four.
+The assembled context is borrowed directly by the wire request and serialized
+**exactly once**. Bodies through 8 MiB stay in refcounted `Bytes`; larger bodies
+promote to an immutable temporary spool and stream from disk. With gzip, serde
+streams directly into the compressor, so raw and compressed bodies are never
+retained together. Retries reopen that exact spool (or clone the small `Bytes`)
+and never re-serialize the request.
 
 When the model returns a batch of tool calls, the loop runs two distinct passes
 over it:
@@ -68,8 +70,8 @@ over it:
 
    | Class | Tools | Behavior |
    | --- | --- | --- |
-   | `Parallel` | `Read`, `Glob`, `Grep` | Run concurrently, bounded to 8 in flight |
-   | `SerialWrite` | `Write`, `Edit` | Run one at a time, in order |
+   | `Parallel` | `Read`, `ReadMany`, `Glob`, `Grep`, `GrepMany` | Run concurrently, bounded to 8 in flight |
+   | `SerialWrite` | `Write`, `Append`, `Edit` | Run one at a time, in order |
    | `Exclusive` | `Bash` | Runs alone, nothing else in flight |
 
 Each parallel tool runs in its own `tokio::spawn`, so a panicking tool becomes an
@@ -101,7 +103,77 @@ export SC_API_KEY=...                 # your gateway key
 sc --doctor                             # verify the endpoint before trusting it
 ```
 
-Defaults point at `https://api-dev.subconscious.dev/v1` with model
+### Optional DLR sidecar
+
+DLR avoids re-uploading the complete conversation on every tool-loop turn. The
+sidecar lives in this repository at `integrations/dlr`; it reconstructs the
+ordinary OpenAI request beside the gateway, so neither the gateway nor SGLang
+needs to change.
+
+Build and run it independently:
+
+```sh
+cargo build --manifest-path integrations/dlr/Cargo.toml --release \
+  -p dlr-sidecar --bin dlr-sidecar
+
+export DLR_UPSTREAM_URL=https://api.subconscious.dev
+export DLR_WAL=/var/lib/dlr/receiver.wal
+export DLR_INGRESS_TOKEN='replace-with-a-secret'
+integrations/dlr/target/release/dlr-sidecar --listen 0.0.0.0:32180
+```
+
+Subconscious Code tries DLR first by default and leaves `SC_BASE_URL` as the
+normal JSON endpoint used for fallback. The shipped DLR URL is
+`https://api.subconscious.dev`, ready for the gateway's `/v1/dlr/*` routes. To
+test against the local sidecar before those routes are deployed, override it:
+
+```sh
+export SC_DLR_URL=http://127.0.0.1:32180
+export SC_DLR_INGRESS_TOKEN="$DLR_INGRESS_TOKEN"
+sc --doctor
+```
+
+The setting `provider.dlr_enabled` (also available under `/menu` → Settings)
+controls the feature. `true` means DLR first with normal JSON fallback; `false`
+means normal JSON only. `SC_DLR_ENABLED=true|false` overrides the file. The
+fallback happens only when the bounded capability probe fails before DLR
+becomes active; it never silently resends a model request in the middle of an
+active DLR run. The older `provider.request_transport` /
+`SC_REQUEST_TRANSPORT` setting remains compatible: `auto` is equivalent to
+enabled, `json` to disabled, and expert `dlr` mode fails closed. The boolean
+setting wins if both forms are present. Other DLR file settings are
+`provider.dlr_url`, `provider.dlr_ingress_token_env`, and
+`provider.dlr_repair_margin_pct` (default 5). Secrets are resolved only from
+the named environment variable.
+
+The sidecar must have durable, sticky state (one WAL owner, or routing affinity
+to the owner) and should sit on the gateway-side of the slower network link.
+It streams SSE responses without buffering. Its current binary envelope is
+capped at 64 MiB; the reconstructed gateway request is still subject to the
+gateway's existing body limit. See
+[`integrations/dlr/docs/SIDECAR.md`](integrations/dlr/docs/SIDECAR.md).
+
+To isolate transport contribution to time-to-first-token against an
+immediate-SSE test gateway, use the repeatable size-ladder example:
+
+```sh
+SC_TTFT_JSON_URL=http://gateway.test/v1 \
+SC_TTFT_DLR_URL=http://sidecar.test:32180 \
+SC_TTFT_DLR_TOKEN="$DLR_INGRESS_TOKEN" \
+SC_TTFT_SIZES_MIB=1,10,25,45 \
+SC_TTFT_REPEATS=3 \
+cargo run --release -p rc-proto --example dlr_ttft
+```
+
+Set `SC_TTFT_SYNTHETIC_SOURCE=1` for a highly compressible generated-Rust
+corpus. The default high-entropy corpus is deliberately unfavorable to gzip.
+Set `SC_TTFT_HISTORY_BLOCK_KIB=4` to split the stable context into many small
+messages and exercise long-history bookkeeping and HTTP chunking rather than a
+single large message.
+The benchmark includes upload, sidecar reconstruction, its local full-JSON
+forward, and first SSE bytes; it intentionally excludes model queue and prefill.
+
+Defaults point at `https://api.subconscious.dev/v1` with model
 `subconscious/glm-5.2`. Override per-invocation with `--base-url` / `--model`, per-shell
 with `SC_BASE_URL` / `SC_MODEL`, or persistently in `~/.sc/settings.json`.
 
@@ -113,6 +185,22 @@ sc --continue            # resume the most recent session
 sc -p "explain src/"     # headless one-shot, prints the answer to stdout
 sc --doctor --body-ladder  # measure the gateway's real maximum request size
 ```
+
+### Harbor benchmarks
+
+The native Harbor adapter lives in
+[`integrations/harbor`](integrations/harbor/README.md). It packages `sc` as a
+first-class Harbor agent and maps its benchmark report into Harbor token,
+cache, cost, and timing metadata. Headless runs can emit that versioned report
+directly:
+
+```sh
+sc --benchmark-report report.json -p "fix the task"
+```
+
+Tagged releases publish the adapter wheel plus x86_64/aarch64 Linux binaries,
+so cloud sandboxes can download a pinned artifact instead of compiling Rust in
+every trial.
 
 In the TUI: `Shift+Tab` cycles permission mode, `Esc` cancels a turn, `Ctrl+C`
 quits, `@` completes file paths, `/` completes commands (`/menu`, `/clear`,
@@ -153,7 +241,7 @@ back, `Esc` to close:
 
 ## Permissions
 
-`Read`/`Glob`/`Grep` run freely. `Write`/`Edit`/`Bash` escalate to an Ask, which
+`Read`/`Glob`/`Grep` run freely. `Write`/`Append`/`Edit`/`Bash` escalate to an Ask, which
 the TUI answers inline (`y` once / `s` session / `a` always / `n` no).
 
 **Headless runs fail closed.** With no TTY there's nobody to ask, so a `-p` run
@@ -163,7 +251,7 @@ anything until you either grant rules or bypass:
 
 ```json
 // ./.sc/settings.json — grant what this project needs
-{ "permissions": { "allow": ["Write", "Edit", "Bash(cargo:*)", "Bash(git:*)"] } }
+{ "permissions": { "allow": ["Write", "Append", "Edit", "Bash(cargo:*)", "Bash(git:*)"] } }
 ```
 
 Or `sc -p "..." --dangerously-skip-permissions` (still hard-denies catastrophic
@@ -174,7 +262,7 @@ commands; refuses to run in CI without `SC_DANGEROUS=1`).
 | Mode | Behavior |
 | --- | --- |
 | `ask` | Confirm **every** tool call, reads included |
-| `default` | Confirm mutating tools (`Write`/`Edit`/`Bash`); reads run freely |
+| `default` | Confirm mutating tools (`Write`/`Append`/`Edit`/`Bash`); reads run freely |
 | `acceptEdits` | Edits apply automatically; `Bash` still confirms |
 | `plan` | Mutating tools are denied outright |
 | `auto` | Nothing confirms. Catastrophic commands are still hard-denied |
@@ -189,13 +277,13 @@ page) — a resumed session restores whichever mode it was last in.
 ### The Eight Configurable Caps
 
 Eight limits existed in the original design to protect a small context window.
-All are now configurable and default to unlimited:
+All remain configurable; only tool-result projection is bounded by default:
 
 | Setting | Default | Was | Enforced in |
 | --- | --- | --- | --- |
-| `context.tool_result_cap` | unlimited | 16 KB per tool result | Context assembler |
+| `context.tool_result_cap` | 256 KiB | 16 KB per tool result | Context assembler |
 | `context.inline_file_cap` | unlimited | 8 KB per `@file` mention | Context assembler |
-| `context.bash_output_cap` | unlimited | 30 KB of stdout+stderr | `Bash` tool |
+| `context.bash_output_cap` | unlimited model projection | 30 KB of stdout+stderr | `Bash` tool |
 | `context.grep_output_cap` | unlimited | 30 KB of matches | `Grep` tool |
 | `context.read_default_limit` | whole file | 2000 lines | `Read` tool |
 | `context.read_max_line_chars` | untruncated | 2000 chars per line | `Read` tool |
@@ -221,15 +309,21 @@ perfectly serviceable — set the caps you want in `~/.sc/settings.json`:
 ### Smart Tool Descriptions
 
 `Bash`, `Read`, and `Glob` build their description string at construction, from
-the cap actually in force. The model is never told output is capped when it
-isn't — and never left unaware of a real cap. Advertising a phantom limit
-changes how a model uses a tool.
+the cap actually in force. `Bash` has a separate 2 MiB-per-stream transport
+ceiling regardless of that setting: it retains the beginning and end of noisy
+stdout/stderr rather than letting a child allocate until the host swaps. A
+background shell similarly publishes a bounded 8 MiB rolling log. One session
+supervisor owns all detached children, drains their nonblocking pipes, reaps
+them, and rotates each log as two append-only 4 MiB segments instead of
+periodically rewriting the whole log. These are process-safety bounds, not
+context-budget policy.
 
 From `bash_description` in `crates/rc-tools/src/bash.rs:85`:
 
 ```rust
 let limit = if cap == 0 {
-    "stdout+stderr are captured in full (ANSI stripped) with no size limit".to_string()
+    "stdout+stderr are ANSI stripped and returned from a bounded head+tail capture window"
+        .to_string()
 } else {
     format!(
         "stdout+stderr are captured, ANSI stripped, and capped at {} chars \
@@ -253,16 +347,22 @@ The token estimator (`rc-tokenize`) is **wired for observation, not control:**
 - **It gates nothing.** No threshold, no compaction trigger, no "context is too
   large, please trim" logic. The agent loop trusts the model.
 
-This design accepts that the provider-side context limit still applies — the model
-has its own ceiling — but the client doesn't need to guess where it is.
+The estimator does not control context. The independent tool-result projection
+cap prevents a single runaway result from crossing the provider's real ceiling.
 
 ### Request Size and Memory Efficiency
 
-The critical optimization that makes unlimited context feasible:
+The critical optimization that makes large context feasible:
 
-**Single Serialization with Refcounting**
-- The request body is serialized **exactly once** to bytes and wrapped in `Arc<Bytes>`
-- Retries don't re-serialize or re-copy; they clone a refcount
+**Single Serialization with Refcounting or Spooling**
+- The request borrows messages/tools during serialization instead of cloning the
+  whole request graph
+- The request body is serialized **exactly once** to `Bytes` (≤8 MiB) or an
+  immutable temp-file spool (>8 MiB)
+- With gzip, serde writes straight into the compressor instead of retaining both
+  raw JSON and compressed buffers
+- Retries don't re-serialize or re-copy; they clone a refcount or reopen the
+  same spool as a streaming body
 - Contrast with the previous path: built a `serde_json::Value` tree, canonicalized
   a copy of it, then a `String`, then called `.to_string()` again per retry
 
@@ -290,17 +390,80 @@ The critical optimization that makes unlimited context feasible:
 **No total request timeout by default.** A total timeout covers the upload, so
 on a large body it expires mid-upload and triggers a retry that re-uploads from
 scratch. Instead, liveness comes from `idle_timeout_ms` (default 120 s), which
-distinguishes a *stalled* stream from a merely large one. Set `timeout_ms` in
-settings if you want a total budget.
+measures raw response-body activity: SSE heartbeat comments and partial frames
+keep a healthy stream alive without appearing in the transcript. Set
+`timeout_ms` in settings if you want a total budget.
+
+**Client retries are off by default.** The Subconscious gateway/router owns
+upstream retry and failover. Set `provider.max_retries` or `SC_MAX_RETRIES` only
+for a direct endpoint that has no retrying intermediary; stacking retry layers
+amplifies overload and circuit-breaker failures.
+
+**The default completion allowance is 8192 tokens.** The GLM route otherwise
+uses an observed 4096-token implicit ceiling that can cut a tool call after a
+long reasoning trace. `SC_MAX_TOKENS=0` (or `--max-tokens 0`) restores the
+provider default. A truncated response gets at most one synthetic continuation;
+SC will surface `length`/`incomplete` rather than repeatedly sending recovery
+prompts.
+
+**GLM reasoning defaults to `high`, not `max`.** Spark traces showed hidden
+reasoning dominating wall time, while prompt-cache hit rate remained about 98%.
+SC now sends `reasoning_effort: "high"` by default. Use
+`SC_REASONING_EFFORT=max`, `--reasoning-effort max`, or
+`provider.reasoning_effort`; set `off` to omit the field for a provider that
+does not support it.
+
+**Long generated files use bounded appends.** `Append` commits one chunk
+atomically and returns its byte `new_size`. Supplying that value as the next
+chunk's `expected_size` prevents a repeated or stale call from duplicating
+content. `GrepMany` similarly collects up to 32 already-known searches into one
+model round trip.
 
 **`--debug` truncates the body log** to 8 KB plus a byte count. Logging a 200 MB
 request per debug run is its own outage. `SC_DEBUG_FULL_BODY=1` restores the full
-dump.
+dump only for in-memory bodies; disk-spooled requests always remain preview-only.
 
-**Optional request gzip** (`SC_REQUEST_GZIP=1` or `provider.request_gzip` in
-settings). Off by default: confirm the gateway honors `Content-Encoding: gzip`
-before enabling, else it will try to parse gzipped bytes as JSON. JSON compresses
-5–10×.
+**Adaptive request gzip** (`SC_REQUEST_GZIP` or `provider.request_gzip` in
+settings). It is enabled automatically for `api.subconscious.dev`; JSON often
+compresses 5–10×. If a gateway returns 415 or a clear compressed-body parse
+error, SC retries that request once uncompressed and remembers to leave gzip off
+for the rest of the process. Set `SC_REQUEST_GZIP=0` to disable the probe.
+
+Failed streams persist bounded private diagnostics: partial text/reasoning/tool
+arguments, event counts, and the last raw/semantic activity timestamps. These
+remain in the session JSONL and are deliberately omitted from ATIF trajectories.
+
+### Linux Session Resource Containment
+
+On a systemd Linux host, every interactive or headless `sc` run automatically
+re-enters a transient user scope. The scope contains the editor and all tool
+descendants, so concurrent builds cannot force the entire host into memory
+reclaim. Where a user systemd manager is unavailable (common inside benchmark
+containers), `sc` applies an inherited `RLIMIT_AS` hard-memory fallback instead.
+This is process containment only; it does not limit model context.
+
+Defaults are sized from the host: one eighth of RAM (4–12 GiB), a soft memory
+threshold at 75% of that, 2 GiB of swap, 512 processes/threads, and half the
+host CPUs capped at 8 cores. Every Bash call also gets an independent process
+group, which is killed in full on timeout, turn cancellation, or session exit.
+
+Override these for a benchmark worker with:
+
+| Variable | Meaning |
+| --- | --- |
+| `SC_RESOURCE_MEMORY_MAX_MB` | Hard memory limit for one `sc` process tree |
+| `SC_RESOURCE_MEMORY_HIGH_MB` | Reclaim threshold below the hard limit |
+| `SC_RESOURCE_SWAP_MAX_MB` | Swap allowed to the scope |
+| `SC_RESOURCE_TASKS_MAX` | Maximum processes/threads in the scope |
+| `SC_RESOURCE_CPU_QUOTA_PERCENT` | CPU quota (`100` = one core) |
+| `SC_RESOURCE_TERMINATE_PERCENT` | Sustained memory percentage that triggers graceful cancellation (default `90`) |
+| `SC_RESOURCE_LIMITS=0` | Disable the systemd scope |
+
+Benchmark reports include the build id plus scope or rlimit memory current,
+peak, monitor peak, maximum, controlled-pressure termination, and the cgroup
+OOM-kill counter where available. At 75%, 85%, and the termination threshold,
+the monitor emits telemetry; three consecutive terminal samples cancel the
+active turn before the kernel's hard OOM boundary.
 
 ### Gateway Ceiling — Measure This First
 
@@ -362,9 +525,9 @@ Read as a table:
 | `rc-sandbox` | — | Landlock + seccomp (Linux; no-op elsewhere) |
 | `rc-core` | `rc-proto`, `rc-perm`, `rc-tokenize` | The agent loop, `Tool` trait, `Turn`/`Session` model |
 | `rc-ctx` | `rc-core`, `rc-proto`, `rc-tokenize` | System prompt, environment, `AGENTS.md`, `@file` expansion |
-| `rc-tools` | `rc-core`, `rc-perm`, `rc-sandbox` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` |
+| `rc-tools` | `rc-core`, `rc-perm`, `rc-sandbox` | `Read`, `ReadMany`, `Write`, `Append`, `Edit`, `Glob`, `Grep`, `GrepMany`, `List`, `Bash` |
 | `rc-session` | `rc-core` | JSONL persistence, resume, `/rewind` |
-| `rc-rt` | `rc-core`, `rc-session` | Event transport (`broadcast` + `mpsc`) |
+| `rc-rt` | `rc-core`, `rc-session` | Bounded/coalesced event transport, action ownership, async persistence |
 | `rc-tui` | `rc-rt`, `rc-core`, `rc-session`, `rc-config` | The ratatui frontend |
 | `rc-cli` | all of the above | Entry point, wiring, `--doctor` |
 
@@ -466,9 +629,17 @@ from aborted startups are skipped on both sides (the store is created *after* th
 terminal check, and `latest` filters them).
 
 **rc-rt** — Event transport. The TUI is a synchronous poll loop that:
-- Drives `rc-core` with a `broadcast` channel (AgentEvent stream)
-- Listens on an `mpsc` for `UserAction` (keystrokes, mode changes)
+- Drains a single-consumer queue with a bounded/coalesced presentation budget;
+  tool lifecycle, permission, artifact, error, and turn-boundary events are
+  structural and are never evicted
+- Sends `UserAction` through bounded channels with one explicitly owned active turn
 - Feeds permission prompts back via `Prompter::ask`
+
+Completed interactive turns are handed to a dedicated background session
+writer, so filesystem flush latency is not part of the model/tool event path.
+File rewind snapshots use a durable per-session content-addressed store:
+repeated before-images share one blob, references survive restart, and event/UI
+clones carry `Arc` handles rather than duplicating file bytes.
 
 **rc-tui** — The TUI frontend. Renders:
 - Transcript (user messages, streaming responses, tool calls, tool results)
@@ -503,10 +674,9 @@ New sessions get opaque UUID-based IDs; a resumed session keeps the ID already
 in its file, so `--continue` and `--resume` stay inside the same gateway
 Conversation.
 
-Retries default to 2 attempts on transient failures (429/5xx). This is only
-cheap because the body is refcounted — see
-[Request Size](#request-size-and-memory-efficiency) — so a retry re-sends the
-same `Bytes` rather than rebuilding a multi-megabyte payload.
+Provider retries default to zero: the gateway/router is the single retry owner.
+Direct endpoints can opt in with `SC_MAX_RETRIES`; the immutable body means an
+explicit retry re-sends the same `Bytes` or spool rather than rebuilding it.
 
 ## Development
 
@@ -525,6 +695,6 @@ cargo check -p rc-sandbox --target x86_64-unknown-linux-gnu --all-targets
 
 Milestones: chat completions (M0), streaming + tool loop (M1), core tools (M2),
 permissions (M3), TUI (M4), session persistence (M5), context assembly (M6),
-background shells + sandbox + rewind (M7), and the unlimited-context/request
+background shells + sandbox + rewind (M7), and the large-context/request
 track plus `sc --doctor` (M8). Still ahead: MCP, hooks, skills, and full
 compaction — see `working-cli-plan.md`.

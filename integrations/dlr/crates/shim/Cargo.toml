@@ -1,0 +1,19 @@
+[package]
+name = "dlr-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dlr-core.workspace = true
+dlr-coding.workspace = true
+dlr-compress.workspace = true
+dlr-transport.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+rayon.workspace = true
+
+[lib]
+path = "src/lib.rs"

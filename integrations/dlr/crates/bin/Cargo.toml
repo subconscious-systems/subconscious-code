@@ -1,0 +1,20 @@
+[package]
+name = "dlr-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dlr"
+path = "src/main.rs"
+
+[dependencies]
+dlr-core.workspace = true
+dlr-coding.workspace = true
+dlr-compress.workspace = true
+dlr-transport.workspace = true
+dlr-shim.workspace = true
+dlr-receiver.workspace = true
+dlr-prune.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true

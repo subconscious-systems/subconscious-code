@@ -6,19 +6,18 @@
 //! [`crate::stream::StreamFuser`] → [`EventStream`] of [`AgentStreamEvent`].
 //! `rustls-tls` (no openssl) keeps the binary self-contained (§0).
 
-use crate::canonical;
+use crate::dlr::{DlrMode, DlrTransport};
 use crate::error::ProtoError;
 use crate::stream::{AgentStreamEvent, SseDecoder, StreamFuser};
 use crate::wire::{
-    ChatCompletionRequest, ChatCompletionResponse, StreamOptions, ToolChoiceValue, ToolDefinition,
-    WireMessage,
+    ChatCompletionResponse, StreamOptions, ToolChoiceValue, ToolDefinition, WireMessage,
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::io::Write as _;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_stream::Stream;
 
 /// Per-call options. The agent loop (M1) fills these from capabilities + config.
@@ -26,6 +25,9 @@ use tokio_stream::Stream;
 pub struct CompleteOpts {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// OpenAI-compatible reasoning posture (`high`, `max`, ...). `None` omits
+    /// the field for providers that do not implement reasoning controls.
+    pub reasoning_effort: Option<String>,
     /// Stable Subconscious Code session identity. Sent as an HTTP header rather
     /// than a body field so correlation never changes canonical prompt bytes or
     /// prefix-cache behavior.
@@ -44,6 +46,14 @@ pub struct RetryOpts {
     pub max_retries: u32,
     pub base_delay: Duration,
     pub max_delay: Duration,
+}
+
+/// Sizes for one encoded request. `json_bytes` is the canonical body before
+/// optional gzip; `wire_bytes` is what reqwest uploads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestPayloadStats {
+    pub json_bytes: usize,
+    pub wire_bytes: usize,
 }
 
 impl Default for RetryOpts {
@@ -67,7 +77,8 @@ pub struct ChatClient {
     api_key: String,
     model: String,
     retry: RetryOpts,
-    gzip_request: bool,
+    gzip_request: AtomicBool,
+    dlr: Option<DlrTransport>,
 }
 
 /// Bytes of a request body written to the `--debug` log before eliding the rest.
@@ -77,10 +88,186 @@ pub struct ChatClient {
 /// to stderr per request. Set `SC_DEBUG_FULL_BODY=1` to opt back into the full
 /// dump when you genuinely need it.
 const DEBUG_BODY_PREVIEW: usize = 8 * 1024;
+/// Keep normal chat requests in memory, but spool genuinely large contexts so
+/// retained request bytes cannot consume the editor's whole memory budget.
+const REQUEST_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 const CLIENT_HEADER: &str = "x-subconscious-client";
 const CLIENT_NAME: &str = "subconscious_code";
 const SESSION_HEADER: &str = "x-subconscious-code-session-id";
 const MAX_SESSION_ID_LEN: usize = 256;
+static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(serde::Serialize)]
+struct BorrowedChatCompletionRequest<'a> {
+    model: &'a str,
+    messages: &'a [WireMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    stream: bool,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    tools: &'a [ToolDefinition],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a ToolChoiceValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<&'a StreamOptions>,
+}
+
+#[derive(serde::Serialize)]
+struct BorrowedChatCompletionMetadata<'a> {
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    stream: bool,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    tools: &'a [ToolDefinition],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a ToolChoiceValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<&'a StreamOptions>,
+}
+
+fn slice_is_empty<T>(slice: &[T]) -> bool {
+    slice.is_empty()
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    written: usize,
+}
+
+enum EncodedBody {
+    Memory(Bytes),
+    Spool {
+        file: tempfile::NamedTempFile,
+        len: usize,
+        preview: Bytes,
+    },
+}
+
+impl EncodedBody {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(bytes) => bytes.len(),
+            Self::Spool { len, .. } => *len,
+        }
+    }
+
+    fn preview(&self) -> &[u8] {
+        match self {
+            Self::Memory(bytes) => bytes,
+            Self::Spool { preview, .. } => preview,
+        }
+    }
+
+    fn is_spooled(&self) -> bool {
+        matches!(self, Self::Spool { .. })
+    }
+
+    async fn request_body(&self) -> Result<reqwest::Body, ProtoError> {
+        match self {
+            Self::Memory(bytes) => Ok(reqwest::Body::from(bytes.clone())),
+            Self::Spool { file, .. } => {
+                let file = tokio::fs::File::open(file.path()).await?;
+                Ok(reqwest::Body::wrap_stream(
+                    tokio_util::io::ReaderStream::new(file),
+                ))
+            }
+        }
+    }
+}
+
+/// A serde target that promotes from one bounded Vec to a temporary file. The
+/// first bytes are retained separately for debug diagnostics; retry attempts
+/// reopen the immutable spool and stream it without rebuilding the request.
+struct SpoolWriter {
+    memory: Vec<u8>,
+    file: Option<tempfile::NamedTempFile>,
+    preview: Vec<u8>,
+    threshold: usize,
+    total: usize,
+}
+
+impl SpoolWriter {
+    fn new(threshold: usize) -> Self {
+        Self {
+            memory: Vec::with_capacity(threshold.min(256 * 1024)),
+            file: None,
+            preview: Vec::with_capacity(DEBUG_BODY_PREVIEW),
+            threshold,
+            total: 0,
+        }
+    }
+
+    fn finish(self) -> std::io::Result<EncodedBody> {
+        if let Some(mut file) = self.file {
+            std::io::Write::flush(&mut file)?;
+            return Ok(EncodedBody::Spool {
+                file,
+                len: self.total,
+                preview: Bytes::from(self.preview),
+            });
+        }
+        Ok(EncodedBody::Memory(Bytes::from(self.memory)))
+    }
+
+    fn promote(&mut self) -> std::io::Result<()> {
+        if self.file.is_some() {
+            return Ok(());
+        }
+        let mut file = tempfile::Builder::new().prefix("sc-request-").tempfile()?;
+        std::io::Write::write_all(&mut file, &self.memory)?;
+        self.memory.clear();
+        self.memory.shrink_to_fit();
+        self.file = Some(file);
+        Ok(())
+    }
+}
+
+impl std::io::Write for SpoolWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let preview_left = DEBUG_BODY_PREVIEW.saturating_sub(self.preview.len());
+        self.preview
+            .extend_from_slice(&bytes[..bytes.len().min(preview_left)]);
+        if self.file.is_none() && self.total.saturating_add(bytes.len()) > self.threshold {
+            self.promote()?;
+        }
+        if let Some(file) = &mut self.file {
+            std::io::Write::write_all(file, bytes)?;
+        } else {
+            self.memory.extend_from_slice(bytes);
+        }
+        self.total = self.total.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), std::io::Write::flush)
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.written = self.written.saturating_add(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 impl ChatClient {
     /// `api_key` empty → `NoApiKey` immediately, so the caller surfaces a clear
@@ -116,13 +303,14 @@ impl ChatClient {
             api_key,
             model,
             retry: RetryOpts::default(),
-            gzip_request: false,
+            gzip_request: AtomicBool::new(false),
+            dlr: None,
         })
     }
 
     /// Set the retry policy for transient HTTP errors (429/5xx). Default is no
-    /// retry. The body is stable bytes, so retrying is safe *and* cheap — the
-    /// `Bytes` handle is cloned per attempt, not the payload. A streaming
+    /// retry. The body is immutable, so retrying is safe and cheap: small bodies
+    /// clone `Bytes`, while large bodies reopen their exact spool. A streaming
     /// request is retried only before the body starts flowing; a mid-stream
     /// error is not retried (no resume). Builder.
     #[must_use]
@@ -139,9 +327,117 @@ impl ChatClient {
     /// source compresses roughly 5-10×, so it is worth confirming support and
     /// turning on. Builder.
     #[must_use]
-    pub fn with_request_gzip(mut self, on: bool) -> Self {
-        self.gzip_request = on;
+    pub fn with_request_gzip(self, on: bool) -> Self {
+        self.gzip_request.store(on, Ordering::Relaxed);
         self
+    }
+
+    /// Route request bodies through a stateful DLR sidecar. The sidecar
+    /// reconstructs ordinary OpenAI JSON next to the gateway; the gateway and
+    /// model runtime require no changes.
+    #[must_use]
+    pub fn with_dlr(
+        mut self,
+        sidecar_url: String,
+        ingress_token: Option<String>,
+        mode: DlrMode,
+        repair_margin_pct: u32,
+    ) -> Result<Self, ProtoError> {
+        self.dlr = Some(DlrTransport::new(
+            sidecar_url,
+            ingress_token,
+            mode,
+            repair_margin_pct,
+        )?);
+        // DLR frames already compress message blocks; HTTP gzip applies only
+        // to the fallback JSON path.
+        Ok(self)
+    }
+
+    async fn send_model_request<T: serde::Serialize, M: serde::Serialize>(
+        &self,
+        url: &str,
+        request: &T,
+        metadata: &M,
+        messages: &[WireMessage],
+        session_id: Option<&str>,
+        streaming: bool,
+    ) -> Result<(reqwest::Response, u32, RequestPayloadStats), (ProtoError, u32, RequestPayloadStats)>
+    {
+        if let Some(dlr) = &self.dlr {
+            let metadata = serde_json::to_value(metadata)
+                .map_err(|error| (ProtoError::Json(error), 0, RequestPayloadStats::default()))?;
+            match dlr
+                .send(session_id, messages, metadata, &self.api_key)
+                .await
+                .map_err(|error| (error, 0, RequestPayloadStats::default()))?
+            {
+                Some((response, payload)) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok((response, 0, payload));
+                    }
+                    let body = response.text().await.unwrap_or_default();
+                    return Err((
+                        ProtoError::Status {
+                            status: status.as_u16(),
+                            body,
+                        },
+                        0,
+                        payload,
+                    ));
+                }
+                None => {}
+            }
+        }
+        self.encode_and_send(url, request, session_id, streaming)
+            .await
+    }
+
+    /// Encode and send once, falling back to the canonical uncompressed body
+    /// when a gateway explicitly rejects or clearly fails to decode gzip. The
+    /// capability result is remembered for this client, so an incompatible
+    /// custom endpoint pays the probe only on its first request.
+    async fn encode_and_send<T: serde::Serialize>(
+        &self,
+        url: &str,
+        request: &T,
+        session_id: Option<&str>,
+        streaming: bool,
+    ) -> Result<(reqwest::Response, u32, RequestPayloadStats), (ProtoError, u32, RequestPayloadStats)>
+    {
+        let gzip = self.gzip_request.load(Ordering::Relaxed);
+        let (body, payload) = self
+            .encode_body_with(request, gzip)
+            .map_err(|error| (error, 0, RequestPayloadStats::default()))?;
+        self.log_request(url, &body, streaming);
+        match self.send_with_retry(url, &body, session_id, gzip).await {
+            Ok((response, retries)) => Ok((response, retries, payload)),
+            Err((error, retries)) if gzip && gzip_is_unsupported(&error) => {
+                tracing::warn!(error = %error, "gateway rejected gzip; retrying once uncompressed and disabling gzip for this client");
+                self.gzip_request.store(false, Ordering::Relaxed);
+                let (raw_body, raw_payload) = self
+                    .encode_body_with(request, false)
+                    .map_err(|error| (error, retries, RequestPayloadStats::default()))?;
+                self.log_request(url, &raw_body, streaming);
+                match self
+                    .send_with_retry(url, &raw_body, session_id, false)
+                    .await
+                {
+                    Ok((response, raw_retries)) => Ok((
+                        response,
+                        retries.saturating_add(1).saturating_add(raw_retries),
+                        raw_payload,
+                    )),
+                    Err((error, raw_retries)) => Err((
+                        error,
+                        retries.saturating_add(1).saturating_add(raw_retries),
+                        raw_payload,
+                    )),
+                }
+            }
+            Err((error, retries)) => Err((error, retries, payload)),
+        }
     }
 
     /// POST `body` to `url`, retrying on a transient error up to
@@ -154,13 +450,14 @@ impl ChatClient {
     /// first attempt), surfaced to the host so a `Turn::Error` can record how
     /// hard the harness tried. On failure returns `(error, retries_used)` so
     /// the final error still carries the retry count.
-    /// `body` is a refcounted `Bytes`, so each attempt clones a handle rather
-    /// than the payload — a retry on a 200 MB request costs nothing extra.
+    /// `body` is either refcounted bytes or a disk spool, so an attempt never
+    /// retains another full payload in memory.
     async fn send_with_retry(
         &self,
         url: &str,
-        body: &Bytes,
+        body: &EncodedBody,
         session_id: Option<&str>,
+        gzip: bool,
     ) -> Result<(reqwest::Response, u32), (ProtoError, u32)> {
         if session_id.is_some_and(|id| {
             id.is_empty()
@@ -178,14 +475,19 @@ impl ChatClient {
                 .post(url)
                 .bearer_auth(self.api_key.clone())
                 .header("content-type", "application/json")
+                .header("content-length", body.len())
                 .header(CLIENT_HEADER, CLIENT_NAME);
             if let Some(session_id) = session_id {
                 req = req.header(SESSION_HEADER, session_id);
             }
-            if self.gzip_request {
+            if gzip {
                 req = req.header("content-encoding", "gzip");
             }
-            let resp = match req.body(body.clone()).send().await {
+            let request_body = match body.request_body().await {
+                Ok(body) => body,
+                Err(error) => return Err((error, attempt)),
+            };
+            let resp = match req.body(request_body).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     if Self::is_transient_transport(&e) && attempt < self.retry.max_retries {
@@ -220,21 +522,45 @@ impl ChatClient {
             }
             let text = resp.text().await.unwrap_or_default();
             tracing::debug!("← {status}\n{text}");
-            return Err((ProtoError::Status {
-                status: status.as_u16(),
-                body: text,
-            }, attempt));
+            return Err((
+                ProtoError::Status {
+                    status: status.as_u16(),
+                    body: text,
+                },
+                attempt,
+            ));
         }
     }
 
-    /// Exponential backoff: `base * 2^attempt`, capped at `max_delay`. No jitter
-    /// (a refinement); deterministic backoff is enough to spread load.
+    /// Exponential backoff capped at `max_delay`, with equal-ish jitter in the
+    /// upper quarter of the window. Keeping a nonzero floor avoids retry storms
+    /// while the per-process sequence and wall clock prevent hundreds of
+    /// benchmark workers from waking on the same millisecond.
     fn backoff(&self, attempt: u32) -> Duration {
         let factor = 1u64 << attempt.min(20);
-        self.retry
+        let ceiling = self
+            .retry
             .base_delay
             .saturating_mul(factor as u32)
-            .min(self.retry.max_delay)
+            .min(self.retry.max_delay);
+        let nanos = ceiling.as_nanos().min(u128::from(u64::MAX)) as u64;
+        if nanos < 4 {
+            return ceiling;
+        }
+        let spread = nanos / 4;
+        let floor = nanos - spread;
+        let sequence = RETRY_JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut mixed = epoch ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mixed ^= mixed >> 30;
+        mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed ^= mixed >> 27;
+        mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        Duration::from_nanos(floor + mixed % (spread + 1))
     }
 
     /// A transport error worth retrying: a *connection* failure (DNS, TCP
@@ -260,10 +586,10 @@ impl ChatClient {
 
     /// Serialize a request to the exact bytes that go on the wire — once.
     ///
-    /// One `serde_json::to_vec` into a `Vec<u8>`, handed to `Bytes` without a
-    /// copy — where the old path built a `Value` tree, a canonicalized copy of
-    /// it, and then a `String`. Gzip, when enabled, compresses in one pass over
-    /// those bytes.
+    /// Without gzip, one deterministic serialization is handed to `Bytes` or a
+    /// spool without a second copy. With gzip, serde writes directly into the
+    /// compressor, avoiding simultaneous raw-JSON and compressed buffers. The
+    /// old path built a `Value` tree, a canonicalized copy, and then a `String`.
     ///
     /// This removes serialization as a memory multiplier; it does not make the
     /// whole request path allocation-free. The ~6× peak RSS measured for a 12 MB
@@ -271,20 +597,53 @@ impl ChatClient {
     /// made turn→wire projection a refcount bump); the new figure has not been
     /// re-measured. Either way, what's left is upstream of this function, not
     /// in it.
-    fn encode_body<T: serde::Serialize>(&self, req: &T) -> Result<Bytes, ProtoError> {
-        let raw = canonical::to_bytes(req)?;
-        if !self.gzip_request {
-            return Ok(Bytes::from(raw));
+    fn encode_body_with<T: serde::Serialize>(
+        &self,
+        req: &T,
+        gzip: bool,
+    ) -> Result<(EncodedBody, RequestPayloadStats), ProtoError> {
+        if !gzip {
+            let mut writer = SpoolWriter::new(REQUEST_MEMORY_BYTES);
+            serde_json::to_writer(&mut writer, req)?;
+            let json_bytes = writer.total;
+            let body = writer.finish()?;
+            return Ok((
+                body,
+                RequestPayloadStats {
+                    json_bytes,
+                    wire_bytes: json_bytes,
+                },
+            ));
         }
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(&raw).map_err(ProtoError::Gzip)?;
-        let compressed = enc.finish().map_err(ProtoError::Gzip)?;
+        // Stream serde directly through gzip. The previous path first retained
+        // the entire raw JSON Vec and then allocated a second compressed Vec;
+        // large-context requests therefore paid for both bodies concurrently.
+        let encoder = flate2::write::GzEncoder::new(
+            SpoolWriter::new(REQUEST_MEMORY_BYTES),
+            flate2::Compression::fast(),
+        );
+        let mut writer = CountingWriter {
+            inner: encoder,
+            written: 0,
+        };
+        serde_json::to_writer(&mut writer, req)?;
+        let json_bytes = writer.written;
+        let compressed = writer.inner.finish().map_err(ProtoError::Gzip)?;
+        let body = compressed.finish()?;
         tracing::debug!(
-            raw = raw.len(),
-            compressed = compressed.len(),
+            raw = json_bytes,
+            compressed = body.len(),
+            spooled = body.is_spooled(),
             "gzipped request body"
         );
-        Ok(Bytes::from(compressed))
+        let wire_bytes = body.len();
+        Ok((
+            body,
+            RequestPayloadStats {
+                json_bytes,
+                wire_bytes,
+            },
+        ))
     }
 
     /// Log a request under `--debug` without dumping the entire conversation.
@@ -293,25 +652,26 @@ impl ChatClient {
     /// interesting part (model, tools, the leading messages) is at the front.
     /// `SC_DEBUG_FULL_BODY=1` restores the unbounded dump. Never logs the API
     /// key — that lives in the `Authorization` header, which is not touched here.
-    fn log_request(&self, url: &str, body: &Bytes, streaming: bool) {
+    fn log_request(&self, url: &str, body: &EncodedBody, streaming: bool) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
         let tag = if streaming { " (stream)" } else { "" };
         let full = std::env::var("SC_DEBUG_FULL_BODY").as_deref() == Ok("1");
-        if full || body.len() <= DEBUG_BODY_PREVIEW {
+        let preview = body.preview();
+        if (full && !body.is_spooled()) || body.len() <= DEBUG_BODY_PREVIEW {
             tracing::debug!(
                 "→ POST {url}{tag} [{} bytes]\n{}",
                 body.len(),
-                String::from_utf8_lossy(body)
+                String::from_utf8_lossy(preview)
             );
             return;
         }
-        let cut = floor_char_boundary(body, DEBUG_BODY_PREVIEW);
+        let cut = floor_char_boundary(preview, DEBUG_BODY_PREVIEW);
         tracing::debug!(
-            "→ POST {url}{tag} [{} bytes, showing first {cut}; set SC_DEBUG_FULL_BODY=1 for all]\n{}",
+            "→ POST {url}{tag} [{} bytes, showing first {cut}; large spooled bodies stay preview-only]\n{}",
             body.len(),
-            String::from_utf8_lossy(&body[..cut])
+            String::from_utf8_lossy(&preview[..cut])
         );
     }
 
@@ -321,27 +681,44 @@ impl ChatClient {
         messages: &[WireMessage],
         opts: &CompleteOpts,
     ) -> Result<ChatCompletionResponse, ProtoError> {
-        let req = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages: messages.to_vec(),
+        let req = BorrowedChatCompletionRequest {
+            model: &self.model,
+            messages,
             max_tokens: opts.max_tokens,
             temperature: opts.temperature,
+            reasoning_effort: opts.reasoning_effort.as_deref(),
             stream: false,
-            tools: Vec::new(),
+            tools: &[],
             tool_choice: None,
             parallel_tool_calls: None,
             stream_options: None,
         };
-        let body = self.encode_body(&req)?;
+        let metadata = BorrowedChatCompletionMetadata {
+            model: &self.model,
+            max_tokens: opts.max_tokens,
+            temperature: opts.temperature,
+            reasoning_effort: opts.reasoning_effort.as_deref(),
+            stream: false,
+            tools: &[],
+            tool_choice: None,
+            parallel_tool_calls: None,
+            stream_options: None,
+        };
         let url = format!("{}/chat/completions", self.base_url);
-        self.log_request(&url, &body, false);
         // `complete` is the non-streaming path (doctor / tests); it discards the
         // wire retry count. The agent loop uses `stream` (via `ChatModel`), which
         // surfaces retries to the host.
-        let (resp, _retries) = self
-            .send_with_retry(&url, &body, opts.session_id.as_deref())
+        let (resp, _retries, _payload) = self
+            .send_model_request(
+                &url,
+                &req,
+                &metadata,
+                messages,
+                opts.session_id.as_deref(),
+                false,
+            )
             .await
-            .map_err(|(e, _)| e)?;
+            .map_err(|(error, _, _)| error)?;
         let status = resp.status();
         let parsed: ChatCompletionResponse = resp.json().await?;
         tracing::debug!(
@@ -372,38 +749,80 @@ impl ChatClient {
         (
             Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>>,
             u32,
+            RequestPayloadStats,
         ),
-        (ProtoError, u32),
+        (ProtoError, u32, RequestPayloadStats),
     > {
-        let req = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages: messages.to_vec(),
+        let tool_choice = ToolChoiceValue::Auto;
+        let stream_options = StreamOptions {
+            include_usage: true,
+        };
+        let req = BorrowedChatCompletionRequest {
+            model: &self.model,
+            messages,
             max_tokens: opts.max_tokens,
             temperature: opts.temperature,
+            reasoning_effort: opts.reasoning_effort.as_deref(),
             stream: true,
-            tools: tools.to_vec(),
+            tools,
             tool_choice: if tools.is_empty() {
                 None
             } else {
-                Some(ToolChoiceValue::Auto)
+                Some(&tool_choice)
             },
             parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
+            stream_options: Some(&stream_options),
         };
-        let body = self.encode_body(&req).map_err(|e| (e, 0))?;
+        let metadata = BorrowedChatCompletionMetadata {
+            model: &self.model,
+            max_tokens: opts.max_tokens,
+            temperature: opts.temperature,
+            reasoning_effort: opts.reasoning_effort.as_deref(),
+            stream: true,
+            tools,
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                Some(&tool_choice)
+            },
+            parallel_tool_calls: if tools.is_empty() { None } else { Some(true) },
+            stream_options: Some(&stream_options),
+        };
         let url = format!("{}/chat/completions", self.base_url);
-        self.log_request(&url, &body, true);
-        let (resp, retries) = self
-            .send_with_retry(&url, &body, opts.session_id.as_deref())
+        let (resp, retries, payload) = self
+            .send_model_request(
+                &url,
+                &req,
+                &metadata,
+                messages,
+                opts.session_id.as_deref(),
+                true,
+            )
             .await?;
         let status = resp.status();
         tracing::debug!("← {status} streaming (retries={retries})");
         let body: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
             Box::pin(resp.bytes_stream());
-        Ok((Box::pin(EventStream::new(body)), retries))
+        Ok((Box::pin(EventStream::new(body)), retries, payload))
     }
+}
+
+fn gzip_is_unsupported(error: &ProtoError) -> bool {
+    let ProtoError::Status { status, body } = error else {
+        return false;
+    };
+    if *status == 415 {
+        return true;
+    }
+    if *status != 400 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("content-encoding")
+        || body.contains("gzip")
+        || body.contains("compressed")
+        || body.contains("invalid utf-8")
+        || body.contains("expected value at line 1 column 1")
 }
 
 /// Largest index `≤ cap` in `bytes` that isn't inside a UTF-8 sequence, so a
@@ -481,6 +900,7 @@ impl Stream for EventStream {
                     return Poll::Ready(Some(Err(ProtoError::Http(e))));
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
+                    let had_pending = !self.pending.is_empty();
                     for chunk in self.dec.feed(&bytes) {
                         match chunk {
                             Ok(c) => {
@@ -495,6 +915,15 @@ impl Stream for EventStream {
                             }
                         }
                     }
+                    // Parsed model events reset the core idle timer themselves.
+                    // When a non-empty network frame produced no semantic event
+                    // (an SSE comment or a partial `data:` line), emit an
+                    // internal-only liveness event instead. Without this,
+                    // Orange Line can send a heartbeat every 15 seconds while
+                    // SC still reports an exact 120-second stream stall.
+                    if !bytes.is_empty() && !had_pending && self.pending.is_empty() {
+                        return Poll::Ready(Some(Ok(AgentStreamEvent::TransportActivity)));
+                    }
                     continue;
                 }
                 Poll::Pending => return Poll::Pending,
@@ -507,6 +936,47 @@ impl Stream for EventStream {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn sse_comment_becomes_transport_activity() {
+        let body = tokio_stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            b": heartbeat\n\n",
+        ))]);
+        let mut stream = EventStream::new(Box::pin(body));
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(AgentStreamEvent::TransportActivity))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(AgentStreamEvent::Finish {
+                reason: crate::stream::FinishReason::Other(reason)
+            })) if reason == "stream-ended"
+        ));
+    }
+
+    #[test]
+    fn request_writer_spools_over_threshold_and_preserves_exact_bytes() {
+        use std::io::Write;
+        let mut writer = SpoolWriter::new(32);
+        writer.write_all(b"0123456789abcdef").unwrap();
+        writer
+            .write_all(b"--this crosses the in-memory boundary--")
+            .unwrap();
+        let body = writer.finish().unwrap();
+        assert!(body.is_spooled());
+        let EncodedBody::Spool { file, len, .. } = body else {
+            unreachable!()
+        };
+        let bytes = std::fs::read(file.path()).unwrap();
+        assert_eq!(
+            bytes,
+            b"0123456789abcdef--this crosses the in-memory boundary--"
+        );
+        assert_eq!(len, bytes.len());
+    }
 
     /// A closed port (bind + drop the listener) → connection refused → a
     /// retryable transport error (is_connect, not a timeout).
@@ -609,5 +1079,27 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "should give up fast, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn retry_jitter_stays_inside_the_upper_quarter_of_each_window() {
+        let client = ChatClient::new("http://127.0.0.1".into(), "k".into(), "m".into(), None)
+            .unwrap()
+            .with_retry(RetryOpts {
+                max_retries: 3,
+                base_delay: Duration::from_millis(100),
+                max_delay: Duration::from_millis(250),
+            });
+
+        for _ in 0..32 {
+            assert!((Duration::from_millis(75)..=Duration::from_millis(100))
+                .contains(&client.backoff(0)));
+            assert!((Duration::from_millis(150)..=Duration::from_millis(200))
+                .contains(&client.backoff(1)));
+            assert!(
+                (Duration::from_micros(187_500)..=Duration::from_millis(250))
+                    .contains(&client.backoff(9))
+            );
+        }
     }
 }

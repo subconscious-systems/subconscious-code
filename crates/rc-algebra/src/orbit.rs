@@ -115,7 +115,10 @@ mod tests {
     use super::*;
 
     fn ids(items: &[&str]) -> Vec<BlockId> {
-        items.iter().map(|s| BlockId::from_bytes(s.as_bytes())).collect()
+        items
+            .iter()
+            .map(|s| BlockId::from_bytes(s.as_bytes()))
+            .collect()
     }
 
     #[test]

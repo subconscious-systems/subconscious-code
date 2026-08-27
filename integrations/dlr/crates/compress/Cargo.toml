@@ -1,0 +1,13 @@
+[package]
+name = "dlr-compress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[lib]
+path = "src/lib.rs"

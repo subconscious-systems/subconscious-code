@@ -39,9 +39,8 @@ pub enum Outcome {
     NewIn(PathBuf),
     /// Rebuild the agent for the session that is already running and re-enter
     /// the TUI. The conversation is preserved (it is reloaded from the session
-    /// file); the point is a fresh HTTP client, which is the only way a
-    /// newly-saved API key can take effect — the running one holds the key it
-    /// was constructed with.
+    /// file); the point is a fresh HTTP client, which is required when a
+    /// newly-saved API key or request transport setting changes.
     Reload,
 }
 
@@ -316,14 +315,21 @@ impl MenuState {
                 self.settings = Settings::load(project_dir);
                 // A saved value that an env var outranks would look like a
                 // no-op; say so rather than let the user think it took effect.
+                let reload_client = field.name == "dlr_enabled";
                 self.status = Some(match field.env_override() {
                     Some(_) => format!(
                         "saved to {} — but ${} overrides it in this shell",
                         path.display(),
                         field.env
                     ),
+                    None if reload_client => {
+                        format!("saved to {} — reloading sc", path.display())
+                    }
                     None => format!("saved to {}", path.display()),
                 });
+                if reload_client {
+                    self.pending_outcome = Some(Outcome::Reload);
+                }
             }
             Err(e) => self.status = Some(e),
         }

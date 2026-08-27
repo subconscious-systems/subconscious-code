@@ -17,7 +17,7 @@ use crossterm::event::{
 use crossterm::execute;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use rc_core::{AgentMode, AskResponse, ToolCall, ToolResultBody, Turn};
+use rc_core::{AgentMode, Artifact, AskResponse, ToolCall, ToolResultBody, Turn};
 use rc_rt::{AgentEvent, EventStream, Runtime, UserAction};
 use serde_json::Value;
 
@@ -153,6 +153,7 @@ pub(crate) fn run(
             }
         }
     }
+    app.runtime.shutdown_blocking(Duration::from_secs(5));
     Ok(app.outcome)
 }
 
@@ -258,6 +259,14 @@ impl App {
                     v.begin_reasoning_phase(Instant::now());
                 }
             }
+            AgentEvent::Artifact {
+                call_id: _,
+                tool: _,
+                artifact,
+            } => {
+                v.flush_text();
+                show_artifact(v, &self.cwd, artifact);
+            }
             AgentEvent::PermissionAsk {
                 id,
                 tool,
@@ -274,6 +283,10 @@ impl App {
             }
             AgentEvent::PermissionDecision { .. } => v.pending_ask = None,
             AgentEvent::Iter { .. } => {}
+            AgentEvent::Retry { retries } => {
+                v.flush_text();
+                v.transcript.push(retry_notice_line(retries));
+            }
             AgentEvent::Usage(u) => {
                 // Replace the preflight estimate with the authoritative context
                 // size returned for this request. Cache efficiency belongs to
@@ -296,13 +309,13 @@ impl App {
             AgentEvent::Outcome(_) => {
                 v.flush_text();
                 collapse_unfinished_tool_calls(v, &mut self.live_tools, Instant::now());
-                end_turn(v);
+                finish_turn(v);
             }
             AgentEvent::Error(e) => {
                 v.flush_text();
                 collapse_unfinished_tool_calls(v, &mut self.live_tools, Instant::now());
                 v.transcript.extend(error_block(&e));
-                end_turn(v);
+                finish_turn(v);
             }
             AgentEvent::ModeChanged(m) => v.mode = m,
             AgentEvent::Notice(n) => {
@@ -327,7 +340,7 @@ impl App {
             AgentEvent::Idle => {
                 v.flush_text();
                 collapse_unfinished_tool_calls(v, &mut self.live_tools, Instant::now());
-                end_turn(v);
+                finish_turn(v);
             }
         }
     }
@@ -378,10 +391,18 @@ impl App {
             // ←/→ cycle a choice/bool setting in place; on other pages ← is
             // "back", which is the more useful binding there.
             KeyCode::Right if menu.page == crate::menu::MenuPage::Settings => {
-                menu.cycle_current(1, &cwd)
+                menu.cycle_current(1, &cwd);
+                let outcome = menu.pending_outcome.take();
+                if let Some(outcome) = outcome {
+                    self.leave_with(outcome);
+                }
             }
             KeyCode::Left if menu.page == crate::menu::MenuPage::Settings => {
-                menu.cycle_current(-1, &cwd)
+                menu.cycle_current(-1, &cwd);
+                let outcome = menu.pending_outcome.take();
+                if let Some(outcome) = outcome {
+                    self.leave_with(outcome);
+                }
             }
             KeyCode::Left => {
                 if !menu.back() {
@@ -622,7 +643,6 @@ impl App {
             // the raw letter — a latent bug once raw mode passes them through.
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => match c {
                 'w' | 'W' => self.delete_word(),
-                't' | 'T' => self.toggle_latest_reasoning(),
                 'o' | 'O' => self.toggle_mouse_capture(),
                 'u' | 'U' => self.clear_composer_line(),
                 _ => {} // other Ctrl+letter combos: ignore, don't insert
@@ -888,38 +908,21 @@ impl App {
         self.refresh_menu();
     }
 
-    /// Ctrl+T expands/collapses the newest completed `thought for N.NNs`
-    /// block. Avoid splicing while a tool block is live because its in-place
-    /// completion bookkeeping references transcript indices.
-    fn toggle_latest_reasoning(&mut self) {
-        if !self.live_tools.is_empty() {
-            return;
-        }
-        let Some(toggle) = self.view.toggle_latest_reasoning() else {
-            return;
-        };
-        if toggle.expanded {
-            // Put the summary at the top so even a long reasoning body is
-            // immediately visible rather than expanding above the viewport.
-            self.view.follow = false;
-            self.view.scroll_top = toggle.summary_index;
-        } else {
-            self.jump_to_bottom();
-        }
-    }
-
     /// A left click on a visible thought or completed-tool label toggles that
-    /// exact retained block. Keep the clicked summary anchored so expanding a
-    /// long body does not move the target out from under the user.
+    /// exact retained block. Thoughts preserve the viewport's existing top so
+    /// their summary stays on the same screen row and the inserted body grows
+    /// downward. Completed tools keep their existing top-anchor behavior.
     fn toggle_expandable_at(&mut self, column: u16, row: u16) {
         if !self.live_tools.is_empty() {
             return;
         }
-        let toggle = self
-            .view
-            .toggle_reasoning_at(column, row)
-            .or_else(|| self.view.toggle_tool_at(column, row));
-        let Some(toggle) = toggle else { return };
+        let top_before = self.current_top(self.total_lines());
+        if toggle_reasoning_preserving_top(&mut self.view, column, row, top_before) {
+            return;
+        }
+        let Some(toggle) = self.view.toggle_tool_at(column, row) else {
+            return;
+        };
         self.view.follow = false;
         self.view.scroll_top = toggle.summary_index;
     }
@@ -1024,10 +1027,8 @@ impl App {
 
     /// Run a recognized slash command. Host-side actions mutate the view (and
     /// may dispatch a `UserAction`); prompt-expansion commands call
-    /// `submit_prompt` with a canned instruction. Everything here is a
-    /// best-effort, real implementation against the state `sc` already has —
-    /// commands whose backends aren't wired yet degrade to an info note via
-    /// `Note`, never a silent no-op.
+    /// `submit_prompt` with a canned instruction. Every advertised command has
+    /// a concrete action here; the registry test enforces that contract.
     fn run_slash(&mut self, action: SlashAction) {
         let p = theme::palette();
         match action {
@@ -1066,14 +1067,11 @@ impl App {
                 self.view
                     .transcript
                     .push(mk("  Alt+↑/↓      recall prompt history"));
-                self.view
-                    .transcript
-                    .push(mk("  Ctrl+T       expand/collapse latest thought"));
                 self.view.transcript.push(mk(
                     "  drag         select text with your terminal, then copy",
                 ));
                 self.view.transcript.push(mk(
-                    "  Ctrl+O       let sc take the mouse: in-app copy + wheel",
+                    "  Ctrl+O       toggle wheel scrolling / native selection",
                 ));
                 self.view
                     .transcript
@@ -1095,20 +1093,24 @@ impl App {
                 self.live_tools.clear();
                 // The welcome card reappears on its own once the transcript is
                 // empty (see `draw_transcript`'s pre-turn guard).
-                end_turn(&mut self.view);
+                reset_turn(&mut self.view);
             }
             SlashAction::Compact => {
-                // Like /clear but signals intent: the context was compacted.
-                let lines = self.view.transcript.len();
+                // Clear the rendered history immediately; the runtime appends
+                // a durable summary marker and projects future requests from
+                // that marker forward.
                 self.view.clear_transcript();
                 self.view.current_text.clear();
                 self.live_tools.clear();
-                end_turn(&mut self.view);
-                self.view.transcript.push(Line::styled(
-                    format!("context compacted · cleared {lines} transcript lines"),
-                    p.chrome(),
-                ));
+                reset_turn(&mut self.view);
+                self.runtime.action(UserAction::Compact);
             }
+            SlashAction::ShowGoal => self.runtime.action(UserAction::ShowGoal),
+            SlashAction::SetGoal(goal) => {
+                self.runtime.action(UserAction::SetGoal(Some(goal)));
+            }
+            SlashAction::ClearGoal => self.runtime.action(UserAction::SetGoal(None)),
+            SlashAction::Loop(direction) => self.submit_prompt(loop_prompt(direction.as_deref())),
             SlashAction::CycleMode => {
                 let next = cycle_mode(self.view.mode);
                 self.view.mode = next; // optimistic; ModeChanged confirms
@@ -1239,30 +1241,31 @@ impl App {
                 self.runtime.action(UserAction::Quit);
                 self.quit = true;
             }
-            SlashAction::Note(kind) => self.run_note(kind),
+            SlashAction::Resume => {
+                let mut menu = crate::menu::MenuState::new(&sessions_dir_for_menu(), &self.cwd);
+                let page = if menu.project(&self.cwd).is_some() {
+                    crate::menu::MenuPage::Sessions(self.cwd.clone())
+                } else {
+                    crate::menu::MenuPage::Projects
+                };
+                menu.goto(page);
+                self.view.menu_overlay = Some(menu);
+            }
+            SlashAction::Login => {
+                let mut menu = crate::menu::MenuState::new(&sessions_dir_for_menu(), &self.cwd);
+                menu.begin_api_key_edit();
+                self.view.menu_overlay = Some(menu);
+            }
+            SlashAction::Memory => self.push_info("memory", &memory_status_lines(&self.cwd)),
+            SlashAction::TerminalSetup => self.push_info(
+                "terminal setup",
+                &[
+                    "  bind Shift+Enter to send a newline / CSI-u sequence".into(),
+                    "  sc accepts bracketed paste and ordinary Enter submits".into(),
+                ],
+            ),
             SlashAction::Prompt(text) => self.submit_prompt(text),
         }
-    }
-
-    /// Print a one-line info note for a capability that isn't fully wired into
-    /// `sc` yet. The note tells the user what the command *would* do and where
-    /// the real control lives, so it's never a silent no-op.
-    fn run_note(&mut self, kind: NoteKind) {
-        let p = theme::palette();
-        let msg = match kind {
-            NoteKind::Vim => "vim keybindings aren't wired yet; the composer is emacs-style (Ctrl+W, Ctrl+U, Alt+Backspace)",
-            NoteKind::TerminalSetup => "for Shift+Enter, bind your terminal to send a CSI-u / `\\n` escape; see its keybind settings",
-            NoteKind::Login | NoteKind::Logout => "auth is set via ANTHROPIC_API_KEY / the configured backend; no interactive login yet",
-            NoteKind::Mcp => "no MCP servers connected (MCP support isn't wired into sc yet)",
-            NoteKind::Memory => "memory lives in CLAUDE.md and ~/.claude/projects/.../memory/; sc doesn't auto-load project memory yet",
-            NoteKind::AddDir => "extra working dirs are set at startup; per-session /add-dir isn't wired yet",
-            NoteKind::Approval => "approval is governed by the permission mode — cycle it with /mode or Shift+Tab",
-            NoteKind::Update => "update sc with: cargo install --path . (or your distribution's update flow)",
-            NoteKind::Resume => "session resume isn't wired yet; conversations aren't persisted across runs",
-        };
-        self.view
-            .transcript
-            .push(Line::styled(format!("» {msg}"), p.chrome()));
     }
 
     /// Hand the mouse back to the terminal, or take it again.
@@ -1270,29 +1273,16 @@ impl App {
     /// Mouse capture is what makes the wheel scroll the transcript, but it
     /// also means the terminal never sees a drag — so there is no way to
     /// select text, and copy/paste out of `sc` is impossible. Neither state is
-    /// right all the time, so it is a toggle rather than a default, and the
-    /// status bar says which one is live.
+    /// right all the time, so it is a toggle rather than a default.
     fn toggle_mouse_capture(&mut self) {
-        let p = theme::palette();
         self.view.mouse_capture = !self.view.mouse_capture;
         let mut out = std::io::stdout();
-        // Best-effort: a terminal that rejects the sequence leaves the flag
-        // and the hint consistent with each other, which is all the rest of
-        // the app reads.
+        // Best-effort: unsupported terminals simply ignore the sequence.
         let _ = if self.view.mouse_capture {
             execute!(out, EnableMouseCapture)
         } else {
             execute!(out, DisableMouseCapture)
         };
-        let msg = if self.view.mouse_capture {
-            "sc has the mouse — drag inside sc to select and copy; the wheel scrolls. Ctrl+O gives it back"
-        } else {
-            "mouse released — select and copy with your terminal as usual"
-        };
-        self.view
-            .transcript
-            .push(Line::styled(format!("» {msg}"), p.chrome()));
-        self.jump_to_bottom();
     }
 
     /// If `text` is a recognized slash command, return its host-side action.
@@ -1301,95 +1291,157 @@ impl App {
     /// map onto the same canonical action — they're recognized here but not
     /// advertised in the completion palette, so the menu stays uncluttered.
     fn handle_slash(&self, text: &str) -> Option<SlashAction> {
-        let t = text.trim();
-        // `/rewind` alone, or `/rewind <n>` with an explicit step count.
-        if let Some(rest) = t.strip_prefix("/rewind") {
-            let rest = rest.trim();
-            if rest.is_empty() {
-                return Some(SlashAction::Rewind { steps: 1 });
-            }
-            let n = rest.parse::<usize>().ok()?;
-            return (n > 0).then_some(SlashAction::Rewind { steps: n });
-        }
-        match t {
-            // Conversation / context hygiene.
-            "/clear" | "/c" | "/new" => Some(SlashAction::Clear),
-            "/menu" | "/m" => Some(SlashAction::Menu),
-            "/compact" | "/cc" => Some(SlashAction::Compact),
-            "/context" => Some(SlashAction::Context),
-            // Session / environment introspection.
-            "/cost" | "/usage" => Some(SlashAction::Cost),
-            "/status" | "/s" => Some(SlashAction::Status),
-            "/model" => Some(SlashAction::Model),
-            "/mode" => Some(SlashAction::CycleMode),
-            "/permissions" => Some(SlashAction::Permissions),
-            "/select" | "/mouse" => Some(SlashAction::SelectMode),
-            "/doctor" => Some(SlashAction::Doctor),
-            "/history" => Some(SlashAction::History),
-            "/export" => Some(SlashAction::Export),
-            // Lifecycle.
-            "/quit" | "/exit" | "/q" => Some(SlashAction::Quit),
-            "/resume" => Some(SlashAction::Note(NoteKind::Resume)),
-            "/update" => Some(SlashAction::Note(NoteKind::Update)),
-            "/login" => Some(SlashAction::Note(NoteKind::Login)),
-            "/logout" => Some(SlashAction::Note(NoteKind::Logout)),
-            // Integrations / capabilities.
-            "/mcp" => Some(SlashAction::Note(NoteKind::Mcp)),
-            "/memory" => Some(SlashAction::Note(NoteKind::Memory)),
-            "/add-dir" => Some(SlashAction::Note(NoteKind::AddDir)),
-            "/vim" => Some(SlashAction::Note(NoteKind::Vim)),
-            "/terminal-setup" => Some(SlashAction::Note(NoteKind::TerminalSetup)),
-            "/approval" => Some(SlashAction::Note(NoteKind::Approval)),
-            // Prompt-expansion commands — submit a canned instruction.
-            "/review" => Some(SlashAction::Prompt(
-                "Review the pending code changes on the current branch. Summarize the diff, flag risks and bugs, and suggest concrete fixes.".into(),
-            )),
-            "/pr" => Some(SlashAction::Prompt(
-                "Create a pull request for the current branch: summarize the changes and generate a title and body.".into(),
-            )),
-            "/init" => Some(SlashAction::Prompt(
-                "Initialize a CLAUDE.md file documenting this codebase: structure, build/test commands, and conventions.".into(),
-            )),
-            "/diff" => Some(SlashAction::Prompt(
-                "Show the diff of pending changes using git.".into(),
-            )),
-            "/release-notes" => Some(SlashAction::Prompt(
-                "Generate release notes from the recent git history.".into(),
-            )),
-            "/bug" => Some(SlashAction::Prompt(
-                "Help me report a bug: summarize the current problem and any recent errors from this session.".into(),
-            )),
-            "/doc" => Some(SlashAction::Prompt(
-                "Generate documentation for the relevant code.".into(),
-            )),
-            "/fix" => Some(SlashAction::Prompt(
-                "Find and fix bugs in the relevant code.".into(),
-            )),
-            "/explain" => Some(SlashAction::Prompt(
-                "Explain the relevant code.".into(),
-            )),
-            "/edit" => Some(SlashAction::Prompt(
-                "Apply the requested edits to the code.".into(),
-            )),
-            "/codebase" => Some(SlashAction::Prompt(
-                "Summarize the structure of this codebase for context.".into(),
-            )),
-            "/docs" => Some(SlashAction::Prompt(
-                "Read and summarize the relevant documentation.".into(),
-            )),
-            // Reference.
-            "/help" | "/h" | "/?" => Some(SlashAction::Help),
-            _ => None,
-        }
+        classify_slash(text)
     }
 }
 
-/// A host-side slash command (not submitted to the model). Each variant is a
-/// recognized command from the union of Claude Code, Codex, and Cursor slash
-/// palettes; aliases (e.g. `/h`, `/c`, `/q`) collapse onto the same variant in
-/// `handle_slash`. `Note` covers the small "print an info line" commands that
-/// don't have a richer action yet, and `Prompt` carries a canned instruction
-/// that `run_slash` submits to the model as if the user had typed it.
+/// Parse the command independently of `App` so completion/help can be checked
+/// against the real dispatcher in tests. This is the single command-routing
+/// table; no test shim is allowed to duplicate it.
+fn classify_slash(text: &str) -> Option<SlashAction> {
+    let t = text.trim();
+    if t == "/goal" {
+        return Some(SlashAction::ShowGoal);
+    }
+    if let Some(goal) = t.strip_prefix("/goal ") {
+        let goal = goal.trim();
+        if goal.is_empty() {
+            return Some(SlashAction::ShowGoal);
+        }
+        if goal.eq_ignore_ascii_case("clear") {
+            return Some(SlashAction::ClearGoal);
+        }
+        return Some(SlashAction::SetGoal(goal.to_string()));
+    }
+    if t == "/loop" {
+        return Some(SlashAction::Loop(None));
+    }
+    if let Some(direction) = t.strip_prefix("/loop ") {
+        let direction = direction.trim();
+        return Some(SlashAction::Loop(
+            (!direction.is_empty()).then(|| direction.to_string()),
+        ));
+    }
+    if let Some(rest) = t.strip_prefix("/rewind") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Some(SlashAction::Rewind { steps: 1 });
+        }
+        let n = rest.parse::<usize>().ok()?;
+        return (n > 0).then_some(SlashAction::Rewind { steps: n });
+    }
+    match t {
+        "/clear" | "/c" | "/new" => Some(SlashAction::Clear),
+        "/menu" | "/m" => Some(SlashAction::Menu),
+        "/compact" | "/cc" => Some(SlashAction::Compact),
+        "/context" => Some(SlashAction::Context),
+        "/cost" | "/usage" => Some(SlashAction::Cost),
+        "/status" | "/s" => Some(SlashAction::Status),
+        "/model" => Some(SlashAction::Model),
+        "/mode" => Some(SlashAction::CycleMode),
+        "/permissions" | "/approval" => Some(SlashAction::Permissions),
+        "/select" | "/mouse" => Some(SlashAction::SelectMode),
+        "/doctor" => Some(SlashAction::Doctor),
+        "/history" => Some(SlashAction::History),
+        "/export" => Some(SlashAction::Export),
+        "/quit" | "/exit" | "/q" => Some(SlashAction::Quit),
+        "/resume" => Some(SlashAction::Resume),
+        "/login" => Some(SlashAction::Login),
+        "/memory" => Some(SlashAction::Memory),
+        "/terminal-setup" => Some(SlashAction::TerminalSetup),
+        "/review" => Some(SlashAction::Prompt(
+            "Review the pending code changes on the current branch. Summarize the diff, flag risks and bugs, and suggest concrete fixes.".into(),
+        )),
+        "/pr" => Some(SlashAction::Prompt(
+            "Create a pull request for the current branch: summarize the changes and generate a title and body.".into(),
+        )),
+        "/init" => Some(SlashAction::Prompt(
+            "Initialize an AGENTS.md file documenting this codebase: structure, build/test commands, and conventions.".into(),
+        )),
+        "/diff" => Some(SlashAction::Prompt(
+            "Show the diff of pending changes using git.".into(),
+        )),
+        "/release-notes" => Some(SlashAction::Prompt(
+            "Generate release notes from the recent git history.".into(),
+        )),
+        "/bug" => Some(SlashAction::Prompt(
+            "Help me report a bug: summarize the current problem and any recent errors from this session.".into(),
+        )),
+        "/doc" => Some(SlashAction::Prompt(
+            "Generate documentation for the relevant code.".into(),
+        )),
+        "/docs" => Some(SlashAction::Prompt(
+            "Read and summarize the relevant documentation.".into(),
+        )),
+        "/fix" => Some(SlashAction::Prompt(
+            "Find and fix bugs in the relevant code.".into(),
+        )),
+        "/explain" => Some(SlashAction::Prompt("Explain the relevant code.".into())),
+        "/edit" => Some(SlashAction::Prompt(
+            "Apply the requested edits to the code.".into(),
+        )),
+        "/codebase" => Some(SlashAction::Prompt(
+            "Summarize the structure of this codebase for context.".into(),
+        )),
+        "/help" | "/h" | "/?" => Some(SlashAction::Help),
+        _ => None,
+    }
+}
+
+fn loop_prompt(direction: Option<&str>) -> String {
+    let mut prompt = "Continue working autonomously toward the active session goal. Inspect the current state, take the next useful actions, verify the result, and do not stop at a progress update while safe in-scope work remains.".to_string();
+    if let Some(direction) = direction {
+        prompt.push_str(" Additional direction: ");
+        prompt.push_str(direction);
+    }
+    prompt
+}
+
+/// Report the exact memory-file locations used by `rc-ctx::Memory::load_chain`.
+/// A file counts as loaded only when it is readable and non-blank, matching the
+/// assembler rather than merely checking whether a path exists.
+fn memory_status_lines(cwd: &Path) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".sc").join("AGENTS.md"));
+    }
+    candidates.push(cwd.join(".sc").join("AGENTS.md"));
+    candidates.push(cwd.join("AGENTS.md"));
+
+    let mut lines: Vec<String> = candidates
+        .into_iter()
+        .filter(|path| {
+            std::fs::read_to_string(path).is_ok_and(|contents| !contents.trim().is_empty())
+        })
+        .map(|path| format!("  loaded  {}", path.display()))
+        .collect();
+    if lines.is_empty() {
+        lines.push("  no non-empty AGENTS.md files loaded".into());
+    }
+    lines
+}
+
+/// Toggle a clicked reasoning block while freezing the logical viewport top
+/// from the frame the user clicked. The summary and every line above it keep
+/// their screen position; only content at and below the expansion moves.
+fn toggle_reasoning_preserving_top(
+    view: &mut ViewState,
+    column: u16,
+    row: u16,
+    top_before: usize,
+) -> bool {
+    if view.toggle_reasoning_at(column, row).is_none() {
+        return false;
+    }
+    view.follow = false;
+    view.scroll_top = top_before;
+    true
+}
+
+/// A host-side slash command (not submitted to the model). Every canonical
+/// command is advertised by `complete::slash_palette` and has a concrete
+/// action here; aliases collapse onto the same variant in `classify_slash`.
+/// `Prompt` carries a canned instruction submitted as a normal user turn.
 #[derive(Debug, Clone)]
 enum SlashAction {
     Help,
@@ -1397,6 +1449,10 @@ enum SlashAction {
     Menu,
     Clear,
     Compact,
+    ShowGoal,
+    SetGoal(String),
+    ClearGoal,
+    Loop(Option<String>),
     CycleMode,
     Rewind {
         steps: usize,
@@ -1412,26 +1468,12 @@ enum SlashAction {
     Export,
     Doctor,
     History,
-    /// Print a short, static info line for a capability not fully wired yet.
-    Note(NoteKind),
+    Resume,
+    Login,
+    Memory,
+    TerminalSetup,
     /// Submit a canned instruction to the model (prompt-expansion commands).
     Prompt(String),
-}
-
-/// The "info note" commands — each prints a one-line status. They share a
-/// handler (`run_note`) so adding a new one is one match arm + one line.
-#[derive(Debug, Clone, Copy)]
-enum NoteKind {
-    Vim,
-    TerminalSetup,
-    Login,
-    Logout,
-    Mcp,
-    Memory,
-    AddDir,
-    Approval,
-    Update,
-    Resume,
 }
 
 /// Two completions are "the same menu" if they're the same kind and would show
@@ -1472,14 +1514,47 @@ enum EscAction {
     Quit,
 }
 
-/// Reset the per-turn animation state: not busy, clock stopped, no in-flight
-/// tools. Called from every terminal turn event (Idle, Outcome, Error) and
-/// from `/clear`. A free function over `&mut ViewState` (not a `&mut self`
-/// method) so it can be called inside `apply`, where `&mut self.view` is
-/// already borrowed.
-fn end_turn(v: &mut crate::view::ViewState) {
+/// Finish a real agent turn, preserving its submit-to-terminal-event wall time
+/// as a divider in transcript history. Providers can emit both Outcome and
+/// Idle; taking `turn_started` makes the divider exactly-once.
+fn finish_turn(v: &mut crate::view::ViewState) {
+    finish_turn_at(v, Instant::now());
+}
+
+fn finish_turn_at(v: &mut crate::view::ViewState, finished: Instant) {
+    let elapsed = v
+        .turn_started
+        .take()
+        .map(|started| finished.saturating_duration_since(started));
+    let changed = v
+        .turn_file_changes
+        .values()
+        .map(|(before, after)| diff::line_stats(before.as_deref(), after.as_deref()))
+        .fold(diff::DiffStats::default(), |mut total, stats| {
+            total.added = total.added.saturating_add(stats.added);
+            total.removed = total.removed.saturating_add(stats.removed);
+            total
+        });
+    reset_turn(v);
+
+    if let Some(elapsed) = elapsed {
+        if v.transcript.last().is_some_and(|line| line.width() > 0) {
+            v.transcript.push(Line::default());
+        }
+        v.transcript.push(view::turn_divider_line(
+            turn_duration_label(elapsed),
+            changed.added,
+            changed.removed,
+        ));
+    }
+}
+
+/// Reset per-turn animation state without writing transcript history. `/clear`
+/// and `/compact` use this path because they intentionally remove the turn.
+fn reset_turn(v: &mut crate::view::ViewState) {
     v.busy = false;
     v.turn_started = None;
+    v.turn_file_changes.clear();
     v.running = 0;
     v.running_tool = None;
     v.stream_chars = 0;
@@ -1491,6 +1566,37 @@ fn end_turn(v: &mut crate::view::ViewState) {
     v.current_reasoning.clear();
     v.reasoning_started = None;
     v.reasoning_elapsed = None;
+}
+
+fn turn_duration_label(elapsed: Duration) -> String {
+    if elapsed < Duration::from_secs(60) {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        let total = elapsed.as_secs();
+        format!("{}m {:02}s", total / 60, total % 60)
+    }
+}
+
+fn show_artifact(v: &mut ViewState, cwd: &Path, artifact: Artifact) {
+    match artifact {
+        Artifact::FileChange {
+            path,
+            before,
+            after,
+        } => {
+            let shown = path
+                .strip_prefix(cwd)
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
+            let (lines, _) = diff::file_diff_lines(&shown, before.as_deref(), after.as_deref());
+            v.transcript.extend(lines);
+            v.turn_file_changes
+                .entry(path)
+                .and_modify(|(_, final_after)| *final_after = after.clone())
+                .or_insert((before, after));
+        }
+    }
 }
 
 /// Accumulate a streaming delta into the tokens/sec meter. The first delta of
@@ -1510,6 +1616,17 @@ fn track_stream(v: &mut crate::view::ViewState, delta: &str) {
 /// model so the word isn't stolen from normal prompts.
 fn is_quit_word(text: &str) -> bool {
     matches!(text.trim(), "exit" | "quit")
+}
+
+/// A successful response can still have spent seconds behind transient
+/// 429/5xx or connection failures. Keep that recovery in the transcript so it
+/// does not masquerade as unexplained model thinking time.
+fn retry_notice_line(retries: u32) -> Line<'static> {
+    let noun = if retries == 1 { "retry" } else { "retries" };
+    Line::styled(
+        format!("↻ model request recovered after {retries} {noun}"),
+        dim_style(),
+    )
 }
 
 fn cycle_mode(m: AgentMode) -> AgentMode {
@@ -1560,15 +1677,11 @@ fn summarize_args(args: &str) -> String {
     truncate(args, 80)
 }
 
-/// The echoed user turn mirrors the composer's neutral `> ` prompt. The orange
-/// brand mark belongs exclusively to assistant output, so direction reads
-/// immediately without painting both sides of the conversation the same.
+/// The echoed user turn keeps the composer's `>` direction marker inside a
+/// padded grey bubble. The orange brand mark remains exclusive to assistant
+/// output, so the two sides of the conversation separate at a glance.
 fn user_prompt_line(text: &str) -> Line<'static> {
-    let p = theme::palette();
-    Line::from(vec![
-        Span::styled("> ", p.chrome()),
-        Span::raw(text.to_string()),
-    ])
+    Line::styled(format!("  > {text}  "), theme::palette().user_prompt())
 }
 
 /// Rehydrate the visible transcript before a resumed TUI's first frame. The
@@ -2131,6 +2244,108 @@ mod tests {
     }
 
     #[test]
+    fn finished_turn_gets_one_timed_divider_and_spacing() {
+        let started = Instant::now();
+        let mut view = ViewState::new("m".into());
+        view.busy = true;
+        view.turn_started = Some(started);
+        view.transcript.push(Line::from("answer"));
+        view.turn_file_changes.insert(
+            PathBuf::from("src/main.rs"),
+            (
+                Some(b"one\ntwo\n".to_vec().into()),
+                Some(b"one\nthree\nfour\n".to_vec().into()),
+            ),
+        );
+
+        finish_turn_at(&mut view, started + Duration::from_secs(75));
+
+        assert_eq!(view.transcript.len(), 3, "answer, space, divider");
+        assert_eq!(view.transcript[1].width(), 0, "blank turn separation");
+        let divider: String = view.transcript[2]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(divider.contains("worked for 1m 15s"), "{divider}");
+        assert!(divider.contains("3 lines changed (+2 -1)"), "{divider}");
+        assert!(view.turn_file_changes.is_empty());
+        assert!(!view.busy);
+
+        finish_turn_at(&mut view, started + Duration::from_secs(76));
+        assert_eq!(
+            view.transcript.len(),
+            3,
+            "Outcome + Idle cannot duplicate it"
+        );
+        assert_eq!(turn_duration_label(Duration::from_millis(1400)), "1.4s");
+    }
+
+    #[test]
+    fn file_artifacts_render_live_and_accumulate_a_net_turn_diff() {
+        let mut view = ViewState::new("m".into());
+        let path = PathBuf::from("/repo/src/main.rs");
+        show_artifact(
+            &mut view,
+            Path::new("/repo"),
+            Artifact::FileChange {
+                path: path.clone(),
+                before: Some(b"one\ntwo\n".to_vec().into()),
+                after: Some(b"one\nthree\n".to_vec().into()),
+            },
+        );
+        show_artifact(
+            &mut view,
+            Path::new("/repo"),
+            Artifact::FileChange {
+                path: path.clone(),
+                before: Some(b"one\nthree\n".to_vec().into()),
+                after: Some(b"one\nfour\nfive\n".to_vec().into()),
+            },
+        );
+
+        let rendered = view
+            .transcript
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("src/main.rs"), "{rendered}");
+        assert!(rendered.contains("two"), "{rendered}");
+        assert!(rendered.contains("three"), "{rendered}");
+        assert!(rendered.contains("four"), "{rendered}");
+
+        let (before, after) = view.turn_file_changes.get(&path).unwrap();
+        assert_eq!(before.as_deref(), Some(b"one\ntwo\n".as_slice()));
+        assert_eq!(after.as_deref(), Some(b"one\nfour\nfive\n".as_slice()));
+        let stats = diff::line_stats(before.as_deref(), after.as_deref());
+        assert_eq!(
+            stats,
+            diff::DiffStats {
+                added: 2,
+                removed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn successful_model_retries_have_a_visible_transcript_notice() {
+        let one: String = retry_notice_line(1)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let two: String = retry_notice_line(2)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(one, "↻ model request recovered after 1 retry");
+        assert_eq!(two, "↻ model request recovered after 2 retries");
+    }
+
+    #[test]
     fn cycle_mode_rotates_through_every_mode() {
         // Ordered least-permissive to most, wrapping: every mode is reachable
         // by pressing Shift+Tab, and none is stranded off the cycle.
@@ -2219,6 +2434,73 @@ mod tests {
         .is_empty());
     }
 
+    #[test]
+    fn clicking_a_thought_expands_down_without_moving_its_screen_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        fn render(view_state: &mut ViewState) -> String {
+            let backend = TestBackend::new(60, 18);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| view::draw(frame, view_state))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let width = buffer.area.width as usize;
+            let mut screen = String::new();
+            for (index, cell) in buffer.content().iter().enumerate() {
+                screen.push_str(cell.symbol());
+                if (index + 1) % width == 0 {
+                    screen.push('\n');
+                }
+            }
+            screen
+        }
+
+        let mut view_state = ViewState::new("m".into());
+        view_state.transcript.extend([
+            Line::from("older one"),
+            Line::from("older two"),
+            Line::from("older three"),
+        ]);
+        let started = Instant::now();
+        view_state.begin_reasoning_phase(started);
+        view_state.current_reasoning = "private line one\nprivate line two".into();
+        view_state.current_text = "answer".into();
+        view_state.finish_reasoning(started + Duration::from_millis(240));
+        view_state.flush_text();
+        view_state.follow = false;
+        view_state.scroll_top = 0;
+
+        let before = render(&mut view_state);
+        let row_before = before
+            .lines()
+            .position(|line| line.contains("thought for 0.24s"))
+            .expect("thought is visible before the click");
+        assert!(toggle_reasoning_preserving_top(
+            &mut view_state,
+            0,
+            row_before as u16,
+            0,
+        ));
+
+        let after = render(&mut view_state);
+        let row_after = after
+            .lines()
+            .position(|line| line.contains("thought for 0.24s"))
+            .expect("thought remains visible after expansion");
+        assert_eq!(row_after, row_before, "the clicked row stays stationary");
+        assert!(
+            after
+                .lines()
+                .skip(row_after + 1)
+                .any(|line| line.contains("private line one")),
+            "the retained body grows below the summary: {after}"
+        );
+        assert!(!view_state.follow, "expansion holds the viewport");
+        assert_eq!(view_state.scroll_top, 0, "the prior top is preserved");
+    }
+
     /// The location label pairs the directory leaf with the branch, and keeps
     /// a long feature-branch name from crowding out the rest of the line.
     #[test]
@@ -2270,6 +2552,7 @@ mod tests {
                     prompt_tokens_details: None,
                 }),
                 cost: None,
+                trace: None,
             },
             Turn::ToolResult {
                 call_id: "call-1".into(),
@@ -2356,17 +2639,25 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_echo_is_neutral_and_has_no_brand_logo() {
+    fn user_prompt_echo_is_a_grey_box_without_the_brand_logo() {
         let line = user_prompt_line("hello");
         let text: String = line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(text, "> hello");
+        assert_eq!(text, "  > hello  ");
         assert!(
             !text.contains(theme::DEFAULT_LOGO),
             "logo is reserved for output: {text}"
+        );
+        let style = line.style;
+        assert!(
+            style.bg == Some(Color::DarkGray)
+                || style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED),
+            "grey background or monochrome enclosure: {style:?}"
         );
     }
 
@@ -2631,29 +2922,66 @@ mod tests {
     }
 
     #[test]
-    fn slash_commands_recognize_clear_help_mode() {
-        // A fresh App needs a Runtime (tokio), but handle_slash is a pure method
-        // over &self that never touches the runtime — test it via a tiny shim
-        // that mirrors its body. We assert the recognized commands and the
-        // fall-through for non-commands and @-mentions.
-        fn classify(text: &str) -> Option<SlashAction> {
-            let t = text.trim();
-            match t {
-                "/clear" => Some(SlashAction::Clear),
-                "/help" => Some(SlashAction::Help),
-                "/mode" => Some(SlashAction::CycleMode),
-                _ => None,
-            }
+    fn every_advertised_slash_command_reaches_the_real_dispatcher() {
+        let mut seen = std::collections::HashSet::new();
+        for (command, description) in complete::slash_palette() {
+            assert!(seen.insert(*command), "duplicate command: {command}");
+            assert!(!description.trim().is_empty(), "missing help: {command}");
+            assert!(
+                classify_slash(command).is_some(),
+                "advertised command has no dispatcher action: {command}"
+            );
         }
-        assert!(matches!(classify("/clear"), Some(SlashAction::Clear)));
-        assert!(matches!(classify("/help"), Some(SlashAction::Help)));
-        assert!(matches!(classify("/mode"), Some(SlashAction::CycleMode)));
-        // Unknown command and plain prompts fall through.
-        assert!(classify("/unknown").is_none());
-        assert!(classify("hello there").is_none());
-        assert!(classify("@src/main.rs").is_none());
-        // Whitespace is tolerated.
-        assert!(matches!(classify("  /clear  "), Some(SlashAction::Clear)));
+
+        assert!(matches!(
+            classify_slash("/rewind 3"),
+            Some(SlashAction::Rewind { steps: 3 })
+        ));
+        assert!(matches!(
+            classify_slash("/goal ship the release"),
+            Some(SlashAction::SetGoal(goal)) if goal == "ship the release"
+        ));
+        assert!(matches!(
+            classify_slash("/goal clear"),
+            Some(SlashAction::ClearGoal)
+        ));
+        assert!(matches!(
+            classify_slash("/loop focus on tests"),
+            Some(SlashAction::Loop(Some(direction))) if direction == "focus on tests"
+        ));
+        let loop_text = loop_prompt(Some("focus on tests"));
+        assert!(loop_text.contains("active session goal"));
+        assert!(loop_text.contains("Additional direction: focus on tests"));
+        assert!(classify_slash("/rewind 0").is_none());
+        assert!(classify_slash("/unknown").is_none());
+        assert!(classify_slash("hello there").is_none());
+        assert!(classify_slash("@src/main.rs").is_none());
+        assert!(matches!(
+            classify_slash("  /clear  "),
+            Some(SlashAction::Clear)
+        ));
+    }
+
+    #[test]
+    fn memory_command_reports_the_files_the_assembler_can_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "project instructions\n").unwrap();
+        std::fs::create_dir(dir.path().join(".sc")).unwrap();
+        std::fs::write(dir.path().join(".sc/AGENTS.md"), "   \n").unwrap();
+
+        let lines = memory_status_lines(dir.path());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&dir.path().join("AGENTS.md").display().to_string())),
+            "non-empty project memory is reported: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(&dir.path().join(".sc/AGENTS.md").display().to_string())),
+            "blank memory is not loaded: {lines:?}"
+        );
     }
 
     #[test]

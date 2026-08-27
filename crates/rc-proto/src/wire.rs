@@ -50,6 +50,12 @@ pub enum WireMessage {
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<Arc<str>>,
+        /// Provider-native hidden reasoning from a prior truncated response.
+        /// Replaying it lets reasoning-capable OpenAI-compatible routes resume
+        /// without exposing it as visible assistant text. It remains absent for
+        /// ordinary models and is never copied into benchmark trajectories.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<Arc<str>>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         tool_calls: Vec<ToolCall>,
     },
@@ -124,6 +130,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tools: Vec<ToolDefinition>,

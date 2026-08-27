@@ -79,7 +79,10 @@ pub fn current_read_state(ctx: &ToolCtx, canon: &Path) -> ReadState {
 /// case. (`Unread` is now handled by auto-reading in the caller, not by erroring.)
 pub fn stale_read_error(canon: &Path) -> ToolOutcome {
     ToolOutcome::Error {
-        message: format!("{} changed since the last `Read` — re-read it first", canon.display()),
+        message: format!(
+            "{} changed since the last `Read` — re-read it first",
+            canon.display()
+        ),
         retryable: false,
     }
 }

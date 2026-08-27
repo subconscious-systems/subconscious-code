@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "xtask"]
+exclude = ["integrations/dlr"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,24 +18,28 @@ serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # M0: rt + macros. M1: sync (semaphore). M2: process + io-util + time (Bash).
 # Later milestones may add fs/signal.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time", "fs"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.1", features = ["fmt", "env-filter"] }
 bytes = "1"
-# Request-body gzip (opt-in): at our body sizes wire time dominates.
+# Request-body gzip (opt-in): the Rust backend benchmarks faster at level 1 on
+# our supported ARM target than zlib-ng, while avoiding a C/CMake build step.
 flate2 = "1"
+memchr = "2"
 wiremock = "0.6"
 insta = "1"
-# Content-addressing for the multiset/sequence hashes (rc-algebra). SHA-256 is
-# the boring production-grade choice; we expand a 32-byte digest to a 2048-byte
-# group element via CTR mode rather than pulling a full XOF crate.
+# SHA-256 provides stable block identities; BLAKE3's SIMD XOF expands each
+# identity across the full LtHash accumulator.
 sha2 = "0.10"
+blake3 = "1"
+libc = "0.2"
+dlr-sidecar = { path = "integrations/dlr/crates/sidecar" }
 
 [profile.release]
 # Static, self-contained binary; no dynamic loader surprises.

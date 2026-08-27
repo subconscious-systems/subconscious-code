@@ -21,6 +21,12 @@ use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, Rule
 
 use super::NETWORK_SYSCALLS;
 
+/// Host paths needed to execute normal developer toolchains without granting
+/// them write access. `/opt` is where Harbor/E2B task images install their
+/// testbed Conda environment; omitting it made the sandbox reject the Python
+/// interpreter in most historical benchmark trajectories.
+const READ_ONLY_SYSTEM_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"];
+
 #[derive(Debug)]
 pub struct Prepared {
     /// Non-`CLOEXEC` dup of the populated Landlock ruleset fd, inherited by the
@@ -92,8 +98,9 @@ fn build_landlock_inner(roots: &[PathBuf]) -> io::Result<OwnedFd> {
             .add_rule(PathBeneath::new(fd, access_all))
             .map_err(ioerr)?;
     }
-    // Read-only system dirs: exec + reads (binaries, libs, configs).
-    for dir in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+    // Read-only system dirs: exec + reads (binaries, libs, configs, benchmark
+    // toolchains). They deliberately do not receive write/make/remove rights.
+    for dir in READ_ONLY_SYSTEM_DIRS {
         if Path::new(dir).is_dir() {
             if let Ok(fd) = PathFd::new(dir) {
                 created = created
@@ -101,6 +108,22 @@ fn build_landlock_inner(roots: &[PathBuf]) -> io::Result<OwnedFd> {
                     .map_err(ioerr)?;
             }
         }
+    }
+
+    // Shells, git, compilers, and test runners routinely open `/dev/null`
+    // themselves (including for redirects such as `2>/dev/null`). Opening the
+    // child's stdio before Landlock is installed is not enough. Grant only the
+    // two file-content rights on this one device; allowing all of `/dev` would
+    // expose unrelated terminals and devices to sandboxed commands.
+    let dev_null = Path::new("/dev/null");
+    if dev_null.exists() {
+        let fd = PathFd::new(dev_null).map_err(ioerr)?;
+        created = created
+            .add_rule(PathBeneath::new(
+                fd,
+                AccessFs::ReadFile | AccessFs::WriteFile,
+            ))
+            .map_err(ioerr)?;
     }
 
     // The crate's fd is O_CLOEXEC (kernel default); take it out of the
@@ -307,6 +330,40 @@ mod linux_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(dir.path().join("inside.txt").exists());
+    }
+
+    #[test]
+    fn dev_null_is_readable_and_writable() {
+        let dir = tempdir().unwrap();
+        let out = sandbox_cmd(
+            &[dir.path().to_path_buf()],
+            false,
+            "printf discarded >/dev/null && cat /dev/null",
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn opt_is_read_only_when_present() {
+        if !Path::new("/opt").is_dir() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let out = sandbox_cmd(
+            &[dir.path().to_path_buf()],
+            false,
+            "test -r /opt && test -x /opt && ! touch /opt/sc-sandbox-must-not-write 2>/dev/null",
+        );
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

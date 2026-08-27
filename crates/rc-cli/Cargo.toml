@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 rc-proto = { path = "../rc-proto" }
+rc-algebra = { path = "../rc-algebra" }
 rc-config = { path = "../rc-config" }
 rc-core = { path = "../rc-core" }
 rc-tools = { path = "../rc-tools" }
@@ -25,9 +26,11 @@ tokio.workspace = true
 tokio-util = { workspace = true }
 anyhow.workspace = true
 async-trait = { workspace = true }
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+libc.workspace = true
 uuid = { version = "=1.20.0", features = ["v4"] }
 
 [dev-dependencies]

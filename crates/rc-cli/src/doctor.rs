@@ -20,7 +20,7 @@
 use anyhow::Result;
 use rc_config::Settings;
 use rc_proto::wire::{FunctionDefinition, ToolDefinition, ToolType};
-use rc_proto::{ChatClient, CompleteOpts, ProtoError, WireMessage};
+use rc_proto::{AgentStreamEvent, ChatClient, CompleteOpts, ProtoError, WireMessage};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,6 +92,7 @@ pub async fn run(settings: &Settings, body_ladder: bool) -> Result<bool> {
         Some(Duration::from_secs(120)),
     )?
     .with_request_gzip(settings.request_gzip);
+    let client = crate::configure_request_transport(client, settings)?;
 
     println!("connectivity");
     let mut failed = false;
@@ -174,6 +175,25 @@ fn config_lines(s: &Settings) -> Vec<String> {
         format!("  max retries         {}", s.max_retries),
         format!("  request gzip        {}", s.request_gzip),
         format!(
+            "  DLR enabled         {} ({})",
+            s.request_transport != rc_config::RequestTransport::Json,
+            s.request_transport
+        ),
+        format!("  DLR sidecar         {}", s.dlr_url),
+        format!(
+            "  DLR ingress token   {} ({})",
+            if s.dlr_ingress_token.is_some() {
+                "present"
+            } else {
+                "unset"
+            },
+            s.dlr_ingress_token_env
+        ),
+        format!(
+            "  reasoning effort    {}",
+            s.reasoning_effort.as_deref().unwrap_or("off")
+        ),
+        format!(
             "  permission mode     {}",
             if s.permissions.default_mode.is_empty() {
                 "default".to_string()
@@ -208,6 +228,7 @@ async fn probe_non_streaming(client: &ChatClient) -> Status {
     }];
     let opts = CompleteOpts {
         max_tokens: Some(16),
+        session_id: Some(doctor_session("nonstream")),
         ..Default::default()
     };
     let t = Instant::now();
@@ -234,18 +255,22 @@ async fn probe_streaming(client: &ChatClient) -> Status {
     }];
     let opts = CompleteOpts {
         max_tokens: Some(32),
+        session_id: Some(doctor_session("stream")),
         ..Default::default()
     };
     let t = Instant::now();
     let mut stream = match client.stream(&msgs, &opts, &[]).await {
-        Ok((s, _retries)) => s,
-        Err((e, _)) => return Status::Fail(describe(&e)),
+        Ok((s, _retries, _payload)) => s,
+        Err((e, _, _payload)) => return Status::Fail(describe(&e)),
     };
     let mut first_chunk_ms = None;
     let mut chunks = 0usize;
     let mut saw_usage = false;
     while let Some(ev) = stream.next().await {
         match ev {
+            Ok(AgentStreamEvent::TransportActivity | AgentStreamEvent::ToolCallProgress { .. }) => {
+                continue
+            }
             Ok(ev) => {
                 chunks += 1;
                 first_chunk_ms.get_or_insert(t.elapsed().as_millis());
@@ -293,19 +318,23 @@ async fn probe_tool_calls(client: &ChatClient) -> Status {
     }];
     let opts = CompleteOpts {
         max_tokens: Some(128),
+        session_id: Some(doctor_session("tools")),
         ..Default::default()
     };
     let mut stream = match client
         .stream(&msgs, &opts, std::slice::from_ref(&tool))
         .await
     {
-        Ok((s, _retries)) => s,
-        Err((e, _)) => return Status::Fail(describe(&e)),
+        Ok((s, _retries, _payload)) => s,
+        Err((e, _, _payload)) => return Status::Fail(describe(&e)),
     };
     let mut saw_tool_call = false;
     let mut names = Vec::new();
     while let Some(ev) = stream.next().await {
         match ev {
+            Ok(AgentStreamEvent::TransportActivity | AgentStreamEvent::ToolCallProgress { .. }) => {
+                continue
+            }
             Ok(ev) => {
                 let d = format!("{ev:?}");
                 if d.contains("ToolCall") {
@@ -344,6 +373,7 @@ async fn probe_body_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
         }];
         let opts = CompleteOpts {
             max_tokens: Some(16),
+            session_id: Some(doctor_session(&format!("single-{size}"))),
             ..Default::default()
         };
         let t = Instant::now();
@@ -387,12 +417,14 @@ async fn probe_chunked_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
             } else {
                 msgs.push(WireMessage::Assistant {
                     content: Some(Arc::from(pad.as_str())),
+                    reasoning_content: None,
                     tool_calls: vec![],
                 });
             }
         }
         let opts = CompleteOpts {
             max_tokens: Some(16),
+            session_id: Some(doctor_session(&format!("chunked-{size}"))),
             ..Default::default()
         };
         let t = Instant::now();
@@ -411,6 +443,10 @@ async fn probe_chunked_ladder(client: &ChatClient) -> Vec<(usize, Status)> {
         }
     }
     out
+}
+
+fn doctor_session(label: &str) -> String {
+    format!("doctor-{}-{label}", std::process::id())
 }
 
 /// Largest rung the gateway accepted, or `None` if even the first was refused.
@@ -650,13 +686,13 @@ mod tests {
         assert!(Status::Warn("d".into()).render("x").contains("warn"));
     }
 
-    /// The caps line must say "unlimited" for 0, since that's the shipped
-    /// default and the whole point of the product.
+    /// The provider-safe tool-result default and remaining unlimited fields
+    /// must both be visible rather than silently applied.
     #[test]
-    fn config_lines_report_unlimited_caps() {
+    fn config_lines_report_provider_safe_tool_cap() {
         let s = Settings::load(std::path::Path::new("/nonexistent"));
         let joined = config_lines(&s).join("\n");
-        assert!(joined.contains("cap: tool result    unlimited"), "{joined}");
+        assert!(joined.contains("cap: tool result    64 KB"), "{joined}");
         assert!(
             joined.contains("cap: read default   whole file"),
             "{joined}"

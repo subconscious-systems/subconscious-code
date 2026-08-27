@@ -7,6 +7,7 @@
 use crate::turn::{NoteKind, Turn};
 use rc_proto::ToolCall as WireToolCall;
 use rc_proto::{FunctionCall, UserContent, WireMessage};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -50,10 +51,54 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
     let mut out = vec![WireMessage::System {
         content: Arc::from(system_prompt),
     }];
-    for turn in messages {
+    // A compaction marker is a durable projection boundary. The session file
+    // stays append-only for trace/history recovery, while requests carry only
+    // the latest bounded summary and everything that happened after it.
+    let active_start = messages
+        .iter()
+        .rposition(|turn| {
+            matches!(
+                turn,
+                Turn::SystemNote {
+                    kind: NoteKind::Compaction,
+                    ..
+                }
+            )
+        })
+        .unwrap_or(0);
+    // Goals are session metadata, not disposable conversational history. When
+    // the active goal predates the newest compaction marker, re-inject it just
+    // ahead of the summary. A later goal/clear marker remains in the active
+    // slice and naturally supersedes the older value.
+    if let Some((goal_index, goal)) =
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, turn)| match turn {
+                Turn::SystemNote {
+                    kind: NoteKind::Goal,
+                    text,
+                } => Some((index, text.as_str())),
+                _ => None,
+            })
+    {
+        if goal_index < active_start && !goal.trim().is_empty() {
+            push_user(
+                &mut out,
+                &Arc::from(format!("<session-goal>{goal}</session-goal>")),
+            );
+        }
+    }
+    for turn in &messages[active_start..] {
         match turn {
             Turn::User { content, .. } => push_user(&mut out, content),
-            Turn::Assistant { text, calls, .. } => {
+            Turn::Assistant {
+                text,
+                reasoning,
+                calls,
+                ..
+            } => {
                 let tool_calls: Vec<WireToolCall> = calls
                     .iter()
                     .map(|c| WireToolCall {
@@ -61,17 +106,22 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
                         kind: Default::default(),
                         function: FunctionCall {
                             name: c.name.clone(),
-                            arguments: c.arguments.clone(),
+                            arguments: safe_tool_arguments(&c.arguments),
                         },
                     })
                     .collect();
                 // Assistant messages with tool calls often carry null content; some
                 // providers reject "" (§3.1 trap 1). Omit when there's no text.
-                let content = if text.is_empty() && !tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(text.clone())
-                };
+                let reasoning_content = reasoning
+                    .as_ref()
+                    .filter(|reasoning| !reasoning.trim().is_empty())
+                    .cloned();
+                let content =
+                    if text.is_empty() && (!tool_calls.is_empty() || reasoning_content.is_some()) {
+                        None
+                    } else {
+                        Some(text.clone())
+                    };
                 // NOTE: a single assistant turn with >1 MB of text is not chunked
                 // here — splitting one assistant message would duplicate its
                 // tool_calls or reorder the turn. Such a turn is rare (it needs
@@ -79,6 +129,7 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
                 // needs a dedicated strategy, not the user/tool split below.
                 out.push(WireMessage::Assistant {
                     content,
+                    reasoning_content,
                     tool_calls,
                 });
             }
@@ -110,6 +161,8 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
                 // Never into the system prompt (already sent); a user-side block.
                 let rendered: Arc<str> = match kind {
                     NoteKind::Compaction => format!("<session-summary>{text}</session-summary>"),
+                    NoteKind::Goal => format!("<session-goal>{text}</session-goal>"),
+                    NoteKind::Recovery => text.clone(),
                     NoteKind::ModeChange | NoteKind::Notice => format!("[note] {text}"),
                 }
                 .into();
@@ -122,6 +175,30 @@ pub fn project_with(messages: &[Turn], system_prompt: &str) -> Vec<WireMessage> 
         }
     }
     out
+}
+
+/// Providers require every replayed `function.arguments` value to be a JSON
+/// object. A cut stream can leave a persisted parse-error call containing the
+/// model's incomplete raw bytes; replaying those bytes poisons every later
+/// request with HTTP 400. Preserve valid objects byte-for-byte for cache
+/// stability, but replace malformed/scalar values with a small valid envelope.
+/// The adjacent tool result still carries the actual parse/interruption error.
+pub(crate) fn safe_tool_arguments(arguments: &Arc<str>) -> Arc<str> {
+    if matches!(
+        serde_json::from_str::<Value>(arguments),
+        Ok(Value::Object(_))
+    ) {
+        return arguments.clone();
+    }
+
+    let preview: String = arguments.chars().take(2048).collect();
+    Arc::from(
+        serde_json::json!({
+            "_sc_invalid_tool_arguments": true,
+            "raw_preview": preview,
+        })
+        .to_string(),
+    )
 }
 
 /// Push one or more `role:user` messages for `content`: a single message when
@@ -153,7 +230,15 @@ fn push_user(out: &mut Vec<WireMessage>, content: &Arc<str>) {
 /// `serde_json::to_string` by the `escaped_len_matches_serde_json` test, so a
 /// serializer change that breaks the assumption fails loudly.
 fn escaped_len(s: &str) -> usize {
-    s.chars().map(escape_len_char).sum()
+    // Begin with the UTF-8 byte length. JSON only adds bytes for ASCII escape
+    // characters, so this avoids decoding every non-ASCII scalar value.
+    s.as_bytes().iter().fold(s.len(), |len, &byte| {
+        len + match byte {
+            b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 1,
+            0x00..=0x1f => 5,
+            _ => 0,
+        }
+    })
 }
 
 fn escape_len_char(c: char) -> usize {
@@ -269,6 +354,7 @@ mod tests {
                 calls: vec![call("c1")],
                 usage: None,
                 cost: None,
+                trace: None,
             },
             toolresult("c1"),
         ];
@@ -284,6 +370,7 @@ mod tests {
                 calls: vec![call("c1")],
                 usage: None,
                 cost: None,
+                trace: None,
             },
             toolresult("c2"),
         ];
@@ -300,6 +387,7 @@ mod tests {
                 calls: vec![call("c1")],
                 usage: None,
                 cost: None,
+                trace: None,
             },
             Turn::User {
                 content: "hi".into(),
@@ -322,10 +410,47 @@ mod tests {
                 calls: vec![call("c1"), call("c2")],
                 usage: None,
                 cost: None,
+                trace: None,
             },
             toolresult("c1"),
         ];
         assert!(verify_invariant(&project(&turns)).is_err());
+    }
+
+    #[test]
+    fn malformed_persisted_tool_arguments_are_safe_to_replay() {
+        let turns = vec![
+            Turn::Assistant {
+                text: Arc::from(""),
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: "cut-write".into(),
+                    name: "Write".into(),
+                    arguments: Arc::from("{\"file_path\":\"plan.md\",\"content\":\"cut"),
+                }],
+                usage: None,
+                cost: None,
+                trace: None,
+            },
+            Turn::ToolResult {
+                call_id: "cut-write".into(),
+                tool: "Write".into(),
+                result: ToolResultBody::Interrupted,
+                duration: Default::default(),
+            },
+        ];
+
+        let wire = project(&turns);
+        assert!(verify_invariant(&wire).is_ok());
+        let WireMessage::Assistant { tool_calls, .. } = &wire[1] else {
+            panic!("expected assistant tool call")
+        };
+        let arguments = &tool_calls[0].function.arguments;
+        assert!(matches!(
+            serde_json::from_str::<Value>(arguments),
+            Ok(Value::Object(_))
+        ));
+        assert!(arguments.contains("_sc_invalid_tool_arguments"));
     }
 
     #[test]
@@ -352,6 +477,66 @@ mod tests {
             &default[1],
             WireMessage::User { content: UserContent::Text(t) } if t.as_ref() == "hi"
         ));
+    }
+
+    #[test]
+    fn latest_compaction_marker_replaces_older_projected_context() {
+        let turns = vec![
+            Turn::User {
+                content: "old context must disappear".into(),
+                ts: SystemTime::now(),
+            },
+            Turn::SystemNote {
+                kind: NoteKind::Compaction,
+                text: "bounded saved summary".into(),
+            },
+            Turn::User {
+                content: "new work".into(),
+                ts: SystemTime::now(),
+            },
+        ];
+        let wire = project(&turns);
+        let rendered = wire
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect::<String>();
+        assert!(!rendered.contains("old context must disappear"));
+        assert!(rendered.contains("bounded saved summary"));
+        assert!(rendered.contains("new work"));
+    }
+
+    #[test]
+    fn active_goal_survives_compaction_and_a_clear_marker_removes_it() {
+        let mut turns = vec![
+            Turn::SystemNote {
+                kind: NoteKind::Goal,
+                text: "finish the release".into(),
+            },
+            Turn::User {
+                content: "old context".into(),
+                ts: SystemTime::now(),
+            },
+            Turn::SystemNote {
+                kind: NoteKind::Compaction,
+                text: "saved summary".into(),
+            },
+        ];
+        let rendered = project(&turns)
+            .into_iter()
+            .map(|message| format!("{message:?}"))
+            .collect::<String>();
+        assert!(rendered.contains("<session-goal>finish the release</session-goal>"));
+        assert!(!rendered.contains("old context"));
+
+        turns.push(Turn::SystemNote {
+            kind: NoteKind::Goal,
+            text: String::new(),
+        });
+        let cleared = project(&turns)
+            .into_iter()
+            .map(|message| format!("{message:?}"))
+            .collect::<String>();
+        assert!(!cleared.contains("finish the release"));
     }
 
     #[test]
@@ -550,6 +735,7 @@ mod tests {
                 calls: vec![call("c1")],
                 usage: None,
                 cost: None,
+                trace: None,
             },
             Turn::ToolResult {
                 call_id: "c1".into(),

@@ -47,7 +47,7 @@ async fn streams_text_finish_and_usage() {
         session_id: Some("session-stream-123".into()),
         ..CompleteOpts::default()
     };
-    let (mut stream, _retries) = client
+    let (mut stream, _retries, payload) = client
         .stream(
             &[WireMessage::User {
                 content: "hi".into(),
@@ -70,6 +70,8 @@ async fn streams_text_finish_and_usage() {
         }
     }
     assert_eq!(text, "hello");
+    assert_eq!(payload.json_bytes, payload.wire_bytes);
+    assert!(payload.wire_bytes > 0);
     assert!(finish.contains("Stop"));
     assert_eq!(usage.unwrap().completion_tokens, 1);
 }
@@ -106,7 +108,7 @@ async fn stream_assembles_tool_call_args_across_fragments() {
         Some(Duration::from_secs(600)),
     )
     .unwrap();
-    let (mut stream, _retries) = client
+    let (mut stream, _retries, _payload) = client
         .stream(
             &[WireMessage::User {
                 content: "read it".into(),
@@ -188,7 +190,7 @@ async fn stream_retries_on_429_then_streams() {
         session_id: Some("session-retry-123".into()),
         ..CompleteOpts::default()
     };
-    let (mut stream, retries) = client
+    let (mut stream, retries, _payload) = client
         .stream(
             &[WireMessage::User {
                 content: "hi".into(),

@@ -115,7 +115,7 @@ mod mode_tests {
     /// lets through — that distinction is the mode's entire purpose.
     #[test]
     fn ask_mode_confirms_reads_too() {
-        for tool in ["Read", "Glob", "Grep", "Write", "Bash"] {
+        for tool in ["Read", "Glob", "Grep", "Write", "Append", "Bash"] {
             assert!(
                 matches!(mode_default(tool, Mode::Ask), Decision::Ask(_)),
                 "{tool} should require confirmation in ask mode"
@@ -132,7 +132,7 @@ mod mode_tests {
     /// guard lives in `bash_check` and is tested separately.
     #[test]
     fn auto_mode_allows_every_tool() {
-        for tool in ["Read", "Write", "Edit", "Bash"] {
+        for tool in ["Read", "Write", "Append", "Edit", "Bash"] {
             assert!(
                 matches!(mode_default(tool, Mode::Auto), Decision::Allow),
                 "{tool} in auto"
@@ -161,7 +161,10 @@ mod mode_tests {
 }
 
 fn is_mutating(tool: &str) -> bool {
-    matches!(tool, "Edit" | "Write" | "Bash" | "NotebookEdit" | "Task")
+    matches!(
+        tool,
+        "Edit" | "Write" | "Append" | "Bash" | "NotebookEdit" | "Task"
+    )
 }
 
 /// The mode's default decision when no rule matches (§7.3).
@@ -415,11 +418,11 @@ impl PermissionChecker for PermissionEngine {
         grants: &[String],
     ) -> Decision {
         let mode = self.mode();
-        let grants = parse_rules(grants);
+        let grant_rules = parse_rules(grants);
 
         // Session grants for path tools: a matching grant → Allow.
         if tool != "Bash" {
-            for r in &grants {
+            for r in &grant_rules {
                 if r.tool == tool && (r.spec.is_none() || Self::path_matches(r, input, cwd)) {
                     return Decision::Allow;
                 }
@@ -428,7 +431,7 @@ impl PermissionChecker for PermissionEngine {
 
         if tool == "Bash" {
             if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                return self.bash_check(cmd, &grants, mode);
+                return self.bash_check(cmd, &grant_rules, mode);
             }
             return Decision::Ask("Bash call without a command".into());
         }
@@ -450,6 +453,24 @@ impl PermissionChecker for PermissionEngine {
         for r in &self.ask {
             if r.tool == tool && (r.spec.is_none() || Self::path_matches(r, input, cwd)) {
                 return Decision::Ask("asked by a rule".into());
+            }
+        }
+
+        // A ReadMany call is one transport/tool round, but permission-wise it
+        // is exactly a collection of ordinary Reads. Re-evaluate every path as
+        // `Read` so existing Read rules and session grants cannot be bypassed
+        // by switching to the batched tool. Any denied/asked member governs the
+        // whole batch; only an all-allowed set runs.
+        if tool == "ReadMany" {
+            if let Some(paths) = input.get("file_paths").and_then(Value::as_array) {
+                for path in paths.iter().filter_map(Value::as_str) {
+                    let read_input = serde_json::json!({"file_path": path});
+                    match self.check("Read", &read_input, cwd, _roots, grants) {
+                        Decision::Allow => {}
+                        decision => return decision,
+                    }
+                }
+                return Decision::Allow;
             }
         }
         mode_default(tool, mode)
@@ -740,6 +761,33 @@ mod tests {
     }
 
     #[test]
+    fn read_many_inherits_read_rules_for_every_path() {
+        let default = eng(Mode::Default, &["Read(secret*)"], &[], &[]);
+        assert!(matches!(
+            default.check(
+                "ReadMany",
+                &json!({"file_paths": ["public.rs", "secret.env"]}),
+                &cwd(),
+                &roots(),
+                &[]
+            ),
+            Decision::Deny(_)
+        ));
+
+        let ask = eng(Mode::Ask, &[], &["Read(public.rs)"], &[]);
+        assert!(matches!(
+            ask.check(
+                "ReadMany",
+                &json!({"file_paths": ["public.rs", "other.rs"]}),
+                &cwd(),
+                &roots(),
+                &[]
+            ),
+            Decision::Ask(_)
+        ));
+    }
+
+    #[test]
     fn deny_beats_allow() {
         let e = eng(Mode::Default, &["Read(./.env)"], &["Read"], &[]);
         assert!(matches!(
@@ -817,7 +865,10 @@ mod tests {
         );
         // The error names the allowed roots so the model can self-correct.
         let err = res.unwrap_err();
-        assert!(err.contains("allowed:"), "missing allowed-roots hint: {err}");
+        assert!(
+            err.contains("allowed:"),
+            "missing allowed-roots hint: {err}"
+        );
     }
 
     /// Switching the engine to `auto` must stop it asking — including for the

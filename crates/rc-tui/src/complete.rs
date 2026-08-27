@@ -43,12 +43,10 @@ pub struct Completion {
     pub candidates: Vec<String>,
 }
 
-/// The fixed slash-command palette — the union of the slash commands shipped
-/// by Claude Code, Codex, and Cursor (de-duplicated; aliases live in
-/// [`crate::app`]'s `handle_slash`, not here, so they don't clutter the menu).
-/// `/clear`, `/mode`, and `/rewind` map to host actions the TUI already
-/// supported; the rest are either new host-side actions or prompt-expansion
-/// commands that submit a canned instruction to the model.
+/// The fixed slash-command palette — only commands with a working sc backend.
+/// Aliases live in [`crate::app`]'s parser, not here, so they don't clutter the
+/// menu. Keeping unsupported commands out is intentional: completion and
+/// `/help` are a capability contract, not a wishlist copied from other CLIs.
 ///
 /// `pub(crate)` so `app::run_slash` can render `/help` from this single source
 /// of truth — the help text and the menu can never drift apart.
@@ -68,13 +66,18 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
             "/rewind",
             "Restore files changed in the last turn (Write/Edit only)",
         ),
+        ("/goal", "Set, show, or clear the persistent session goal"),
+        (
+            "/loop",
+            "Run another autonomous agent loop toward the active goal",
+        ),
         // Session / environment introspection.
         ("/cost", "Show token usage for the last turn"),
         ("/usage", "Show token usage (alias of /cost)"),
         ("/menu", "Open the menu: projects, sessions, and settings"),
         ("/status", "Show session status (model, mode, cwd, busy)"),
         ("/model", "Show the active model"),
-        ("/mode", "Show or cycle the permission mode"),
+        ("/mode", "Cycle the permission mode"),
         (
             "/permissions",
             "Show the active permission mode and rule hints",
@@ -86,14 +89,12 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
         // Lifecycle.
         ("/quit", "Quit the session"),
         ("/resume", "Resume a previous conversation"),
-        ("/update", "Check for an sc CLI update"),
-        ("/login", "Show authentication status"),
-        ("/logout", "Show authentication status"),
-        // Integrations / capabilities (notes — not all backends are wired yet).
-        ("/mcp", "List connected MCP servers"),
-        ("/memory", "Show the memory / CLAUDE.md location"),
-        ("/add-dir", "Add a working directory to the session"),
-        ("/vim", "Toggle vim keybindings (not yet wired)"),
+        ("/login", "Open the API-key editor and reload on save"),
+        // Integrations / capabilities.
+        (
+            "/memory",
+            "Show the AGENTS.md files loaded for this project",
+        ),
         (
             "/terminal-setup",
             "Show terminal setup hints for Shift+Enter",
@@ -105,7 +106,7 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
             "Review the pending code changes on the current branch",
         ),
         ("/pr", "Create a pull request for the current branch"),
-        ("/init", "Generate a CLAUDE.md documenting the codebase"),
+        ("/init", "Generate an AGENTS.md documenting the codebase"),
         ("/diff", "Show the diff of pending changes"),
         (
             "/release-notes",
@@ -113,6 +114,7 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
         ),
         ("/bug", "Help report a bug from recent errors"),
         ("/doc", "Generate documentation for the code"),
+        ("/docs", "Read and summarize the relevant documentation"),
         ("/fix", "Find and fix bugs in the code"),
         ("/explain", "Explain the code"),
         ("/edit", "Apply edits to the code"),

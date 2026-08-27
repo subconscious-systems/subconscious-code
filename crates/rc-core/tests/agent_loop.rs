@@ -11,11 +11,85 @@ use rc_core::{
     AllowAllChecker, Mode, NullPrompter, PermissionChecker, PermissionEngine,
 };
 use rc_core::{AskResponse, FinishReason, Prompter, ToolResultBody, Usage};
+use rc_proto::WireMessage;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
+
+struct FailingProgressModel;
+
+#[async_trait]
+impl Model for FailingProgressModel {
+    async fn complete(
+        &self,
+        _req: ModelRequest,
+        sink: &dyn EventSink,
+    ) -> Result<ModelResponse, ModelError> {
+        sink.on_response_headers(Duration::from_millis(7));
+        sink.on_transport_activity();
+        sink.on_reasoning("partial thought");
+        sink.on_text("partial answer");
+        sink.on_tool_delta(
+            0,
+            Some("call_partial"),
+            Some("Write"),
+            r#"{"file_path":"plan.md","content":"unfinished"#,
+        );
+        Err(ModelError::Proto {
+            error: rc_proto::ProtoError::Idle(Duration::from_secs(120)),
+            retries: 0,
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_stream_persists_bounded_partial_diagnostics() {
+    let agent = AgentLoop::new(
+        Arc::new(FailingProgressModel),
+        Arc::new(ToolRegistry::new(Vec::new())),
+        Arc::new(AllowAllChecker),
+    );
+    let mut session = Session::new(
+        "partial-failure".into(),
+        std::env::temp_dir(),
+        "mock".into(),
+    );
+    let result = agent
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(result.is_err());
+    match session.messages.last().expect("persisted error") {
+        Turn::Error {
+            trace: Some(trace),
+            partial: Some(partial),
+            ..
+        } => {
+            assert_eq!(trace.transport_events, 1);
+            assert_eq!(trace.semantic_events, 3);
+            assert_eq!(trace.partial_text_chars, "partial answer".chars().count());
+            assert_eq!(
+                trace.partial_reasoning_chars,
+                "partial thought".chars().count()
+            );
+            assert!(trace.last_transport_activity_ms.is_some());
+            assert!(trace.last_semantic_activity_ms.is_some());
+            assert_eq!(partial.text, "partial answer");
+            assert_eq!(partial.reasoning, "partial thought");
+            assert_eq!(partial.tool_calls.len(), 1);
+            assert_eq!(partial.tool_calls[0].name.as_deref(), Some("Write"));
+            assert!(partial.tool_calls[0].arguments.contains("unfinished"));
+        }
+        other => panic!("expected error diagnostics, got {other:?}"),
+    }
+}
 
 /// A model that replays a scripted queue of responses.
 struct MockModel {
@@ -69,7 +143,8 @@ impl Tool for Echo {
 async fn loop_runs_tool_then_answers() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -80,7 +155,8 @@ async fn loop_runs_tool_then_answers() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -126,12 +202,186 @@ async fn loop_runs_tool_then_answers() {
 }
 
 #[tokio::test]
+async fn one_response_can_execute_multiple_tool_calls() {
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![
+                FinalizedToolCall::Call(ToolCall {
+                    id: "c1".into(),
+                    name: "Echo".into(),
+                    arguments: r#"{"msg":"first"}"#.into(),
+                }),
+                FinalizedToolCall::Call(ToolCall {
+                    id: "c2".into(),
+                    name: "Echo".into(),
+                    arguments: r#"{"msg":"second"}"#.into(),
+                }),
+            ],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "done".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let sink = RecordingSink::default();
+    let mut session = Session::new("multi".into(), std::env::temp_dir(), "mock".into());
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "run both".into(),
+            &sink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
+    assert_eq!(session.messages.len(), 5);
+    let results: Vec<_> = session
+        .messages
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::ToolResult {
+                call_id, result, ..
+            } => Some((call_id.as_str(), result.render())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, "c1");
+    assert!(results[0].1.contains("echo: first"));
+    assert_eq!(results[1].0, "c2");
+    assert!(results[1].1.contains("echo: second"));
+    assert_eq!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "tool_end")
+            .count(),
+        2
+    );
+    assert!(verify_invariant(&project(&session.messages)).is_ok());
+}
+
+#[tokio::test]
+async fn repeated_investigation_rounds_receive_a_batching_nudge() {
+    struct ResearchModel {
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    #[async_trait]
+    impl Model for ResearchModel {
+        async fn complete(
+            &self,
+            req: ModelRequest,
+            _sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let round = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(req);
+                requests.len()
+            };
+            if round <= 3 {
+                Ok(ModelResponse {
+                    retries: 0,
+                    text: String::new(),
+                    reasoning: None,
+                    tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                        id: format!("research-{round}"),
+                        name: "Echo".into(),
+                        arguments: format!(r#"{{"msg":"round {round}"}}"#).into(),
+                    })],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: None,
+                })
+            } else {
+                Ok(ModelResponse {
+                    retries: 0,
+                    text: "done".into(),
+                    reasoning: None,
+                    tool_calls: vec![],
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                })
+            }
+        }
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let model = Arc::new(ResearchModel {
+        requests: requests.clone(),
+    }) as Arc<dyn Model>;
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new(
+        "research-budget".into(),
+        std::env::temp_dir(),
+        "mock".into(),
+    );
+
+    agent
+        .run(
+            &mut session,
+            "investigate".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    for request in &requests[..3] {
+        assert!(
+            !request.messages.iter().any(|message| matches!(
+                message,
+                WireMessage::User {
+                    content: rc_proto::wire::UserContent::Text(content)
+                } if content.contains("agent guidance")
+            )),
+            "the budget should allow the first three rounds without a nudge"
+        );
+    }
+    assert!(requests[3].messages.iter().any(|message| matches!(
+        message,
+        WireMessage::User {
+            content: rc_proto::wire::UserContent::Text(content)
+        } if content.contains("fetch all independent paths and queries together")
+    )));
+}
+
+#[tokio::test]
 async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
     // The model emits a tool call with arguments that won't parse. The loop must
     // synthesize a `role:tool` error result (§3.3) so the model can retry.
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::ParseError {
@@ -143,7 +393,8 @@ async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "recovered".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -176,6 +427,18 @@ async fn loop_feeds_back_a_parse_error_as_a_tool_result() {
         verify_invariant(&wire).is_ok(),
         "parse-error result must satisfy the invariant"
     );
+    let WireMessage::Assistant { tool_calls, .. } = &wire[2] else {
+        panic!("expected the parse-error assistant call")
+    };
+    let arguments = &tool_calls[0].function.arguments;
+    assert!(
+        matches!(
+            serde_json::from_str::<serde_json::Value>(arguments),
+            Ok(serde_json::Value::Object(_))
+        ),
+        "replayed tool arguments must be a valid JSON object: {arguments}"
+    );
+    assert!(arguments.contains("_sc_invalid_tool_arguments"));
 
     match &session.messages[2] {
         Turn::ToolResult { result, .. } => {
@@ -194,7 +457,8 @@ async fn ask_escalation_denied_by_null_prompter_becomes_a_denied_result() {
     let engine = Arc::new(PermissionEngine::new(Mode::Default, vec![], vec![], vec![]))
         as Arc<dyn PermissionChecker>;
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -205,7 +469,8 @@ async fn ask_escalation_denied_by_null_prompter_becomes_a_denied_result() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "ok".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -274,7 +539,8 @@ impl EventSink for RecordingSink {
 async fn loop_emits_iter_tool_end_and_usage() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -285,7 +551,8 @@ async fn loop_emits_iter_tool_end_and_usage() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -342,7 +609,8 @@ impl Prompter for MockPrompter {
 }
 
 fn edit_call(id: &str) -> ModelResponse {
-    ModelResponse { retries: 0,
+    ModelResponse {
+        retries: 0,
         text: String::new(),
         reasoning: None,
         tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -356,7 +624,8 @@ fn edit_call(id: &str) -> ModelResponse {
 }
 
 fn stop_response(text: &str) -> ModelResponse {
-    ModelResponse { retries: 0,
+    ModelResponse {
+        retries: 0,
         text: text.into(),
         reasoning: None,
         tool_calls: vec![],
@@ -455,7 +724,8 @@ async fn turn_timeout_ends_a_long_loop() {
                 *c
             };
             tokio::time::sleep(self.delay).await;
-            Ok(ModelResponse { retries: 0,
+            Ok(ModelResponse {
+                retries: 0,
                 text: String::new(),
                 reasoning: None,
                 tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -508,6 +778,150 @@ async fn turn_timeout_ends_a_long_loop() {
     );
 }
 
+#[tokio::test]
+async fn turn_timeout_interrupts_an_in_flight_model_request() {
+    struct BlockedModel;
+    #[async_trait]
+    impl Model for BlockedModel {
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            _sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            unreachable!("the turn deadline must drop this request")
+        }
+    }
+
+    let agent = AgentLoop::new(
+        Arc::new(BlockedModel),
+        Arc::new(ToolRegistry::new(vec![])),
+        Arc::new(AllowAllChecker),
+    )
+    .with_turn_timeout(Some(Duration::from_millis(40)));
+    let mut session = Session::new("hard-deadline".into(), std::env::temp_dir(), "mock".into());
+    let started = tokio::time::Instant::now();
+    let outcome = agent
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::TimeUp);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "deadline did not interrupt the active request"
+    );
+}
+
+#[tokio::test]
+async fn turn_timeout_preserves_completed_tool_results_and_interrupts_the_rest() {
+    struct TimedTool {
+        name: &'static str,
+        delay: Duration,
+    }
+    #[async_trait]
+    impl Tool for TimedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "A serial timeout test tool."
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn concurrency(&self) -> Concurrency {
+            Concurrency::SerialWrite
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(ToolOutcome::ok(format!("{} complete", self.name)))
+        }
+    }
+    #[derive(Default)]
+    struct EndSink(Mutex<Vec<String>>);
+    impl EventSink for EndSink {
+        fn on_tool_end(&self, _call_id: &str, tool: &str, _result: &ToolResultBody) {
+            self.0.lock().unwrap().push(tool.to_string());
+        }
+    }
+
+    let tools = Arc::new(ToolRegistry::new(vec![
+        Arc::new(TimedTool {
+            name: "FastWrite",
+            delay: Duration::ZERO,
+        }),
+        Arc::new(TimedTool {
+            name: "BlockedWrite",
+            delay: Duration::from_secs(30),
+        }),
+    ]));
+    let calls = ["FastWrite", "BlockedWrite"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            FinalizedToolCall::Call(ToolCall {
+                id: format!("call-{index}"),
+                name: name.into(),
+                arguments: "{}".into(),
+            })
+        })
+        .collect();
+    let model = Arc::new(MockModel::new(vec![ModelResponse {
+        retries: 0,
+        text: String::new(),
+        reasoning: None,
+        tool_calls: calls,
+        finish_reason: rc_proto::FinishReason::ToolCalls,
+        usage: None,
+    }]));
+    let agent = AgentLoop::new(model, tools, Arc::new(AllowAllChecker))
+        .with_turn_timeout(Some(Duration::from_millis(50)));
+    let sink = EndSink::default();
+    let mut session = Session::new("partial-tools".into(), std::env::temp_dir(), "mock".into());
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "go".into(),
+            &sink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::TimeUp);
+    assert!(matches!(
+        &session.messages[2],
+        Turn::ToolResult {
+            tool,
+            result: ToolResultBody::Ok { .. },
+            ..
+        } if tool == "FastWrite"
+    ));
+    assert!(matches!(
+        &session.messages[3],
+        Turn::ToolResult {
+            tool,
+            result: ToolResultBody::Interrupted,
+            ..
+        } if tool == "BlockedWrite"
+    ));
+    assert_eq!(
+        *sink.0.lock().unwrap(),
+        vec!["FastWrite", "BlockedWrite"],
+        "every tool gets exactly one terminal event"
+    );
+    assert!(verify_invariant(&project(&session.messages)).is_ok());
+}
+
 // ---- M3: cross-turn usage accumulation ------------------------------------
 
 #[tokio::test]
@@ -522,7 +936,8 @@ async fn accumulates_usage_across_iterations() {
     }
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -533,7 +948,8 @@ async fn accumulates_usage_across_iterations() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: Some(usage(10, 2)),
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -567,28 +983,50 @@ async fn accumulates_usage_across_iterations() {
     assert_eq!(t.total_tokens, 35, "total summed across iterations");
 }
 
-// ---- early-return invariant (§4.2 / project.rs:69) --------------------------
+// ---- unconfirmed tool-call recovery (§4.2 / project.rs:69) -----------------
 //
-// A finish_reason that isn't `ToolCalls` but the assistant DID emit a tool call
-// (provider anomaly, or a stream cut mid-tool-call). The loop must NOT execute
-// the tool, and must synthesize an `Interrupted` result so the tool-answer
-// invariant holds — otherwise the next turn's projection has an unanswered
-// assistant tool_call (debug_assert panic / malformed request to the provider).
+// A provider can emit a tool call without the corresponding `ToolCalls` finish
+// reason. The loop must not execute that unconfirmed call, but it also must not
+// abandon the user's turn. It pairs the call with a retryable error and asks the
+// model again; a confirmed reissue can then execute normally.
 
 #[tokio::test]
-async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
+async fn stop_with_outstanding_call_recovers_in_the_same_turn() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
-    let responses = vec![ModelResponse { retries: 0,
-        text: String::new(),
-        reasoning: None,
-        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
-            id: "c1".into(),
-            name: "Echo".into(),
-            arguments: r#"{"msg":"hi"}"#.to_string().into(),
-        })],
-        finish_reason: rc_proto::FinishReason::Stop,
-        usage: None,
-    }];
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "unconfirmed".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"hi"}"#.to_string().into(),
+            })],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "confirmed".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"hi"}"#.to_string().into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "done".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
     let agent = AgentLoop::new(
         model,
@@ -609,16 +1047,23 @@ async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
 
-    // User, Assistant(calls), ToolResult(Interrupted) — the tool was NOT executed.
-    assert_eq!(session.messages.len(), 3);
+    // User, unconfirmed Assistant + retry error, confirmed Assistant + real
+    // result, final Assistant. The unconfirmed call was never executed.
+    assert_eq!(session.messages.len(), 6);
     match &session.messages[2] {
-        Turn::ToolResult { result, .. } => {
-            assert!(
-                matches!(result, ToolResultBody::Interrupted),
-                "expected Interrupted, got {result:?}"
-            );
-        }
+        Turn::ToolResult { result, .. } => match result {
+            ToolResultBody::Error { message, retryable } => {
+                assert!(*retryable);
+                assert!(message.contains("not executed"));
+                assert!(message.contains("Retry"));
+            }
+            other => panic!("expected a retryable error, got {other:?}"),
+        },
         other => panic!("expected a synthesized tool result, got {other:?}"),
+    }
+    match &session.messages[4] {
+        Turn::ToolResult { result, .. } => assert!(result.render().contains("echo: hi")),
+        other => panic!("expected the confirmed tool result, got {other:?}"),
     }
     assert!(
         verify_invariant(&project(&session.messages)).is_ok(),
@@ -627,19 +1072,42 @@ async fn stop_with_outstanding_call_synthesizes_an_interrupted_result() {
 }
 
 #[tokio::test]
-async fn length_with_outstanding_call_synthesizes_an_interrupted_result() {
+async fn length_with_outstanding_call_recovers_in_the_same_turn() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
-    let responses = vec![ModelResponse { retries: 0,
-        text: "partial".into(),
-        reasoning: None,
-        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
-            id: "c1".into(),
-            name: "Echo".into(),
-            arguments: r#"{"msg":"hi"}"#.to_string().into(),
-        })],
-        finish_reason: rc_proto::FinishReason::Length,
-        usage: None,
-    }];
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: "partial".into(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "unconfirmed".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"hi"}"#.to_string().into(),
+            })],
+            finish_reason: rc_proto::FinishReason::Length,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "confirmed".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"hi"}"#.to_string().into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "done".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
     let agent = AgentLoop::new(
         model,
@@ -658,37 +1126,107 @@ async fn length_with_outstanding_call_synthesizes_an_interrupted_result() {
         )
         .await
         .unwrap();
-    assert_eq!(outcome, rc_core::agent::LoopOutcome::Length);
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
     assert!(
         verify_invariant(&project(&session.messages)).is_ok(),
-        "length exit with outstanding calls must still satisfy the invariant"
+        "recovery must preserve the invariant"
     );
     assert!(session.messages.iter().any(|t| matches!(
         t,
         Turn::ToolResult {
-            result: ToolResultBody::Interrupted,
+            result: ToolResultBody::Error {
+                retryable: true,
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(session.messages.iter().any(|t| matches!(
+        t,
+        Turn::ToolResult {
+            result: ToolResultBody::Ok { .. },
             ..
         }
     )));
 }
 
-// ---- A13: auto-continue on finish_reason=length ----------------------------
+#[tokio::test]
+async fn repeated_unconfirmed_tool_call_stops_after_one_reissue() {
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let response = |id: &str| ModelResponse {
+        retries: 0,
+        text: String::new(),
+        reasoning: None,
+        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+            id: id.into(),
+            name: "Echo".into(),
+            arguments: r#"{"msg":"unsafe until confirmed"}"#.into(),
+        })],
+        finish_reason: rc_proto::FinishReason::Length,
+        usage: None,
+    };
+    let model =
+        Arc::new(MockModel::new(vec![response("first"), response("second")])) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new(
+        "bounded-unconfirmed".into(),
+        std::env::temp_dir(),
+        "mock".into(),
+    );
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "do it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::Incomplete);
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|turn| matches!(turn, Turn::ToolResult { .. }))
+            .count(),
+        2
+    );
+    assert!(session.messages.iter().all(|turn| !matches!(
+        turn,
+        Turn::ToolResult {
+            result: ToolResultBody::Ok { .. },
+            ..
+        }
+    )));
+    assert!(verify_invariant(&project(&session.messages)).is_ok());
+}
+
+// ---- A13: bounded recovery on finish_reason=length -------------------------
 
 #[tokio::test]
-async fn length_without_tool_calls_auto_continues() {
+async fn visible_length_response_gets_a_synthetic_recovery_note() {
     // The model returns finish_reason=Length with text but no tool calls. The
-    // loop must inject a "continue" user turn and re-request, so the model
-    // finishes the answer instead of stopping with a warning.
+    // loop may request one continuation, but must record it as harness control
+    // state rather than attributing a fake `continue` message to the user.
     let registry = Arc::new(ToolRegistry::new(vec![]));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "partial answer".into(),
             reasoning: None,
             tool_calls: vec![],
             finish_reason: rc_proto::FinishReason::Length,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: " done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -716,12 +1254,14 @@ async fn length_without_tool_calls_auto_continues() {
         .unwrap();
     assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
 
-    // User, Assistant(partial), User(continue), Assistant(done).
+    // User, Assistant(partial), SystemNote(recovery), Assistant(done).
     assert_eq!(session.messages.len(), 4);
-    // The auto-injected continue turn.
     match &session.messages[2] {
-        Turn::User { content, .. } => assert_eq!(content.as_ref(), "continue", "injected turn"),
-        other => panic!("expected an injected user turn, got {other:?}"),
+        Turn::SystemNote { kind, text } => {
+            assert!(matches!(kind, rc_core::NoteKind::Recovery));
+            assert!(text.contains("visible partial response"));
+        }
+        other => panic!("expected a synthetic recovery note, got {other:?}"),
     }
     match &session.messages[3] {
         Turn::Assistant { text, .. } => assert_eq!(text.as_ref(), " done"),
@@ -734,22 +1274,405 @@ async fn length_without_tool_calls_auto_continues() {
 }
 
 #[tokio::test]
-async fn length_with_outstanding_call_stops_and_synthesizes() {
-    // finish_reason=Length mid-tool-call: the stream was cut. The loop must NOT
-    // auto-continue (the assistant message has outstanding calls); it
-    // synthesizes Interrupted results and stops with LoopOutcome::Length.
+async fn repeated_visible_length_stops_after_one_continuation() {
+    let registry = Arc::new(ToolRegistry::new(vec![]));
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: "first partial".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Length,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "second partial".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Length,
+            usage: None,
+        },
+    ];
+    let agent = AgentLoop::new(
+        Arc::new(MockModel::new(responses)),
+        registry,
+        Arc::new(AllowAllChecker),
+    );
+    let mut session = Session::new(
+        "bounded-visible-length".into(),
+        std::env::temp_dir(),
+        "mock".into(),
+    );
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "explain".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::Length);
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|turn| matches!(turn, Turn::SystemNote { .. }))
+            .count(),
+        1
+    );
+    assert!(!session
+        .messages
+        .iter()
+        .any(|turn| matches!(turn, Turn::User { content, .. } if content.as_ref() == "continue")));
+}
+
+#[tokio::test]
+async fn empty_reasoning_response_gets_one_force_action_recovery() {
+    // The GLM route has been observed returning `stop` at its implicit 4096
+    // completion-token ceiling after producing reasoning but no answer. Treat
+    // that shape as length exhaustion, replay its reasoning privately, and
+    // issue one force-action recovery without impersonating the user.
+    let registry = Arc::new(ToolRegistry::new(vec![]));
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: Some("reasoning that consumed the whole allowance".into()),
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 4096,
+                total_tokens: 4196,
+                prompt_tokens_details: None,
+            }),
+        },
+        ModelResponse {
+            retries: 0,
+            text: "recovered answer".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new(
+        "implicit-length".into(),
+        std::env::temp_dir(),
+        "mock".into(),
+    );
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "do the work".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
+    assert!(matches!(
+        &session.messages[2],
+        Turn::SystemNote { kind: rc_core::NoteKind::Recovery, text }
+            if text.contains("Take the next observable action now")
+    ));
+    let Turn::Assistant {
+        trace: Some(trace), ..
+    } = &session.messages[1]
+    else {
+        panic!("first assistant turn should carry request trace metadata")
+    };
+    assert!(trace.implicit_length);
+    assert_eq!(trace.reported_finish_reason, "stop");
+    assert_eq!(trace.effective_finish_reason, "length");
+    let wire = project(&session.messages[..3]);
+    assert!(matches!(
+        &wire[2],
+        WireMessage::Assistant {
+            content: None,
+            reasoning_content: Some(reasoning),
+            ..
+        } if reasoning.as_ref() == "reasoning that consumed the whole allowance"
+    ));
+    assert!(matches!(
+        &session.messages[3],
+        Turn::Assistant { text, .. } if text.as_ref() == "recovered answer"
+    ));
+}
+
+#[tokio::test]
+async fn repeated_reasoning_only_length_stops_as_no_progress() {
+    let registry = Arc::new(ToolRegistry::new(vec![]));
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: Some("first private attempt".into()),
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Length,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: Some("second private attempt".into()),
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Length,
+            usage: None,
+        },
+    ];
+    let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new("no-progress".into(), std::env::temp_dir(), "mock".into());
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "do the work".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::NoProgress);
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|turn| matches!(
+                turn,
+                Turn::SystemNote {
+                    kind: rc_core::NoteKind::Recovery,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(!session
+        .messages
+        .iter()
+        .any(|turn| matches!(turn, Turn::User { content, .. } if content.as_ref() == "continue")));
+}
+
+#[tokio::test]
+async fn force_action_recovery_is_used_only_once_even_after_tool_progress() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
-    let responses = vec![ModelResponse { retries: 0,
-        text: "partial".into(),
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: Some("first hidden-only attempt".into()),
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Length,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "progress".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"visible action"}"#.into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: Some("another hidden-only attempt".into()),
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Length,
+            usage: None,
+        },
+    ];
+    let agent = AgentLoop::new(
+        Arc::new(MockModel::new(responses)),
+        registry,
+        Arc::new(AllowAllChecker),
+    );
+    let mut session = Session::new("one-recovery".into(), std::env::temp_dir(), "mock".into());
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "do it".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::NoProgress);
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|turn| matches!(
+                turn,
+                Turn::SystemNote {
+                    kind: rc_core::NoteKind::Recovery,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn terminal_stream_end_is_incomplete_not_stop() {
+    let registry = Arc::new(ToolRegistry::new(vec![]));
+    let model = Arc::new(MockModel::new(vec![ModelResponse {
+        retries: 0,
+        text: String::new(),
         reasoning: None,
-        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
-            id: "c1".into(),
-            name: "Echo".into(),
-            arguments: r#"{"msg":"hi"}"#.to_string().into(),
-        })],
-        finish_reason: rc_proto::FinishReason::Length,
+        tool_calls: vec![],
+        finish_reason: rc_proto::FinishReason::Other("stream-ended".into()),
         usage: None,
-    }];
+    }])) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new("stream-ended".into(), std::env::temp_dir(), "mock".into());
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "do the work".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Incomplete);
+}
+
+#[tokio::test]
+async fn successful_model_request_persists_diagnostic_trace_fields() {
+    struct InstrumentedModel;
+    #[async_trait]
+    impl Model for InstrumentedModel {
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            sink.on_request_payload(10_000, 1_500);
+            sink.on_response_headers(Duration::from_millis(12));
+            sink.on_retry(2);
+            sink.on_reasoning("first output");
+            Ok(ModelResponse {
+                retries: 2,
+                text: "done".into(),
+                reasoning: Some("first output".into()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            })
+        }
+    }
+
+    let agent = AgentLoop::new(
+        Arc::new(InstrumentedModel) as Arc<dyn Model>,
+        Arc::new(ToolRegistry::new(vec![])),
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new("trace".into(), std::env::temp_dir(), "mock".into());
+    agent
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let Turn::Assistant {
+        trace: Some(trace), ..
+    } = &session.messages[1]
+    else {
+        panic!("assistant response must persist request metrics")
+    };
+    assert_eq!(trace.request_bytes, 10_000);
+    assert_eq!(trace.wire_bytes, 1_500);
+    assert_eq!(trace.response_headers_ms, Some(12));
+    assert!(trace.ttft_ms.is_some());
+    assert_eq!(trace.retries, 2);
+    assert_eq!(trace.reported_finish_reason, "stop");
+    assert_eq!(trace.effective_finish_reason, "stop");
+    assert!(trace.completed_ms >= trace.started_ms);
+    assert!(trace.context_chars > 0);
+}
+
+#[tokio::test]
+async fn stream_end_with_outstanding_call_recovers_without_executing_it() {
+    // A missing/unrecognized provider finish marker follows the same safe retry
+    // path. Only the subsequent ToolCalls-confirmed reissue may execute.
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: "partial".into(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "unconfirmed".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"hi"}"#.to_string().into(),
+            })],
+            finish_reason: rc_proto::FinishReason::Other("stream-ended".into()),
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "confirmed".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"hi"}"#.to_string().into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "done".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
     let model = Arc::new(MockModel::new(responses)) as Arc<dyn Model>;
     let agent = AgentLoop::new(
         model,
@@ -768,18 +1691,28 @@ async fn length_with_outstanding_call_stops_and_synthesizes() {
         )
         .await
         .unwrap();
-    assert_eq!(outcome, rc_core::agent::LoopOutcome::Length);
+    assert_eq!(outcome, rc_core::agent::LoopOutcome::Stop);
     assert!(
         verify_invariant(&project(&session.messages)).is_ok(),
-        "length exit with outstanding calls must still satisfy the invariant"
+        "stream-end recovery must preserve the invariant"
     );
-    assert!(session.messages.iter().any(|t| matches!(
-        t,
-        Turn::ToolResult {
-            result: ToolResultBody::Interrupted,
+    let tool_results: Vec<_> = session
+        .messages
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::ToolResult { result, .. } => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_results.len(), 2);
+    assert!(matches!(
+        tool_results[0],
+        ToolResultBody::Error {
+            retryable: true,
             ..
         }
-    )));
+    ));
+    assert!(matches!(tool_results[1], ToolResultBody::Ok { .. }));
 }
 
 // ---- context assembler (M6) -------------------------------------------------
@@ -821,7 +1754,8 @@ async fn loop_uses_the_wired_context_assembler() {
     // With an assembler set, the loop must send its system prompt, not the
     // legacy default. We capture the request and inspect message[0].
     let captured = Arc::new(Mutex::new(None));
-    let response = ModelResponse { retries: 0,
+    let response = ModelResponse {
+        retries: 0,
         text: "done".into(),
         reasoning: None,
         tool_calls: vec![],
@@ -882,7 +1816,8 @@ async fn loop_without_assembler_uses_legacy_default_prompt() {
     // With no assembler set, the loop falls back to the legacy `project` path
     // (M1–M5 behavior) — the system message is the default identity prompt.
     let captured = Arc::new(Mutex::new(None));
-    let response = ModelResponse { retries: 0,
+    let response = ModelResponse {
+        retries: 0,
         text: "done".into(),
         reasoning: None,
         tool_calls: vec![],
@@ -965,7 +1900,8 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
         vec![Arc::new(PanicTool) as Arc<dyn Tool>],
     ));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -976,7 +1912,8 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "recovered".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -1026,11 +1963,10 @@ async fn a_panicking_parallel_tool_becomes_an_error_not_a_crash() {
     );
 }
 
-// ---- unlimited context (M8) -------------------------------------------------
+// ---- explicitly unlimited context (M8) --------------------------------------
 
-/// The product claim, at the loop level: a large tool result reaches the wire
-/// whole. This is the regression guard against reintroducing a silent per-result
-/// cap anywhere between the tool and the request.
+/// Disabling the hard backstop explicitly still lets a large tool result reach
+/// the wire whole.
 #[tokio::test]
 async fn large_tool_results_reach_the_wire_uncapped() {
     use rc_core::{Tool, ToolCtx, ToolError, ToolOutcome};
@@ -1076,7 +2012,8 @@ async fn large_tool_results_reach_the_wire_uncapped() {
                 r.len() == 1
             };
             Ok(if first {
-                ModelResponse { retries: 0,
+                ModelResponse {
+                    retries: 0,
                     text: String::new(),
                     reasoning: None,
                     tool_calls: vec![rc_core::model::FinalizedToolCall::Call(rc_core::ToolCall {
@@ -1088,7 +2025,8 @@ async fn large_tool_results_reach_the_wire_uncapped() {
                     usage: None,
                 }
             } else {
-                ModelResponse { retries: 0,
+                ModelResponse {
+                    retries: 0,
                     text: "done".into(),
                     reasoning: None,
                     tool_calls: vec![],
@@ -1107,7 +2045,8 @@ async fn large_tool_results_reach_the_wire_uncapped() {
         model,
         registry,
         Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
-    );
+    )
+    .with_hard_tool_result_cap(0);
 
     let mut session = Session::new("s".into(), std::env::temp_dir(), "mock".into());
     agent
@@ -1165,14 +2104,15 @@ async fn hard_tool_result_cap_clips_a_runaway_output() {
             json!({"type": "object", "properties": {}})
         }
         async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
-            // 10 KB — over the 4 KB test cap, under the 100 MB default.
+            // 10 KB — over the 4 KB test cap, under the 1 MiB default.
             Ok(ToolOutcome::ok("z".repeat(10_000)))
         }
     }
 
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Huge) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -1183,7 +2123,8 @@ async fn hard_tool_result_cap_clips_a_runaway_output() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -1254,7 +2195,8 @@ async fn hard_tool_result_cap_zero_disables_it() {
 
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Big) as Arc<dyn Tool>]));
     let responses = vec![
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: String::new(),
             reasoning: None,
             tool_calls: vec![FinalizedToolCall::Call(ToolCall {
@@ -1265,7 +2207,8 @@ async fn hard_tool_result_cap_zero_disables_it() {
             finish_reason: rc_proto::FinishReason::ToolCalls,
             usage: None,
         },
-        ModelResponse { retries: 0,
+        ModelResponse {
+            retries: 0,
             text: "done".into(),
             reasoning: None,
             tool_calls: vec![],
@@ -1303,4 +2246,215 @@ async fn hard_tool_result_cap_zero_disables_it() {
         },
         other => panic!("expected a tool result, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn mixed_tool_batch_preserves_model_effect_order() {
+    struct OrderedTool {
+        name: &'static str,
+        concurrency: Concurrency,
+        observed: Arc<Mutex<Vec<&'static str>>>,
+    }
+    #[async_trait]
+    impl Tool for OrderedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Records its execution order."
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn concurrency(&self) -> Concurrency {
+            self.concurrency
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            self.observed.lock().unwrap().push(self.name);
+            Ok(ToolOutcome::ok(self.name.to_string()))
+        }
+    }
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(ToolRegistry::new(vec![
+        Arc::new(OrderedTool {
+            name: "WriteState",
+            concurrency: Concurrency::SerialWrite,
+            observed: observed.clone(),
+        }),
+        Arc::new(OrderedTool {
+            name: "ReadState",
+            concurrency: Concurrency::Parallel,
+            observed: observed.clone(),
+        }),
+    ]));
+    let calls = ["WriteState", "ReadState", "WriteState", "ReadState"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            FinalizedToolCall::Call(ToolCall {
+                id: format!("call-{index}"),
+                name: name.into(),
+                arguments: "{}".into(),
+            })
+        })
+        .collect();
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: calls,
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "done".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
+    let agent = AgentLoop::new(
+        Arc::new(MockModel::new(responses)),
+        registry,
+        Arc::new(AllowAllChecker),
+    );
+    let mut session = Session::new("ordered-tools".into(), std::env::temp_dir(), "mock".into());
+
+    agent
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec!["WriteState", "ReadState", "WriteState", "ReadState"]
+    );
+}
+
+#[tokio::test]
+async fn permission_check_uses_cwd_from_an_earlier_batch_barrier() {
+    struct ChangeDirectory;
+    #[async_trait]
+    impl Tool for ChangeDirectory {
+        fn name(&self) -> &str {
+            "ChangeDirectory"
+        }
+        fn description(&self) -> &str {
+            "Changes the shared cwd for the test."
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn concurrency(&self) -> Concurrency {
+            Concurrency::Exclusive
+        }
+        async fn call(&self, _input: Value, ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            let next = ctx.cwd.join("subdir");
+            ctx.shell_state.lock().unwrap().cwd = next;
+            Ok(ToolOutcome::ok("changed cwd".into()))
+        }
+    }
+    struct Mutate;
+    #[async_trait]
+    impl Tool for Mutate {
+        fn name(&self) -> &str {
+            "Mutate"
+        }
+        fn description(&self) -> &str {
+            "A relative mutation."
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn concurrency(&self) -> Concurrency {
+            Concurrency::SerialWrite
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::ok("mutated".into()))
+        }
+    }
+    struct CwdChecker(Arc<Mutex<Vec<(String, std::path::PathBuf)>>>);
+    impl PermissionChecker for CwdChecker {
+        fn check(
+            &self,
+            tool: &str,
+            _input: &Value,
+            cwd: &std::path::Path,
+            _roots: &[std::path::PathBuf],
+            _grants: &[String],
+        ) -> rc_perm::Decision {
+            self.0
+                .lock()
+                .unwrap()
+                .push((tool.to_string(), cwd.to_path_buf()));
+            rc_perm::Decision::Allow
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("subdir")).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let tools = Arc::new(ToolRegistry::new(vec![
+        Arc::new(ChangeDirectory),
+        Arc::new(Mutate),
+    ]));
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![
+                FinalizedToolCall::Call(ToolCall {
+                    id: "cd".into(),
+                    name: "ChangeDirectory".into(),
+                    arguments: "{}".into(),
+                }),
+                FinalizedToolCall::Call(ToolCall {
+                    id: "edit".into(),
+                    name: "Mutate".into(),
+                    arguments: "{}".into(),
+                }),
+            ],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "done".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
+    let agent = AgentLoop::new(
+        Arc::new(MockModel::new(responses)),
+        tools,
+        Arc::new(CwdChecker(observed.clone())),
+    );
+    let mut session = Session::new("live-cwd".into(), dir.path().to_path_buf(), "mock".into());
+    agent
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let checks = observed.lock().unwrap();
+    assert_eq!(checks[0].1, dir.path());
+    assert_eq!(checks[1].1, dir.path().join("subdir"));
 }
