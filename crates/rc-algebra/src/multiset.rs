@@ -308,8 +308,8 @@ pub(crate) fn expand_to_element(block: &BlockId) -> [u16; 1024] {
     let mut h = blake3::Hasher::new_derive_key("subconscious-code LtHash element v1");
     h.update(block.as_bytes());
     h.finalize_xof().fill(&mut buf);
-    for (i, chunk) in buf.chunks_exact(2).enumerate() {
-        out[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+    for (i, chunk) in buf.as_chunks::<2>().0.iter().enumerate() {
+        out[i] = u16::from_le_bytes(*chunk);
     }
     out
 }
