@@ -996,7 +996,7 @@ pub fn parse_root_hex(value: &str) -> Option<MerkleRoot> {
         return None;
     }
     let mut root = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         root[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Some(root)

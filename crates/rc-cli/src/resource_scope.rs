@@ -246,7 +246,7 @@ fn apply_fallback(limits: Limits) {
                 },
             ) == 0
             {
-                Some(soft as u64)
+                Some(soft)
             } else {
                 None
             }
