@@ -1,8 +1,9 @@
 # Benchmarks
 
-The repository includes benchmark adapters and result artifacts so performance
-claims can be inspected instead of treated as anecdotes. Benchmark outputs are
-evidence, not runtime dependencies; installing `sc` does not load them.
+The repository includes benchmark adapters and reproducible measurement
+instructions. Generated results, trial summaries, and trajectories are not
+part of the source distribution and should remain in external artifact storage
+or an ignored local output directory.
 
 ## Harbor integration
 
@@ -31,14 +32,15 @@ sidecar, and upstream placement fixed. A synthetic immediate-SSE upstream
 measures transport overhead; a real model endpoint measures end-to-end TTFT
 and includes queueing, prefill, and cache effects.
 
-## Checked-in result files
+## Result handling
 
-Files beginning with `swebench_` or `swebenchpro_` are generated evaluation
-summaries, manifests, and traces. A trace may contain model output and task
-content, so review and sanitize new artifacts before committing them. Never
-include credentials, private source, customer prompts, or unredacted session
-files.
+Write local outputs beneath `benchmark-results/` or `trial-results/`; both are
+ignored by Git. Store durable evaluation evidence in the benchmark system's
+artifact store rather than this source repository. A trace may contain model
+output and task content, so review and sanitize it before sharing it anywhere.
+Never include credentials, private source, customer prompts, or unredacted
+session files.
 
-When publishing a new comparison, record the commit SHA, model, endpoint
-region, client region, concurrency, repetitions, corpus characteristics, and
-whether caches were warm. Those details are required for a useful result.
+When sharing a comparison, record the commit SHA, model, endpoint region,
+client region, concurrency, repetitions, corpus characteristics, and whether
+caches were warm. Those details are required for a useful result.
