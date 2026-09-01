@@ -15,10 +15,17 @@ rm -f \
   "$out_dir"/subconscious_code_harbor-*.tar.gz \
   "$out_dir/SHA256SUMS" \
   "$out_dir/MANIFEST.json"
+# Benchmark trajectories and result tables are repository evidence, not
+# runtime inputs. Keeping them out of the release source payload avoids
+# shipping more than a thousand traces (and tens of megabytes) with Harbor.
 COPYFILE_DISABLE=1 tar \
   --no-xattrs \
   --exclude='subconscious-code/.git' \
   --exclude='subconscious-code/target' \
+  --exclude='*/target' \
+  --exclude='subconscious-code/swebench*' \
+  --exclude='subconscious-code/working-cli-plan.md' \
+  --exclude='subconscious-code/improvement.md' \
   --exclude='subconscious-code/integrations/harbor/dist' \
   --exclude='*/.venv' \
   --exclude='*/.DS_Store' \

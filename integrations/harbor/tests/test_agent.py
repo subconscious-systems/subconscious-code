@@ -7,14 +7,23 @@ from pathlib import Path
 import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
-
+from harbor.models.task.config import NetworkPolicy
 from subconscious_harbor.agent import SubconsciousCode
+from subconscious_harbor.mini_swe_agent import OfflineMiniSweAgent
 
 
 class FakeEnvironment(BaseEnvironment):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        network_mode: str = "no-network",
+        allowed_hosts: list[str] | None = None,
+    ) -> None:
         self.calls: list[dict] = []
         self.uploads: list[tuple[str, str]] = []
+        self._network_policy = NetworkPolicy(
+            network_mode=network_mode,
+            allowed_hosts=allowed_hosts or [],
+        )
 
     @property
     def type(self):
@@ -78,6 +87,7 @@ async def test_run_forwards_model_endpoint_and_report(tmp_path):
     assert "--model subconscious/glm-5.2" in call["command"]
     assert "--benchmark-report /logs/agent/subconscious-code-report.json" in call["command"]
     assert "--benchmark-trajectory /logs/agent/trajectory.json" in call["command"]
+    assert "--print='fix the issue'" in call["command"]
     assert agent.SUPPORTS_ATIF is True
     assert call["env"]["SC_API_KEY"] == "test-key"
     assert call["env"]["SC_BASE_URL"] == "https://api.subconscious.dev/v1"
@@ -85,6 +95,9 @@ async def test_run_forwards_model_endpoint_and_report(tmp_path):
     assert call["env"]["SC_REQUEST_GZIP"] == "true"
     assert call["env"]["SC_SANDBOX"] == "true"
     assert call["env"]["SC_SANDBOX_NET"] == "false"
+    assert call["env"]["PIP_NO_INDEX"] == "1"
+    assert call["env"]["CARGO_NET_OFFLINE"] == "true"
+    assert call["env"]["GOPROXY"] == "off"
     assert "no_progress" in call["command"]
     assert "incomplete" in call["command"]
     assert "PIPESTATUS[0]" in call["command"]
@@ -111,6 +124,17 @@ async def test_prompt_is_shell_quoted(tmp_path):
     assert environment.calls[-1]["env"]["SC_TURN_TIMEOUT_MS"] == "540000"
 
 
+@pytest.mark.asyncio
+async def test_dash_prefixed_prompt_is_passed_as_an_attached_option_value(tmp_path):
+    agent = make_agent(tmp_path)
+    environment = FakeEnvironment()
+
+    await agent.run("- Update the display grid", environment, AgentContext())
+
+    command = environment.calls[-1]["command"]
+    assert "--print='- Update the display grid'" in command
+
+
 def test_report_populates_native_harbor_metrics(tmp_path):
     report = {
         "schema_version": 1,
@@ -133,7 +157,15 @@ def test_report_populates_native_harbor_metrics(tmp_path):
     assert context.n_cache_tokens == 80
     assert context.n_output_tokens == 30
     assert context.cost_usd == 0.0123
-    assert context.metadata == {"subconscious_code": report}
+    assert context.metadata == {
+        "subconscious_code": report,
+        "offline_runtime": {
+            "enabled": True,
+            "bundle_sha256": None,
+            "control_plane_hosts": ["api.subconscious.dev"],
+            "bundle_source": "none",
+        },
+    }
 
 
 def test_explicit_install_artifacts_outrank_prebaked_binary(tmp_path):
@@ -141,6 +173,7 @@ def test_explicit_install_artifacts_outrank_prebaked_binary(tmp_path):
         tmp_path,
         binary_url="https://example.test/sc-x86_64-unknown-linux-gnu.tar.gz",
         binary_sha256="a" * 64,
+        offline=False,
     )
     command = agent._install_command()
 
@@ -158,7 +191,16 @@ def test_explicit_install_artifacts_outrank_prebaked_binary(tmp_path):
 
 def test_remote_binary_requires_a_checksum(tmp_path):
     with pytest.raises(ValueError, match="binary_sha256 is required"):
-        make_agent(tmp_path, binary_url="https://example.test/sc")
+        make_agent(tmp_path, binary_url="https://example.test/sc", offline=False)
+
+
+def test_remote_binary_is_rejected_by_default(tmp_path):
+    with pytest.raises(ValueError, match="unavailable in offline mode"):
+        make_agent(
+            tmp_path,
+            binary_url="https://example.test/sc",
+            binary_sha256="a" * 64,
+        )
 
 
 @pytest.mark.asyncio
@@ -171,8 +213,8 @@ async def test_direct_binary_upload_skips_package_manager(tmp_path):
     await agent.install(environment)
 
     assert environment.uploads == [(str(binary.resolve()), "/tmp/subconscious-code-sc")]
-    assert len(environment.calls) == 1, "direct binary should skip root package setup"
-    install_call = environment.calls[0]
+    assert len(environment.calls) == 2, "offline policy plus local install expected"
+    install_call = environment.calls[-1]
     assert install_call["env"]["SC_HARBOR_BINARY_PATH"] == "/tmp/subconscious-code-sc"
     assert install_call["env"]["SC_HARBOR_ARTIFACT_SHA256"] == hashlib.sha256(
         b"static-binary"
@@ -201,3 +243,79 @@ async def test_install_uploads_exact_source_bundle(tmp_path):
         b"archive"
     ).hexdigest()
     assert 'tar -xzf "$SC_HARBOR_SOURCE_ARCHIVE"' in install_call["command"]
+
+
+@pytest.mark.asyncio
+async def test_offline_setup_rejects_public_network(tmp_path):
+    binary = tmp_path / "sc"
+    binary.write_bytes(b"static-binary")
+    agent = make_agent(tmp_path, binary_path=binary)
+
+    with pytest.raises(RuntimeError, match="public or unknown networking"):
+        await agent.install(FakeEnvironment(network_mode="public"))
+
+
+@pytest.mark.asyncio
+async def test_offline_setup_rejects_github_allowlist(tmp_path):
+    binary = tmp_path / "sc"
+    binary.write_bytes(b"static-binary")
+    agent = make_agent(tmp_path, binary_path=binary)
+
+    with pytest.raises(RuntimeError, match="github.com"):
+        await agent.install(
+            FakeEnvironment(
+                network_mode="allowlist",
+                allowed_hosts=["api.subconscious.dev", "*.github.com"],
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_same_offline_bundle_is_uploaded_and_verified_for_sc(tmp_path):
+    bundle = tmp_path / "offline.tar.gz"
+    bundle.write_bytes(b"immutable bundle")
+    binary = tmp_path / "sc"
+    binary.write_bytes(b"static-binary")
+    agent = make_agent(tmp_path, binary_path=binary, offline_bundle=bundle)
+    environment = FakeEnvironment()
+
+    await agent.install(environment)
+
+    assert environment.uploads[0] == (
+        str(bundle.resolve()),
+        "/tmp/subconscious-offline-bundle.tar.gz",
+    )
+    extract_call = environment.calls[0]
+    assert hashlib.sha256(b"immutable bundle").hexdigest() in extract_call["command"]
+    assert "unsafe offline bundle member" in extract_call["command"]
+
+
+def make_mini_agent(logs_dir: Path, **kwargs) -> OfflineMiniSweAgent:
+    return OfflineMiniSweAgent(
+        logs_dir=logs_dir,
+        model_name="openai/subconscious/glm-5.2",
+        extra_env={"OPENAI_API_KEY": "test-key"},
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mini_swe_install_uses_only_prebaked_agent_or_wheelhouse(tmp_path):
+    bundle = tmp_path / "offline.tar.gz"
+    bundle.write_bytes(b"same immutable bundle")
+    agent = make_mini_agent(tmp_path, offline_bundle=bundle)
+    environment = FakeEnvironment()
+
+    await agent.install(environment)
+
+    install_call = environment.calls[-1]
+    assert "mini_swe_agent-*.whl" in install_call["command"]
+    assert "pip install" in install_call["command"]
+    assert "--no-index" in install_call["command"]
+    assert "apt-get" not in install_call["command"]
+    assert "astral.sh" not in install_call["command"]
+    assert "uv tool install" not in install_call["command"]
+    assert install_call["env"]["PIP_NO_INDEX"] == "1"
+    assert environment.uploads == [
+        (str(bundle.resolve()), "/tmp/subconscious-offline-bundle.tar.gz")
+    ]

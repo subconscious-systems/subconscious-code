@@ -6,12 +6,44 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  linux-binaries:
+  release-preflight:
+    name: Release preflight
     runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: astral-sh/setup-uv@v6
+      - name: Validate release tag and package versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/check-release-version.py --tag "$RELEASE_TAG"
+      - name: Check Rust workspace
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+      - name: Check DLR workspace
+        run: |
+          cargo fmt --manifest-path integrations/dlr/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path integrations/dlr/Cargo.toml \
+            --workspace --all-targets -- -D warnings
+          cargo test --locked --manifest-path integrations/dlr/Cargo.toml --workspace
+      - name: Check Harbor adapter
+        run: |
+          uv sync --project integrations/harbor --extra test --locked
+          uv run --project integrations/harbor pytest
+
+  linux-binaries:
+    needs: release-preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -41,16 +73,23 @@ jobs:
           cosign sign-blob --yes \
             --bundle "dist/sc-$TARGET.tar.gz.sha256.sigstore.json" \
             "dist/sc-$TARGET.tar.gz.sha256"
-      - uses: softprops/action-gh-release@v2
+          "target/$TARGET/release/sc" --version
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: sc-${{ matrix.target }}
+          path: |
             dist/sc-${{ matrix.target }}.tar.gz
             dist/sc-${{ matrix.target }}.tar.gz.sha256
             dist/sc-${{ matrix.target }}.tar.gz.sigstore.json
             dist/sc-${{ matrix.target }}.tar.gz.sha256.sigstore.json
+          if-no-files-found: error
 
   harbor-wheel:
+    needs: release-preflight
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -58,8 +97,31 @@ jobs:
       - name: Build Harbor adapter
         run: |
           uv build integrations/harbor --out-dir dist
-          sha256sum dist/* > dist/SHA256SUMS
+          sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
           cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harbor-wheel
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub release
+    needs: [linux-binaries, harbor-wheel]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: dist/*

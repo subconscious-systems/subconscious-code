@@ -43,11 +43,25 @@ struct SessionHeader {
 /// An append-only handle to a session's JSONL file. Flushes on every append
 /// so a crash leaves a valid prefix (crash recovery, §9).
 pub struct SessionStore {
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
     path: PathBuf,
+    /// Serialized header held until the first turn for a lazy fresh session.
+    /// Resumed and eagerly-created stores have already written it.
+    pending_header: Option<String>,
 }
 
 impl SessionStore {
+    fn serialized_header(session: &Session) -> Result<String> {
+        let header = SessionHeader {
+            id: session.id.clone(),
+            cwd: session.cwd.clone(),
+            model: session.model.clone(),
+            mode: session.mode,
+            extra_dirs: session.extra_dirs.clone(),
+        };
+        serde_json::to_string(&header).context("serializing session header")
+    }
+
     /// Create (or overwrite) a session file at `path`, writing the header.
     /// The caller picks the path — typically `~/.rc/sessions/<id>.jsonl`.
     pub fn create(path: PathBuf, session: &Session) -> Result<Self> {
@@ -62,25 +76,58 @@ impl SessionStore {
             .open(&path)
             .with_context(|| format!("creating session file {}", path.display()))?;
         let mut writer = BufWriter::new(file);
-        let header = SessionHeader {
-            id: session.id.clone(),
-            cwd: session.cwd.clone(),
-            model: session.model.clone(),
-            mode: session.mode,
-            extra_dirs: session.extra_dirs.clone(),
-        };
-        let line = serde_json::to_string(&header).context("serializing session header")?;
+        let line = Self::serialized_header(session)?;
         writeln!(writer, "{line}")?;
         writer.flush()?;
-        Ok(Self { writer, path })
+        Ok(Self {
+            writer: Some(writer),
+            path,
+            pending_header: None,
+        })
+    }
+
+    /// Prepare a fresh session store without touching the filesystem. The
+    /// header and first turn are created together on the first append, so
+    /// opening and quitting the TUI leaves no header-only orphan.
+    pub fn create_lazy(path: PathBuf, session: &Session) -> Result<Self> {
+        Ok(Self {
+            writer: None,
+            path,
+            pending_header: Some(Self::serialized_header(session)?),
+        })
+    }
+
+    fn ensure_writer(&mut self) -> Result<&mut BufWriter<File>> {
+        if self.writer.is_none() {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating session dir {}", parent.display()))?;
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .with_context(|| format!("creating session file {}", self.path.display()))?;
+            let mut writer = BufWriter::new(file);
+            let header = self.pending_header.take().ok_or_else(|| {
+                anyhow::anyhow!("lazy session store is missing its pending header")
+            })?;
+            writeln!(writer, "{header}")?;
+            self.writer = Some(writer);
+        }
+        self.writer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("session writer was not initialized"))
     }
 
     /// Append a turn as one JSON line, then flush (crash recovery: the file is
     /// always a valid prefix up to the last completed turn).
     pub fn append_turn(&mut self, turn: &Turn) -> Result<()> {
         let line = serde_json::to_string(turn).context("serializing turn")?;
-        writeln!(self.writer, "{line}")?;
-        self.writer.flush().context("flushing session file")?;
+        let writer = self.ensure_writer()?;
+        writeln!(writer, "{line}")?;
+        writer.flush().context("flushing session file")?;
         Ok(())
     }
 
@@ -100,8 +147,9 @@ impl SessionStore {
             .open(&path)
             .with_context(|| format!("opening session file for append: {}", path.display()))?;
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: Some(BufWriter::new(file)),
             path,
+            pending_header: None,
         })
     }
 }
@@ -523,6 +571,30 @@ mod tests {
         let store = SessionStore::create(nested.clone(), &session).unwrap();
         assert!(nested.exists());
         assert_eq!(store.path(), nested);
+    }
+
+    #[test]
+    fn lazy_store_creates_nothing_until_first_turn() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested/lazy.jsonl");
+        let session = Session::new("lazy".into(), dir.path().to_path_buf(), "model".into());
+        let mut store = SessionStore::create_lazy(path.clone(), &session).unwrap();
+
+        assert!(!path.exists(), "a turnless session must not create a file");
+        store
+            .append_turn(&Turn::User {
+                content: "hello".into(),
+                ts: std::time::SystemTime::now(),
+            })
+            .unwrap();
+
+        assert!(path.exists());
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.id, "lazy");
+        assert!(matches!(
+            loaded.messages.as_slice(),
+            [Turn::User { content, .. }] if content.as_ref() == "hello"
+        ));
     }
 
     #[test]

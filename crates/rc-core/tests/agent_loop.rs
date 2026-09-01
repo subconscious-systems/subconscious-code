@@ -202,6 +202,83 @@ async fn loop_runs_tool_then_answers() {
 }
 
 #[tokio::test]
+async fn benchmark_completion_review_is_bounded_and_runs_after_tool_work() {
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let responses = vec![
+        ModelResponse {
+            retries: 0,
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+                id: "c1".into(),
+                name: "Echo".into(),
+                arguments: r#"{"msg":"implemented"}"#.into(),
+            })],
+            finish_reason: rc_proto::FinishReason::ToolCalls,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "premature completion".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+        ModelResponse {
+            retries: 0,
+            text: "reviewed completion".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: rc_proto::FinishReason::Stop,
+            usage: None,
+        },
+    ];
+    let agent = AgentLoop::new(
+        Arc::new(MockModel::new(responses)),
+        registry,
+        Arc::new(AllowAllChecker),
+    )
+    .with_completion_review(true);
+    let mut session = Session::new(
+        "benchmark-completion-review".into(),
+        std::env::temp_dir(),
+        "mock".into(),
+    );
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "implement the change".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::Stop);
+    let completion_notes = session
+        .messages
+        .iter()
+        .filter(|turn| {
+            matches!(
+                turn,
+                Turn::SystemNote {
+                    kind: rc_core::NoteKind::Recovery,
+                    text,
+                } if text.contains("completion audit")
+            )
+        })
+        .count();
+    assert_eq!(completion_notes, 1, "review must be requested exactly once");
+    assert!(matches!(
+        session.messages.last(),
+        Some(Turn::Assistant { text, .. }) if text.as_ref() == "reviewed completion"
+    ));
+}
+
+#[tokio::test]
 async fn one_response_can_execute_multiple_tool_calls() {
     let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let responses = vec![

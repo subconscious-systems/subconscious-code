@@ -1,0 +1,7 @@
+{
+  "staging_image": "REPLACE_WITH_IMMUTABLE_EC2_IMAGE_ID",
+  "architecture": "x86_64",
+  "sc_release": "REPLACE_WITH_TAG_AND_RELEASE_SHA256",
+  "mini_swe_agent_version": "REPLACE_WITH_PINNED_VERSION",
+  "dependency_lock_sha256": "REPLACE_WITH_LOCKFILE_SHA256"
+}
