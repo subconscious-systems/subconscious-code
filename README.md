@@ -41,6 +41,27 @@ cd subconscious-code
 cargo install --locked --path crates/rc-cli
 ```
 
+### Install a Linux release
+
+Tagged releases provide static `x86_64` and `aarch64` Linux binaries. Replace
+`VERSION` with the release you want to install:
+
+```sh
+VERSION=v0.1.0
+TARGET=x86_64-unknown-linux-musl # or aarch64-unknown-linux-musl
+curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/sc-$TARGET.tar.gz"
+curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/sc-$TARGET.tar.gz.sha256"
+sha256sum --check "sc-$TARGET.tar.gz.sha256"
+tar -xzf "sc-$TARGET.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install -m 0755 sc "$HOME/.local/bin/sc"
+sc --version
+```
+
+Release archives and their checksum files include keyless Sigstore bundles;
+the [Harbor guide](integrations/harbor/README.md#install-on-the-benchmark-platform)
+shows how to verify the signing identity with Cosign.
+
 Configure the default Subconscious endpoint:
 
 ```sh
