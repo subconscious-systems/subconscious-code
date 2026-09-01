@@ -7,7 +7,7 @@ Describe the user-visible problem and the solution.
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --locked --workspace`
-- [ ] Relevant DLR or Harbor checks, if changed
+- [ ] Relevant DLR checks, if changed
 
 List any additional manual or automated checks:
 

@@ -58,17 +58,23 @@ install -m 0755 sc "$HOME/.local/bin/sc"
 sc --version
 ```
 
-Release archives and their checksum files include keyless Sigstore bundles;
-the [Harbor guide](integrations/harbor/README.md#install-on-the-benchmark-platform)
-shows how to verify the signing identity with Cosign.
+Release archives and their checksum files include keyless Sigstore bundles.
 
-Configure the default Subconscious endpoint:
+Launch `sc`. On first use, the CLI securely prompts for your Subconscious API
+key and saves it to `~/.sc/key` with user-only permissions:
+
+```sh
+cd /path/to/your/project
+sc
+```
+
+For automation, provide the key through the environment and verify the endpoint
+before running a headless task:
 
 ```sh
 export SC_API_KEY="your-api-key"
 sc doctor
-cd /path/to/your/project
-sc
+sc -p "explain the architecture and identify the main entry point"
 ```
 
 For another compatible provider, set its base URL and model. Custom providers
@@ -104,9 +110,8 @@ headless mode for code changes.
 | [Configuration](docs/CONFIGURATION.md) | Settings files, environment variables, permissions, DLR, and examples |
 | [Architecture](docs/ARCHITECTURE.md) | Crate boundaries, request flow, persistence, and transport design |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Endpoint, terminal, context-size, DLR, and sandbox problems |
-| [Benchmarks](docs/BENCHMARKS.md) | What the checked-in benchmark artifacts measure and how to reproduce them |
+| [Benchmarks](docs/BENCHMARKS.md) | How to reproduce transport and harness measurements |
 | [DLR sidecar](integrations/dlr/README.md) | Protocol status, local testing, deployment, and internals |
-| [Harbor adapter](integrations/harbor/README.md) | Reproducible benchmark integration |
 | [Contributing](CONTRIBUTING.md) | Development setup, tests, review expectations, and PR workflow |
 
 Please report vulnerabilities privately as described in
@@ -286,21 +291,22 @@ sc -p "explain src/"     # headless one-shot, prints the answer to stdout
 sc doctor --body-ladder    # measure the gateway's real maximum request size
 ```
 
-### Harbor benchmarks
+### Headless benchmarks
 
-The native Harbor adapter lives in
-[`integrations/harbor`](integrations/harbor/README.md). It packages `sc` as a
-first-class Harbor agent and maps its benchmark report into Harbor token,
-cache, cost, and timing metadata. Headless runs can emit that versioned report
-directly:
+The CLI can write a stable performance report and an ATIF v1.7 trajectory for
+headless evaluation runs:
 
 ```sh
-sc --benchmark-report report.json -p "fix the task"
+SC_API_KEY="your-api-key" sc \
+  --benchmark-report report.json \
+  --benchmark-trajectory trajectory.json \
+  -p "fix the task"
 ```
 
-Tagged releases publish the adapter wheel plus x86_64/aarch64 Linux binaries,
-so cloud sandboxes can download a pinned artifact instead of compiling Rust in
-every trial.
+The report contains timing, token, cost, retry, tool, and build-provenance
+fields without prompt or tool-result content. The trajectory is an explicit
+transcript artifact and may contain sensitive task data; review it before
+sharing.
 
 In the TUI: `Shift+Tab` cycles permission mode, `Esc` cancels a turn, `Ctrl+C`
 quits, `@` completes file paths, `/` completes commands (`/menu`, `/clear`,
@@ -797,8 +803,5 @@ rustup target add x86_64-unknown-linux-gnu
 cargo check -p rc-sandbox --target x86_64-unknown-linux-gnu --all-targets
 ```
 
-Milestones: chat completions (M0), streaming + tool loop (M1), core tools (M2),
-permissions (M3), TUI (M4), session persistence (M5), context assembly (M6),
-background shells + sandbox + rewind (M7), and the large-context/request
-track plus `sc doctor` (M8). Still ahead: MCP, hooks, skills, and full
-compaction — see `working-cli-plan.md`.
+Planned work is tracked in the repository issue tracker. MCP, hooks, skills,
+and full compaction are not yet part of the user-facing product.

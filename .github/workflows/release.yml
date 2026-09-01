@@ -17,7 +17,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: astral-sh/setup-uv@v6
       - name: Validate release tag and package versions
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -33,10 +32,6 @@ jobs:
           cargo clippy --locked --manifest-path integrations/dlr/Cargo.toml \
             --workspace --all-targets -- -D warnings
           cargo test --locked --manifest-path integrations/dlr/Cargo.toml --workspace
-      - name: Check Harbor adapter
-        run: |
-          uv sync --project integrations/harbor --extra test --locked
-          uv run --project integrations/harbor pytest
 
   linux-binaries:
     needs: release-preflight
@@ -84,34 +79,9 @@ jobs:
             dist/sc-${{ matrix.target }}.tar.gz.sha256.sigstore.json
           if-no-files-found: error
 
-  harbor-wheel:
-    needs: release-preflight
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Build Harbor adapter
-        run: |
-          uv build integrations/harbor --out-dir dist
-          sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
-          cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: harbor-wheel
-          path: |
-            dist/*.whl
-            dist/*.tar.gz
-            dist/SHA256SUMS
-            dist/SHA256SUMS.sigstore.json
-          if-no-files-found: error
-
   github-release:
     name: Publish GitHub release
-    needs: [linux-binaries, harbor-wheel]
+    needs: linux-binaries
     runs-on: ubuntu-24.04
     permissions:
       contents: write

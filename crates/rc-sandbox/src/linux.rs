@@ -22,7 +22,7 @@ use landlock::{Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, Rule
 use super::NETWORK_SYSCALLS;
 
 /// Host paths needed to execute normal developer toolchains without granting
-/// them write access. `/opt` is where Harbor/E2B task images install their
+/// them write access. `/opt` is where container task images often install their
 /// testbed Conda environment; omitting it made the sandbox reject the Python
 /// interpreter in most historical benchmark trajectories.
 const READ_ONLY_SYSTEM_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"];

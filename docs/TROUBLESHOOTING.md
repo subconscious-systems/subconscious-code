@@ -11,8 +11,10 @@ results of non-streaming, streaming, and tool-call checks.
 
 ## `no API key`
 
-Set the variable named by `provider.api_key_env` (`SC_API_KEY` by default), or
-use `/menu` → Change API key. Do not add a literal key to `settings.json`.
+Run bare `sc` in a terminal to complete the secure first-launch prompt, or set
+the variable named by `provider.api_key_env` (`SC_API_KEY` by default) for
+automation. Use `/menu` → Change API key to replace a saved key. Do not add a
+literal key to `settings.json`.
 
 ```sh
 export SC_API_KEY="your-api-key"

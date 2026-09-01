@@ -78,7 +78,8 @@ pub async fn run(settings: &Settings, body_ladder: bool) -> Result<bool> {
             Status::Fail("no API key — set $SC_API_KEY".into()).render("api key")
         );
         println!();
-        println!("Set the key and re-run: SC_API_KEY=... sc doctor");
+        println!("Run bare `sc` to save a key, or set SC_API_KEY for automation,");
+        println!("then re-run: sc doctor");
         return Ok(false);
     };
 
