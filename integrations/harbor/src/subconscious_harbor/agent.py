@@ -7,12 +7,18 @@ import json
 import os
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from harbor.agents.installed.base import BaseInstalledAgent, EnvVar, with_prompt_template
+from harbor.agents.installed.base import (
+    BaseInstalledAgent,
+    EnvVar,
+    with_prompt_template,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.paths import EnvironmentPaths
+
+from .offline import OFFLINE_ROOT, OfflineRuntime
 
 
 class SubconsciousCode(BaseInstalledAgent):
@@ -35,7 +41,7 @@ class SubconsciousCode(BaseInstalledAgent):
         "https://github.com/subconscious-systems/subconscious-code.git"
     )
 
-    ENV_VARS = [
+    ENV_VARS: ClassVar[list[EnvVar]] = [
         # GLM reasoning regularly exceeds the provider's implicit 4096-token
         # completion ceiling. Give benchmark turns enough room to finish one
         # thought while the core loop's no-progress guard bounds runaways.
@@ -64,11 +70,31 @@ class SubconsciousCode(BaseInstalledAgent):
         repository: str = _DEFAULT_REPOSITORY,
         revision: str | None = None,
         reuse_existing: bool = True,
+        offline: bool = True,
+        offline_bundle: str | Path | None = None,
+        offline_bundle_remote_path: str | None = None,
+        offline_bundle_sha256: str | None = None,
+        offline_control_plane_hosts: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        extra_env = kwargs.get("extra_env")
+        self._offline = OfflineRuntime(
+            enabled=offline,
+            bundle=offline_bundle,
+            bundle_remote_path=offline_bundle_remote_path,
+            bundle_sha256=offline_bundle_sha256,
+            control_plane_hosts=(
+                offline_control_plane_hosts
+                if offline_control_plane_hosts is not None
+                else OfflineRuntime.control_plane_hosts_from_env(extra_env)
+            ),
+        )
+        kwargs["extra_env"] = self._offline.merge_extra_env(extra_env)
         super().__init__(*args, **kwargs)
         self._binary_url = binary_url
         self._binary_sha256 = binary_sha256
+        if self._offline.enabled and self._binary_url:
+            raise ValueError("binary_url is unavailable in offline mode; use binary_path")
         if self._binary_url and not (
             self._binary_sha256 or os.environ.get("SC_HARBOR_BINARY_SHA256")
         ):
@@ -111,8 +137,10 @@ class SubconsciousCode(BaseInstalledAgent):
         return text.removeprefix("sc ").strip()
 
     async def install(self, environment: BaseEnvironment) -> None:
+        await self._offline.prepare(self, environment)
+
         # A directly uploaded binary needs no package-manager bootstrap.
-        if self._binary_path is None:
+        if not self._offline.enabled and self._binary_path is None:
             await self.exec_as_root(
                 environment,
                 command=(
@@ -151,7 +179,11 @@ class SubconsciousCode(BaseInstalledAgent):
                 self._REMOTE_BINARY if self._binary_path is not None else ""
             ),
             "SC_HARBOR_BINARY_URL": self._binary_url
-            or os.environ.get("SC_HARBOR_BINARY_URL", ""),
+            or (
+                ""
+                if self._offline.enabled
+                else os.environ.get("SC_HARBOR_BINARY_URL", "")
+            ),
             "SC_HARBOR_BINARY_SHA256": self._binary_sha256
             or os.environ.get("SC_HARBOR_BINARY_SHA256", ""),
             "SC_HARBOR_ARTIFACT_SHA256": self._binary_path_sha256
@@ -168,6 +200,8 @@ class SubconsciousCode(BaseInstalledAgent):
             "SC_HARBOR_REVISION": self._revision
             or os.environ.get("SC_HARBOR_REVISION")
             or (f"v{self._version}" if self._version else "main"),
+            "SC_HARBOR_OFFLINE": "1" if self._offline.enabled else "0",
+            "SC_HARBOR_OFFLINE_ROOT": OFFLINE_ROOT,
         }
         await self.exec_as_agent(
             environment,
@@ -205,9 +239,14 @@ elif [ -n "$SC_HARBOR_BINARY_URL" ]; then
 elif [ -n "$SC_HARBOR_SOURCE_ARCHIVE" ]; then
   printf '%s  %s\n' "$SC_HARBOR_SOURCE_SHA256" "$SC_HARBOR_SOURCE_ARCHIVE" | sha256sum -c -
   if ! command -v cargo >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-      sh -s -- -y --profile minimal
-    . "$HOME/.cargo/env"
+    if [ "$SC_HARBOR_OFFLINE" = 1 ]; then
+      printf '%s\n' 'cargo is required to build the uploaded source archive offline' >&2
+      exit 65
+    else
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+        sh -s -- -y --profile minimal
+      . "$HOME/.cargo/env"
+    fi
   fi
   source_parent="$(mktemp -d)"
   tar -xzf "$SC_HARBOR_SOURCE_ARCHIVE" -C "$source_parent"
@@ -215,9 +254,15 @@ elif [ -n "$SC_HARBOR_SOURCE_ARCHIVE" ]; then
   [ -f "$source_dir/Cargo.toml" ]
   cargo install --locked --path "$source_dir/crates/rc-cli" \
     --root "$HOME/.local" --force
+elif [ -x "$SC_HARBOR_OFFLINE_ROOT/payload/agents/sc" ]; then
+  install -m 0755 "$SC_HARBOR_OFFLINE_ROOT/payload/agents/sc" "$HOME/.local/bin/sc"
 elif [ "$SC_HARBOR_REUSE_EXISTING" = 1 ] && command -v sc >/dev/null 2>&1; then
   sc --version
 else
+  if [ "$SC_HARBOR_OFFLINE" = 1 ]; then
+    printf '%s\n' 'sc is not prebaked and payload/agents/sc is absent from the offline bundle' >&2
+    exit 65
+  fi
   if ! command -v cargo >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
       sh -s -- -y --profile minimal
@@ -319,7 +364,7 @@ sc --version'''
                 f"--model {shlex.quote(model)} "
                 f"--benchmark-report {shlex.quote(report_path)} "
                 f"--benchmark-trajectory {shlex.quote(trajectory_path)} "
-                f"--print {shlex.quote(instruction)} "
+                f"--print={shlex.quote(instruction)} "
                 f"2>&1 </dev/null | tee {shlex.quote(output_path)}; "
                 "sc_status=${PIPESTATUS[0]}; set -e; "
                 f"if [ ! -f {shlex.quote(report_path)} ]; then exit \"$sc_status\"; fi; "
@@ -347,7 +392,10 @@ sc --version'''
         cost = report.get("cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
             context.cost_usd = float(cost)
-        context.metadata = {"subconscious_code": report}
+        context.metadata = {
+            "subconscious_code": report,
+            "offline_runtime": self._offline.provenance(),
+        }
 
     @staticmethod
     def _nonnegative_int(value: Any) -> int | None:
