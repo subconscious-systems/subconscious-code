@@ -69,6 +69,11 @@ the answer.";
 const PARTIAL_ANSWER_RECOVERY: &str =
     "[harness recovery] Continue from the visible partial response \
 above without repeating it. Complete the task now.";
+const FINAL_REVIEW_RECOVERY: &str = "[benchmark completion gate] Before finalizing, perform one \
+independent completion audit. Inspect the final diff, map every acceptance requirement to the \
+implementation, and run the broadest relevant verification that is available after the last edit. \
+Do not treat self-authored tests alone as sufficient evidence. If verification fails or a \
+requirement is uncovered, fix it and verify again; otherwise provide the final answer.";
 /// At most one extra model request may be manufactured for a truncated answer.
 /// More attempts hide a serving/output-budget failure behind a loop of synthetic
 /// continuations and can keep benchmark tasks alive indefinitely.
@@ -481,6 +486,10 @@ pub struct AgentLoop {
     /// sentinel so the model sees it was cut. `0` disables it (truly
     /// unlimited); the default is [`HARD_TOOL_RESULT_CAP`].
     pub hard_tool_result_cap: usize,
+    /// Require one bounded independent review after a benchmark coding turn
+    /// first attempts to stop following tool work. Disabled for interactive
+    /// sessions; the CLI enables it when benchmark artifacts are requested.
+    pub completion_review: bool,
 }
 
 /// Default hard backstop on a single tool result: 1 MiB. A single runaway
@@ -510,6 +519,7 @@ impl AgentLoop {
             estimator: Estimator::new(),
             pricing: Pricing::ZERO,
             hard_tool_result_cap: HARD_TOOL_RESULT_CAP,
+            completion_review: false,
         }
     }
 
@@ -592,6 +602,12 @@ impl AgentLoop {
         self
     }
 
+    #[must_use]
+    pub fn with_completion_review(mut self, enabled: bool) -> Self {
+        self.completion_review = enabled;
+        self
+    }
+
     /// Token pricing for cost accounting, in integer micro-USD per million
     /// tokens (see [`crate::cost::Pricing`]). Integer per-million pricing keeps
     /// the running cost a true monoid — shard/reduce in any order, get the same
@@ -653,6 +669,8 @@ impl AgentLoop {
         let mut consecutive_investigation_rounds = 0u32;
         let mut length_recoveries_used = 0u32;
         let mut unconfirmed_tool_recoveries_used = 0u32;
+        let mut completion_review_used = false;
+        let mut tool_work_observed = false;
         loop {
             iters += 1;
             if iters > self.max_iters {
@@ -945,6 +963,21 @@ impl AgentLoop {
                         },
                     );
                     synthesize_interrupted(session, &assistant_calls, sink);
+                    if self.completion_review && tool_work_observed && !completion_review_used {
+                        completion_review_used = true;
+                        push_turn(
+                            session,
+                            sink,
+                            Turn::SystemNote {
+                                kind: crate::turn::NoteKind::Recovery,
+                                text: FINAL_REVIEW_RECOVERY.to_string(),
+                            },
+                        );
+                        tracing::debug!(
+                            "benchmark completion gate requested one final implementation audit"
+                        );
+                        continue;
+                    }
                     return Ok(LoopOutcome::Stop);
                 }
                 FinishReason::Length => {
@@ -1027,6 +1060,7 @@ impl AgentLoop {
             }
 
             let investigation_batch = is_investigation_batch(&exec_list);
+            tool_work_observed |= !exec_list.is_empty();
             let batch_checkpoint = Arc::new(Mutex::new(BatchCheckpoint::new(exec_list.len())));
             let results = match await_turn_budget(
                 execute_batch(

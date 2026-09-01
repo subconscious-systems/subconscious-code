@@ -500,13 +500,13 @@ impl ChatClient {
             if status.is_success() {
                 return Ok((resp, attempt));
             }
-            let transient = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
+            let retry_after = self.retry_after(&resp);
+            let text = resp.text().await.unwrap_or_default();
+            let transient = is_transient_status_body(status.as_u16(), &text);
             if transient && attempt < self.retry.max_retries {
                 // Honor `Retry-After` (seconds) if the server sent one, capped at
                 // max_delay; else exponential backoff.
-                let d = self
-                    .retry_after(&resp)
-                    .unwrap_or_else(|| self.backoff(attempt));
+                let d = retry_after.unwrap_or_else(|| self.backoff(attempt));
                 tracing::warn!(
                     status = status.as_u16(),
                     attempt,
@@ -516,7 +516,6 @@ impl ChatClient {
                 attempt += 1;
                 continue;
             }
-            let text = resp.text().await.unwrap_or_default();
             tracing::debug!("← {status}\n{text}");
             return Err((
                 ProtoError::Status {
@@ -801,6 +800,17 @@ impl ChatClient {
             Box::pin(resp.bytes_stream());
         Ok((Box::pin(EventStream::new(body)), retries, payload))
     }
+}
+
+fn is_transient_status_body(status: u16, body: &str) -> bool {
+    if matches!(status, 429 | 500 | 502 | 503 | 504) {
+        return true;
+    }
+    if status != 404 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("no router available") || body.contains("no available router")
 }
 
 fn gzip_is_unsupported(error: &ProtoError) -> bool {
@@ -1097,5 +1107,16 @@ mod tests {
                     .contains(&client.backoff(9))
             );
         }
+    }
+
+    #[test]
+    fn only_router_unavailable_404_is_transient() {
+        assert!(is_transient_status_body(
+            404,
+            r#"{"error":{"message":"Model 'x' not found or no router available"}}"#,
+        ));
+        assert!(!is_transient_status_body(404, "ordinary missing endpoint"));
+        assert!(is_transient_status_body(502, "bad gateway"));
+        assert!(!is_transient_status_body(401, "unauthorized"));
     }
 }

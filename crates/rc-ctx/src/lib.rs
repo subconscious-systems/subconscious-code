@@ -203,19 +203,29 @@ folder inventories or ‘everything in this folder’, call `List` once on that 
 `recursive: true` instead of probing with repeated `ls`, `find`, or `Glob` calls. If that inventory \
 needs descriptions from file contents, follow it with exactly \
 one `ReadMany` call containing every relevant text file, then answer; do not read those files one at \
-a time. When several independent searches are known, use one `GrepMany` call. For other independent \
+a time. Use `Grep`/`GrepMany` for content searches and `Glob` for file patterns instead of shelling \
+out to `grep`, `rg`, or `find`; these tools preserve workspace scoping and return structured \
+results. When several independent searches are known, use one `GrepMany` call. For other independent \
 reads, use one `ReadMany` call or issue them together in one parallel tool batch. Spend at most three \
 consecutive tool rounds investigating before consolidating what is \
 known, listing every remaining unknown, and fetching those unknowns together. Before emitting any \
 read-only call, collect every independent path or query already known \
 and include all of those calls in the same assistant response; do not narrate and then emit only the \
-first one. For a long generated document, create it in bounded `Append` chunks and use each \
+first one. For a short factual question, perform at least one cheap grounded inspection before \
+answering unless the existing conversation or tool output already establishes the answer; label \
+remaining uncertainty explicitly instead of substituting a shallow guess. For a long generated \
+document, create it in bounded `Append` chunks and use each \
 reported `new_size` as the next `expected_size`; do not attempt one completion-sized `Write`. \
 Independent `Write`, `Append`, or `Edit` calls may also share a response. The runtime runs safe reads \
 concurrently and serializes file edits in model order. Never batch calls when a later call depends on \
 an earlier call's result. While editing, run the narrowest relevant test or check. Run the full \
 workspace test suite once, at the end; rerun it only if that final run fails and you have applied a \
-fix. Do not repeat an unchanged passing test command. When you have enough information to answer, \
+fix. Do not repeat an unchanged passing test command. For implementation tasks, do not declare \
+completion merely because a narrow or self-authored test passes. Before the final answer, inspect \
+the final diff, map every acceptance requirement to the implementation, and run the broadest \
+relevant verification available after the last edit. If part of the requested verification cannot \
+run, perform a static review of that behavior and state the limitation. When you have enough \
+information to answer and this completion audit is satisfied, \
 stop calling tools and answer in plain text. Keep private reasoning proportional to the task; once \
 the next observable action is known, call the tool or answer instead of spending the completion \
 budget rehearsing it.";
@@ -590,6 +600,9 @@ mod tests {
         assert!(prompt.contains("narrowest relevant test or check"));
         assert!(prompt.contains("full workspace test suite once"));
         assert!(prompt.contains("Do not repeat an unchanged passing test command"));
+        assert!(prompt.contains("do not declare completion"));
+        assert!(prompt.contains("map every acceptance requirement"));
+        assert!(prompt.contains("self-authored test"));
         assert!(prompt.contains("Keep private reasoning proportional to the task"));
         assert!(prompt.contains("once the next observable action is known"));
     }

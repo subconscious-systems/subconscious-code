@@ -55,7 +55,7 @@ use tokio_util::sync::CancellationToken;
 )]
 struct Cli {
     /// One-shot headless mode: run the agent loop for PROMPT and print the answer (§5.8 U14).
-    #[arg(short, long, value_name = "PROMPT")]
+    #[arg(short, long, value_name = "PROMPT", allow_hyphen_values = true)]
     print: Option<String>,
 
     /// Write a stable JSON performance report for a headless run.
@@ -166,6 +166,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let benchmark_mode = cli.benchmark_report.is_some() || cli.benchmark_trajectory.is_some();
     let mut settings = Settings::load(&std::env::current_dir()?);
     let model_override = cli.model.clone();
     let base_url_override = cli.base_url.clone();
@@ -370,6 +371,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .with_max_tokens(max_tokens)
                 .with_temperature(temperature)
                 .with_reasoning_effort(reasoning_effort.clone())
+                .with_completion_review(benchmark_mode)
                 .with_sandbox(sandbox))
         };
 
@@ -676,7 +678,8 @@ fn fresh_session_id() -> String {
 
 #[cfg(test)]
 mod session_id_tests {
-    use super::fresh_session_id;
+    use super::{fresh_session_id, Cli};
+    use clap::Parser;
 
     #[test]
     fn fresh_session_ids_are_unique_header_safe_uuids() {
@@ -689,6 +692,14 @@ mod session_id_tests {
         assert!(first
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    }
+
+    #[test]
+    fn print_accepts_a_prompt_beginning_with_a_hyphen() {
+        let cli = Cli::try_parse_from(["sc", "--print", "- Update the display grid"])
+            .expect("dash-prefixed prompts are task content, not CLI flags");
+
+        assert_eq!(cli.print.as_deref(), Some("- Update the display grid"));
     }
 }
 
@@ -1940,13 +1951,14 @@ async fn run_tui(
         );
     }
 
-    // Persistence: a fresh session gets a new timestamped file; a resumed
-    // session re-opens its existing file in append mode (the header and old
-    // turns are already on disk — no rewrite, no risk of losing history).
+    // Persistence: a fresh session prepares a lazy store whose file is created
+    // with its first turn; a resumed session re-opens its existing file in
+    // append mode (the header and old turns are already on disk — no rewrite,
+    // no risk of losing history).
     //
-    // Created *after* the terminal check on purpose: creating it first left a
-    // header-only orphan file behind on every failed startup, and `--continue`
-    // would then pick that orphan as the newest session and resume nothing.
+    // Prepared *after* the terminal check on purpose. Fresh stores are also
+    // lazy, so both failed startup and opening/closing without a turn leave no
+    // header-only orphan for `--continue` to mistake for useful history.
     let is_resumed = resumed_path.is_some();
     let path = resumed_path.unwrap_or_else(|| sessions_dir.join(format!("{}.jsonl", session.id)));
     let store = if is_resumed {
@@ -1954,7 +1966,7 @@ async fn run_tui(
         // from the id would append somewhere else for imported session files.
         Some(rc_session::SessionStore::open_append(path)?)
     } else {
-        Some(rc_session::SessionStore::create(path, &session)?)
+        Some(rc_session::SessionStore::create_lazy(path, &session)?)
     };
 
     let runtime = rc_rt::Runtime::new(agent, session, store);

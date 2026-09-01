@@ -107,11 +107,14 @@ fn bash_description(cap: usize) -> String {
         )
     };
     format!(
-        "Run a shell command. `cd` persists across calls (a successful, in-workspace `cd` \
-updates the session's working directory). {limit}; the exit code is shown first. Default \
+        "Run a shell command. `cd` persists across calls only when its destination is inside \
+the workspace roots; otherwise the result says that the cwd was not persisted. {limit}; the \
+exit code is shown first. Full command output is safe to request because capture is already \
+bounded. Default \
 timeout 120s, max 600s. stdin is closed — commands that read input see EOF; use \
 non-interactive flags (`-y`, `--no-pager`, `git --no-pager`). Pipelines use `pipefail`, so \
-any failed stage makes the reported exit non-zero; avoid piping builds or tests to `head`/`tail`. \
+any failed stage makes the reported exit non-zero; do not pipe builds or tests to `head`/`tail`, \
+which hides useful diagnostics. \
 Set `run_in_background: true` \
 for long-running servers; output goes to a bounded rotating log file you can `Read` to check progress."
     )
@@ -231,22 +234,39 @@ impl Tool for Bash {
 
                 // M7: persist a successful, in-workspace `cd` into the live shell state.
                 // The agent loop syncs this back into ctx.cwd/session.cwd for later calls.
+                let mut cwd_note = None;
                 if exit == "0" {
                     if let Some(new_cwd) = infer_cwd(&inp.command, &ctx.cwd) {
-                        if let Ok(canon) =
-                            resolve_within(&ctx.allowed_roots, &ctx.cwd, &new_cwd.to_string_lossy())
-                        {
-                            if let Ok(mut shell_state) = ctx.shell_state.lock() {
-                                shell_state.cwd = canon;
+                        match resolve_within(
+                            &ctx.allowed_roots,
+                            &ctx.cwd,
+                            &new_cwd.to_string_lossy(),
+                        ) {
+                            Ok(canon) => {
+                                if let Ok(mut shell_state) = ctx.shell_state.lock() {
+                                    shell_state.cwd = canon;
+                                }
+                            }
+                            Err(_) => {
+                                cwd_note = Some(format!(
+                                    "note: cd to {} was not persisted (outside workspace roots); cwd remains {}",
+                                    new_cwd.display(),
+                                    ctx.cwd.display()
+                                ));
                             }
                         }
-                        // A cd outside the allowed roots ran (transient, in the subshell)
-                        // but is not persisted — the agent can't `cd` out of the workspace.
                     }
                 }
 
+                let mut content = format!("exit: {exit}\n{body}");
+                if let Some(note) = cwd_note {
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    content.push_str(&note);
+                }
                 Ok(ToolOutcome::Ok {
-                    content: format!("exit: {exit}\n{body}"),
+                    content,
                     truncated,
                     artifacts: Vec::new(),
                 })
@@ -1007,9 +1027,22 @@ mod tests {
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path());
         // /tmp (or its canonical form) is outside the tempdir root.
-        let _ = Bash::new().call(json!({"command": "cd /tmp"}), &ctx).await;
+        let out = Bash::new()
+            .call(json!({"command": "cd /tmp"}), &ctx)
+            .await
+            .unwrap();
         let live_cwd = ctx.shell_state.lock().unwrap().cwd.clone();
         assert_eq!(live_cwd, dir.path(), "cd escaped the workspace root");
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.contains("was not persisted"), "{content}");
+                assert!(
+                    content.contains(&dir.path().display().to_string()),
+                    "{content}"
+                );
+            }
+            other => panic!("expected successful transient cd, got {other:?}"),
+        }
     }
 
     #[tokio::test]

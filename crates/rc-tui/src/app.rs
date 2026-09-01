@@ -37,6 +37,17 @@ const TICK_BUSY: Duration = Duration::from_millis(8);
 /// Poll cadence while idle. Nothing is streaming, so there's no latency to
 /// optimize — a slower tick saves CPU (and battery) while the user reads.
 const TICK_IDLE: Duration = Duration::from_millis(33);
+/// A normal human cannot type the first character of the next prompt this
+/// quickly after Enter, but a terminal that has lost bracketed-paste framing
+/// can. Hold plain submissions briefly so an Enter-delimited paste can be
+/// reconstructed as one multiline prompt before anything reaches the runtime.
+const PASTE_RESCUE_WINDOW: Duration = Duration::from_millis(20);
+
+#[derive(Debug)]
+struct PendingSubmit {
+    text: String,
+    staged: Instant,
+}
 
 /// The transcript range occupied by one in-flight tool call. Tool details are
 /// useful while the call is running, but become noise once its terminal event
@@ -65,6 +76,10 @@ pub(crate) struct App {
     /// cwd, tool set, and permission roots, all built in `rc-cli` — so it
     /// quits and hands this back for the host to rebuild against.
     outcome: Option<crate::menu::Outcome>,
+    /// Plain prompts wait one tiny debounce window before dispatch. This is
+    /// the fallback for terminals/multiplexers that turn a multiline paste
+    /// into a burst of Char/Enter events instead of one bracketed Paste event.
+    pending_submit: Option<PendingSubmit>,
 }
 
 impl App {
@@ -93,6 +108,7 @@ impl App {
             quit: false,
             live_tools: HashMap::new(),
             outcome: None,
+            pending_submit: None,
         }
     }
 }
@@ -121,6 +137,7 @@ pub(crate) fn run(
     app.view.mode = initial_mode;
     loop {
         app.drain_events();
+        app.flush_pending_submit_if_due();
         terminal.draw(|f| view::draw(f, &mut app.view))?;
         // After the draw, never before: `view::draw` is what harvests the
         // selected text out of the finished buffer.
@@ -463,6 +480,15 @@ impl App {
             return;
         }
 
+        // If a terminal emitted an unbracketed multiline paste, the character
+        // or Enter immediately following a staged submit belongs to the same
+        // document. Restore the staged line to the composer before handling
+        // this key. A slower key flushes the real submit first and begins an
+        // ordinary draft for the next turn.
+        let paste_continuation = key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+            && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter);
+        self.resolve_pending_submit(paste_continuation);
+
         // `/menu` is modal: while it's open it consumes every key, so nothing
         // reaches the composer behind it.
         if self.view.menu_overlay.is_some() {
@@ -564,6 +590,16 @@ impl App {
 
         match key.code {
             KeyCode::Enter => {
+                if self.view.busy {
+                    if !self.view.composer.is_empty() {
+                        self.view.transcript.push(Line::styled(
+                            "· turn still running; draft kept in the composer",
+                            dim_style(),
+                        ));
+                        self.jump_to_bottom();
+                    }
+                    return;
+                }
                 if !self.view.composer.is_empty() {
                     let text = std::mem::take(&mut self.view.composer);
                     self.view.clear_paste_markers();
@@ -579,7 +615,10 @@ impl App {
                         // falls through and is submitted to the model verbatim.
                         self.run_slash(action);
                     } else {
-                        self.submit_prompt(text);
+                        self.pending_submit = Some(PendingSubmit {
+                            text,
+                            staged: Instant::now(),
+                        });
                     }
                     self.refresh_menu();
                     // A submit (or host-side command) is a "watch the result"
@@ -678,15 +717,28 @@ impl App {
     /// Native bracketed paste is deliberately separate from key handling:
     /// newlines stay inside the composer and cannot trigger Enter's submit arm.
     fn handle_paste(&mut self, text: &str) {
-        // Modal surfaces own their input. An open menu editor takes the paste
-        // (an API key is pasted, never typed); otherwise it is dropped rather
-        // than landing in the composer hidden behind the modal.
+        // A native paste can also be the continuation of a staged first line
+        // if the terminal only partially preserved bracketed-paste framing.
+        self.resolve_pending_submit(true);
+
+        // Modal editors own their input (notably the API-key field). A menu
+        // with no editor cannot accept the payload, so close it and preserve
+        // the text in the composer instead of dropping it behind the overlay.
         if let Some(menu) = self.view.menu_overlay.as_mut() {
-            menu.paste(text);
-            return;
+            if menu.paste(text) {
+                return;
+            }
+            self.view.menu_overlay = None;
+            self.view.transcript.push(Line::styled(
+                "· paste saved in the composer; menu closed",
+                dim_style(),
+            ));
         }
         if self.view.pending_ask.is_some() {
-            return;
+            self.view.transcript.push(Line::styled(
+                "· paste saved in the composer; answer the permission prompt to continue",
+                dim_style(),
+            ));
         }
         if self.view.append_paste(text) == 0 {
             return;
@@ -694,6 +746,32 @@ impl App {
         self.view.history_pos = None;
         self.view.last_input = Some(Instant::now());
         self.refresh_menu();
+    }
+
+    /// Resolve the tiny pre-submit debounce. `continuation` means the caller
+    /// is handling input that can belong to the same unbracketed paste; within
+    /// the rescue window the staged line is restored with its newline. Any
+    /// other input (or elapsed window) dispatches the staged prompt normally.
+    fn resolve_pending_submit(&mut self, continuation: bool) {
+        let Some(prompt) = resolve_staged_submit(
+            &mut self.pending_submit,
+            &mut self.view.composer,
+            Instant::now(),
+            continuation,
+        ) else {
+            return;
+        };
+        self.submit_prompt(prompt);
+    }
+
+    fn flush_pending_submit_if_due(&mut self) {
+        let due = self
+            .pending_submit
+            .as_ref()
+            .is_some_and(|pending| pending.staged.elapsed() >= PASTE_RESCUE_WINDOW);
+        if due {
+            self.resolve_pending_submit(false);
+        }
     }
 
     /// Recompute the completion menu from the current composer buffer. Clears
@@ -1480,6 +1558,27 @@ enum SlashAction {
 /// the same candidates — used to preserve the selection across keystrokes.
 fn same_menu(a: &Completion, b: &Completion) -> bool {
     a.kind == b.kind && a.candidates == b.candidates
+}
+
+/// Fold one staged submit back into the live composer when the next input
+/// proves it was an unbracketed paste continuation. Otherwise return the
+/// prompt for immediate dispatch. Kept runtime-free for regression tests.
+fn resolve_staged_submit(
+    pending: &mut Option<PendingSubmit>,
+    composer: &mut String,
+    now: Instant,
+    continuation: bool,
+) -> Option<String> {
+    let staged = pending.take()?;
+    if continuation && now.saturating_duration_since(staged.staged) <= PASTE_RESCUE_WINDOW {
+        let suffix = std::mem::take(composer);
+        *composer = staged.text;
+        composer.push('\n');
+        composer.push_str(&suffix);
+        None
+    } else {
+        Some(staged.text)
+    }
 }
 
 /// What `Esc` does in the current state. Factored out so the safety ordering
@@ -3012,6 +3111,76 @@ mod tests {
             candidates: vec!["/clear".into()],
         };
         assert!(!same_menu(&a, &d));
+    }
+
+    #[test]
+    fn rapid_enter_stream_is_reassembled_as_one_multiline_prompt() {
+        let start = Instant::now();
+        let mut composer = String::new();
+        let mut pending = Some(PendingSubmit {
+            text: "first line".into(),
+            staged: start,
+        });
+
+        // The first character after Enter arrives immediately: restore the
+        // staged line plus its newline, then continue collecting the paste.
+        assert!(resolve_staged_submit(
+            &mut pending,
+            &mut composer,
+            start + Duration::from_millis(1),
+            true,
+        )
+        .is_none());
+        composer.push_str("second line");
+        pending = Some(PendingSubmit {
+            text: std::mem::take(&mut composer),
+            staged: start + Duration::from_millis(2),
+        });
+
+        // A second rapid Enter/line is folded into the same pending prompt.
+        assert!(resolve_staged_submit(
+            &mut pending,
+            &mut composer,
+            start + Duration::from_millis(3),
+            true,
+        )
+        .is_none());
+        composer.push_str("third line");
+        pending = Some(PendingSubmit {
+            text: std::mem::take(&mut composer),
+            staged: start + Duration::from_millis(4),
+        });
+
+        let prompt = resolve_staged_submit(
+            &mut pending,
+            &mut composer,
+            start + PASTE_RESCUE_WINDOW + Duration::from_millis(5),
+            false,
+        )
+        .unwrap();
+        assert_eq!(prompt, "first line\nsecond line\nthird line");
+        assert!(composer.is_empty());
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn human_speed_input_dispatches_staged_prompt_before_new_draft() {
+        let start = Instant::now();
+        let mut composer = String::new();
+        let mut pending = Some(PendingSubmit {
+            text: "send this".into(),
+            staged: start,
+        });
+
+        let prompt = resolve_staged_submit(
+            &mut pending,
+            &mut composer,
+            start + PASTE_RESCUE_WINDOW + Duration::from_millis(1),
+            true,
+        )
+        .unwrap();
+        assert_eq!(prompt, "send this");
+        assert!(composer.is_empty());
     }
 
     #[test]

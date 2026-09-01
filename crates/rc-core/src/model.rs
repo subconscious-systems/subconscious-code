@@ -18,6 +18,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::{Stream, StreamExt};
 
+/// A 2xx response whose stream closes or fails before emitting any semantic
+/// content is a transport/proxy failure, not an assistant decision. Retry it a
+/// small, bounded number of times without changing the conversation history.
+const MAX_ZERO_SEMANTIC_STREAM_RETRIES: u32 = 2;
+const ZERO_SEMANTIC_STREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
 /// What the loop sends to a model.
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
@@ -59,9 +65,9 @@ pub enum FinalizedToolCall {
 pub enum ModelError {
     /// A request that failed at the protocol layer. `retries` is the number of
     /// wire-layer retries (429/5xx) that happened before the final failure, so a
-    /// persisted `Turn::Error` can record how hard the harness tried. Stream
-    /// events (`ev?` in `consume_stream`) carry `retries: 0` — they are not
-    /// retried at the wire layer.
+    /// persisted `Turn::Error` can record how hard the harness tried. A stream
+    /// that fails before semantic output may also be replayed by `ChatModel`;
+    /// those bounded recovery attempts are included here.
     #[error("proto: {error}")]
     Proto { error: ProtoError, retries: u32 },
 }
@@ -70,6 +76,27 @@ impl From<ProtoError> for ModelError {
     /// Stream-event errors are not wire retried, so they carry `retries: 0`.
     fn from(error: ProtoError) -> Self {
         ModelError::Proto { error, retries: 0 }
+    }
+}
+
+#[derive(Debug)]
+struct StreamAttemptError {
+    error: ModelError,
+    semantic_output: bool,
+}
+
+impl StreamAttemptError {
+    /// Replaying a request is safe only before the model has emitted anything
+    /// that could have been shown to the user or assembled into a tool call.
+    fn is_retryable_without_semantic_output(&self) -> bool {
+        !self.semantic_output
+            && matches!(
+                self.error,
+                ModelError::Proto {
+                    error: ProtoError::Http(_) | ProtoError::Idle(_),
+                    ..
+                }
+            )
     }
 }
 
@@ -96,9 +123,9 @@ pub trait EventSink: Send + Sync {
     fn on_artifact(&self, _call_id: &str, _tool: &str, _artifact: &Artifact) {}
     fn on_iter(&self, _count: u32, _max: u32) {}
     fn on_usage(&self, _usage: &Usage) {}
-    /// The request succeeded after `retries` wire-layer retries (429/5xx).
-    /// Fired once at the start of `ChatModel::complete` when `retries > 0`, so
-    /// the host can surface "retried N×" live. Wire retries are otherwise silent.
+    /// The request has survived `retries` transport recovery attempts. Fired
+    /// after a wire retry (429/5xx) or a safe replay of a zero-semantic stream,
+    /// so the host can surface "retried N×" live.
     fn on_retry(&self, _retries: u32) {}
     /// A raw SSE comment or partial frame arrived without a semantic delta.
     fn on_transport_activity(&self) {}
@@ -164,32 +191,104 @@ impl Model for ChatModel {
         req: ModelRequest,
         sink: &dyn EventSink,
     ) -> Result<ModelResponse, ModelError> {
-        let started = Instant::now();
-        let (stream, retries, payload) = match self
-            .client
-            .stream(&req.messages, &req.opts, &req.tools)
-            .await
-        {
-            Ok(response) => response,
-            Err((error, retries, payload)) => {
-                sink.on_request_payload(payload.json_bytes, payload.wire_bytes);
-                return Err(ModelError::Proto { error, retries });
+        let mut zero_semantic_stream_retries = 0u32;
+        let mut total_retries = 0u32;
+        let mut reported_retries = 0u32;
+        loop {
+            let started = Instant::now();
+            let (stream, wire_retries, payload) = match self
+                .client
+                .stream(&req.messages, &req.opts, &req.tools)
+                .await
+            {
+                Ok(response) => response,
+                Err((error, wire_retries, payload)) => {
+                    sink.on_request_payload(payload.json_bytes, payload.wire_bytes);
+                    return Err(ModelError::Proto {
+                        error,
+                        retries: total_retries.saturating_add(wire_retries),
+                    });
+                }
+            };
+            total_retries = total_retries.saturating_add(wire_retries);
+            sink.on_request_payload(payload.json_bytes, payload.wire_bytes);
+            sink.on_response_headers(started.elapsed());
+            if total_retries > reported_retries {
+                sink.on_retry(total_retries);
+                reported_retries = total_retries;
             }
-        };
-        sink.on_request_payload(payload.json_bytes, payload.wire_bytes);
-        sink.on_response_headers(started.elapsed());
-        if retries > 0 {
-            sink.on_retry(retries);
+            let attempt = consume_stream(
+                stream,
+                req.opts.idle_timeout,
+                self.reasoning_tag.as_deref(),
+                total_retries,
+                sink,
+            )
+            .await;
+            let mut response = match attempt {
+                Ok(response) => response,
+                Err(failure)
+                    if failure.is_retryable_without_semantic_output()
+                        && zero_semantic_stream_retries < MAX_ZERO_SEMANTIC_STREAM_RETRIES =>
+                {
+                    zero_semantic_stream_retries += 1;
+                    total_retries = total_retries.saturating_add(1);
+                    if total_retries > reported_retries {
+                        sink.on_retry(total_retries);
+                        reported_retries = total_retries;
+                    }
+                    tracing::warn!(
+                        attempt = zero_semantic_stream_retries,
+                        max_attempts = MAX_ZERO_SEMANTIC_STREAM_RETRIES,
+                        error = %failure.error,
+                        "model stream failed before semantic output; retrying identical request"
+                    );
+                    tokio::time::sleep(
+                        ZERO_SEMANTIC_STREAM_RETRY_BASE_DELAY
+                            .saturating_mul(zero_semantic_stream_retries),
+                    )
+                    .await;
+                    continue;
+                }
+                Err(failure) => return Err(failure.error),
+            };
+            if is_empty_stream_end(&response)
+                && zero_semantic_stream_retries < MAX_ZERO_SEMANTIC_STREAM_RETRIES
+            {
+                zero_semantic_stream_retries += 1;
+                total_retries = total_retries.saturating_add(1);
+                if total_retries > reported_retries {
+                    sink.on_retry(total_retries);
+                    reported_retries = total_retries;
+                }
+                tracing::warn!(
+                    attempt = zero_semantic_stream_retries,
+                    max_attempts = MAX_ZERO_SEMANTIC_STREAM_RETRIES,
+                    "model stream ended without semantic output; retrying identical request"
+                );
+                tokio::time::sleep(
+                    ZERO_SEMANTIC_STREAM_RETRY_BASE_DELAY
+                        .saturating_mul(zero_semantic_stream_retries),
+                )
+                .await;
+                continue;
+            }
+            response.retries = total_retries;
+            return Ok(response);
         }
-        consume_stream(
-            stream,
-            req.opts.idle_timeout,
-            self.reasoning_tag.as_deref(),
-            retries,
-            sink,
-        )
-        .await
     }
+}
+
+fn is_empty_stream_end(response: &ModelResponse) -> bool {
+    matches!(
+        &response.finish_reason,
+        FinishReason::Other(reason) if reason == "stream-ended"
+    ) && response.text.trim().is_empty()
+        && response
+            .reasoning
+            .as_deref()
+            .is_none_or(|reasoning| reasoning.trim().is_empty())
+        && response.tool_calls.is_empty()
 }
 
 /// Drive an [`AgentStreamEvent`] stream to completion: forward deltas to `sink`,
@@ -204,12 +303,13 @@ async fn consume_stream(
     reasoning_tag: Option<&str>,
     retries: u32,
     sink: &dyn EventSink,
-) -> Result<ModelResponse, ModelError> {
+) -> Result<ModelResponse, StreamAttemptError> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut finish_reason = FinishReason::Stop;
     let mut usage = None;
+    let mut semantic_output = false;
 
     loop {
         // T2: bound the gap between chunks. `None` preserves the legacy
@@ -219,7 +319,13 @@ async fn consume_stream(
             Some(d) => match tokio::time::timeout(d, stream.next()).await {
                 Ok(inner) => inner,
                 Err(_) => {
-                    return Err(ModelError::from(ProtoError::Idle(d)));
+                    return Err(StreamAttemptError {
+                        error: ModelError::Proto {
+                            error: ProtoError::Idle(d),
+                            retries,
+                        },
+                        semantic_output,
+                    });
                 }
             },
             None => stream.next().await,
@@ -227,16 +333,27 @@ async fn consume_stream(
         let Some(ev) = next else {
             break;
         };
-        match ev? {
+        let ev = match ev {
+            Ok(ev) => ev,
+            Err(error) => {
+                return Err(StreamAttemptError {
+                    error: ModelError::Proto { error, retries },
+                    semantic_output,
+                });
+            }
+        };
+        match ev {
             // A comment or partial SSE frame proves the response body is still
             // moving. Reaching this match already reset the per-event timeout;
             // it intentionally has no user-visible or persisted representation.
             AgentStreamEvent::TransportActivity => sink.on_transport_activity(),
             AgentStreamEvent::Text(t) => {
+                semantic_output |= !t.is_empty();
                 sink.on_text(&t);
                 text.push_str(&t);
             }
             AgentStreamEvent::Reasoning(r) => {
+                semantic_output |= !r.is_empty();
                 sink.on_reasoning(&r);
                 reasoning.push_str(&r);
             }
@@ -245,12 +362,16 @@ async fn consume_stream(
                 id,
                 name,
                 arguments,
-            } => sink.on_tool_delta(index, id.as_deref(), name.as_deref(), &arguments),
+            } => {
+                semantic_output = true;
+                sink.on_tool_delta(index, id.as_deref(), name.as_deref(), &arguments);
+            }
             AgentStreamEvent::ToolCallReady {
                 id,
                 name,
                 arguments,
             } => {
+                semantic_output = true;
                 // `arguments` arrives as an owned `String` from the stream parser;
                 // wrap it once here so every later re-send of this call is a
                 // refcount bump, not a copy.
@@ -269,6 +390,7 @@ async fn consume_stream(
                 error,
                 ..
             } => {
+                semantic_output = true;
                 tool_calls.push(FinalizedToolCall::ParseError {
                     id,
                     name,
@@ -372,6 +494,27 @@ mod tests {
         assert!(r.is_none());
     }
 
+    #[test]
+    fn only_semantically_empty_stream_end_is_retryable() {
+        let empty = ModelResponse {
+            text: String::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Other("stream-ended".into()),
+            usage: None,
+            retries: 0,
+        };
+        assert!(is_empty_stream_end(&empty));
+
+        let mut partial = empty.clone();
+        partial.reasoning = Some("still working".into());
+        assert!(!is_empty_stream_end(&partial));
+
+        let mut clean_stop = empty;
+        clean_stop.finish_reason = FinishReason::Stop;
+        assert!(!is_empty_stream_end(&clean_stop));
+    }
+
     // ---- T2: idle timeout (consume_stream) -----------------------------------
 
     use rc_proto::{FinishReason, ProtoError};
@@ -402,12 +545,15 @@ mod tests {
         assert!(
             matches!(
                 res,
-                Err(ModelError::Proto {
-                    error: ProtoError::Idle(_),
-                    ..
+                Err(StreamAttemptError {
+                    error: ModelError::Proto {
+                        error: ProtoError::Idle(_),
+                        ..
+                    },
+                    semantic_output: true,
                 })
             ),
-            "stalled stream should hit Idle, got {res:?}"
+            "stalled stream should hit Idle after semantic output, got {res:?}"
         );
         assert!(
             elapsed < Duration::from_secs(2),
@@ -457,6 +603,43 @@ mod tests {
         producer.await.unwrap();
         assert_eq!(response.text, "alive");
         assert_eq!(response.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn transport_failure_before_semantic_output_is_retryable() {
+        let stream = boxed(vec![
+            Ok(AgentStreamEvent::TransportActivity),
+            Err(ProtoError::Idle(Duration::from_secs(300))),
+        ]);
+
+        let failure = consume_stream(stream, None, None, 4, &NullSink)
+            .await
+            .expect_err("transport-only stream should fail");
+
+        assert!(!failure.semantic_output);
+        assert!(failure.is_retryable_without_semantic_output());
+        assert!(matches!(
+            failure.error,
+            ModelError::Proto {
+                error: ProtoError::Idle(_),
+                retries: 4,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_after_semantic_output_is_not_retryable() {
+        let stream = boxed(vec![
+            Ok(AgentStreamEvent::Text("partial".into())),
+            Err(ProtoError::Idle(Duration::from_secs(300))),
+        ]);
+
+        let failure = consume_stream(stream, None, None, 0, &NullSink)
+            .await
+            .expect_err("partial stream should fail");
+
+        assert!(failure.semantic_output);
+        assert!(!failure.is_retryable_without_semantic_output());
     }
 
     #[tokio::test]
