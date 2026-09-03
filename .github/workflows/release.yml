@@ -19,7 +19,7 @@ jobs:
     name: Release preflight
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
@@ -41,49 +41,69 @@ jobs:
             --workspace --all-targets -- -D warnings
           cargo test --locked --manifest-path integrations/dlr/Cargo.toml --workspace
 
-  linux-binaries:
+  release-binaries:
+    name: Release binary (${{ matrix.target }})
     needs: release-preflight
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       id-token: write
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            builder: cross
+            file_pattern: "x86-64"
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04
+            builder: cross
+            file_pattern: "ARM aarch64"
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            builder: cargo
+            file_pattern: "arm64"
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            builder: cargo
+            file_pattern: "x86_64"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@cross
+        if: runner.os == 'Linux'
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Build sc
-        run: cross build --locked --release --target "${{ matrix.target }}" --bin sc
+        run: ${{ matrix.builder }} build --locked --release --target "${{ matrix.target }}" --bin sc
       - name: Package and validate binary
         env:
+          FILE_PATTERN: ${{ matrix.file_pattern }}
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist/package
           cp "target/$TARGET/release/sc" dist/package/sc
           tar -C dist/package -czf "dist/sc-$TARGET.tar.gz" sc
-          (cd dist && sha256sum "sc-$TARGET.tar.gz" > "sc-$TARGET.tar.gz.sha256")
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "sc-$TARGET.tar.gz" > "sc-$TARGET.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "sc-$TARGET.tar.gz" > "sc-$TARGET.tar.gz.sha256")
+          fi
           cosign sign-blob --yes \
             --bundle "dist/sc-$TARGET.tar.gz.sigstore.json" \
             "dist/sc-$TARGET.tar.gz"
           cosign sign-blob --yes \
             --bundle "dist/sc-$TARGET.tar.gz.sha256.sigstore.json" \
             "dist/sc-$TARGET.tar.gz.sha256"
-          if [[ "$TARGET" == "x86_64-unknown-linux-musl" ]]; then
+          file "target/$TARGET/release/sc" | grep -F "$FILE_PATTERN"
+          if [[ "$TARGET" != "aarch64-unknown-linux-musl" ]]; then
             "target/$TARGET/release/sc" --version
-          else
-            file "target/$TARGET/release/sc" | grep -F "ARM aarch64"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sc-${{ matrix.target }}
           path: |
@@ -95,16 +115,16 @@ jobs:
 
   github-release:
     name: Publish GitHub release
-    needs: linux-binaries
+    needs: release-binaries
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
