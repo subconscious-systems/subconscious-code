@@ -1711,23 +1711,17 @@ pub(crate) fn turn_divider_line(
     lines_removed: usize,
 ) -> Line<'static> {
     let p = theme::palette();
-    let changed = lines_added.saturating_add(lines_removed);
-    let noun = if changed == 1 { "line" } else { "lines" };
-    let label = if changed == 0 {
+    let label = if lines_added == 0 && lines_removed == 0 {
         vec![Span::styled(
-            format!("worked for {duration} · 0 lines changed"),
+            format!("worked for {duration}"),
             p.accent_dim(),
         )]
     } else {
         vec![
-            Span::styled(
-                format!("worked for {duration} · {changed} {noun} changed ("),
-                p.accent_dim(),
-            ),
+            Span::styled(format!("worked for {duration} · "), p.accent_dim()),
             Span::styled(format!("+{lines_added}"), p.semantic(Color::Green)),
             Span::styled(" ", p.accent_dim()),
             Span::styled(format!("-{lines_removed}"), p.semantic(Color::Red)),
-            Span::styled(")", p.accent_dim()),
         ]
     };
     let mut spans = Vec::with_capacity(label.len() + 2);
@@ -3696,10 +3690,12 @@ mod tests {
 
         assert_eq!(divider.chars().count(), 120, "divider width: {divider:?}");
         assert!(
-            divider.starts_with("─ worked for 12.4s · 0 lines changed ─"),
+            divider.starts_with("─ worked for 12.4s ─"),
             "left-aligned duration: {divider:?}"
         );
-        assert!(divider.contains("0 lines changed"), "{divider:?}");
+        assert!(!divider.contains("changed"), "{divider:?}");
+        assert!(!divider.contains("+0"), "{divider:?}");
+        assert!(!divider.contains("-0"), "{divider:?}");
         assert!(divider.ends_with('─'), "right terminal edge: {divider:?}");
     }
 

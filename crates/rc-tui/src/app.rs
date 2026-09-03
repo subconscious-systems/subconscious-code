@@ -2306,28 +2306,106 @@ fn git_branch(dir: &Path) -> Option<String> {
     None
 }
 
-/// Put `text` on the *user's* clipboard with OSC 52.
+/// Put `text` on the user's clipboard.
 ///
-/// Not a clipboard crate on purpose: `sc` is routinely run over SSH, where the
-/// process has no access to the clipboard the user is actually pasting into —
-/// a local clipboard API would copy into the void on the remote host. OSC 52
-/// travels back down the same terminal connection and the terminal emulator
-/// does the copying, so it works identically local and remote.
+/// Local sessions prefer the OS clipboard because terminals may silently block
+/// OSC 52. tmux gets its purpose-built clipboard bridge. SSH and unsupported
+/// local environments fall back to OSC 52, which travels through the terminal
+/// connection to the clipboard on the user's machine.
 ///
 /// Inside tmux the sequence has to be wrapped in a DCS passthrough (and its
 /// ESCs doubled) or tmux swallows it. Terminals that refuse OSC 52 for
 /// security drop it silently — there is no reply to wait for — which is why
 /// select mode (Ctrl+O) stays as the fallback.
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    if std::env::var_os("TMUX").is_some()
+        && copy_with_command("tmux", &["load-buffer", "-w", "-"], text).is_ok()
+    {
+        return Ok(());
+    }
+    let remote =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    if !remote && copy_to_system_clipboard(text).is_ok() {
+        return Ok(());
+    }
+    copy_with_osc52(text)
+}
+
+fn copy_with_osc52(text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let osc = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
-    let seq = match std::env::var_os("TMUX") {
-        Some(_) => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
-        None => osc,
-    };
+    let seq = osc52_sequence(text, std::env::var_os("TMUX").is_some());
     let mut out = std::io::stdout();
     out.write_all(seq.as_bytes())?;
     out.flush()
+}
+
+fn osc52_sequence(text: &str, tmux: bool) -> String {
+    let osc = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    if tmux {
+        format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
+    } else {
+        osc
+    }
+}
+
+fn copy_with_command(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("clipboard command has no stdin"))?
+        .write_all(text.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "clipboard command exited with {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_to_system_clipboard(text: &str) -> std::io::Result<()> {
+    copy_with_command("pbcopy", &[], text)
+}
+
+#[cfg(target_os = "windows")]
+fn copy_to_system_clipboard(text: &str) -> std::io::Result<()> {
+    copy_with_command("clip.exe", &[], text)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_to_system_clipboard(text: &str) -> std::io::Result<()> {
+    for (program, args) in [
+        ("wl-copy", &[][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+        ("xsel", &["--clipboard", "--input"][..]),
+    ] {
+        if copy_with_command(program, args, text).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no supported system clipboard command",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn copy_to_system_clipboard(_text: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no system clipboard integration for this platform",
+    ))
 }
 
 /// Standard-alphabet base64 with padding (RFC 4648).
@@ -2475,7 +2553,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(divider.contains("worked for 1m 15s"), "{divider}");
-        assert!(divider.contains("3 lines changed (+2 -1)"), "{divider}");
+        assert!(divider.contains("· +2 -1"), "{divider}");
+        assert!(!divider.contains("changed"), "{divider}");
         assert!(view.turn_file_changes.is_empty());
         assert!(!view.busy);
 
@@ -2596,6 +2675,15 @@ mod tests {
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         // Non-ASCII goes through as its UTF-8 bytes.
         assert_eq!(base64("é".as_bytes()), "w6k=");
+    }
+
+    #[test]
+    fn osc52_sequence_supports_direct_and_tmux_terminals() {
+        let direct = osc52_sequence("copy me", false);
+        assert_eq!(direct, "\x1b]52;c;Y29weSBtZQ==\x07");
+
+        let tmux = osc52_sequence("copy me", true);
+        assert_eq!(tmux, "\x1bPtmux;\x1b\x1b]52;c;Y29weSBtZQ==\x07\x1b\\");
     }
 
     /// A selection reads the same whichever way it was dragged.

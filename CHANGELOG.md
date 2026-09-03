@@ -10,6 +10,16 @@ All notable changes to Subconscious Code are documented here. This project uses
 - Interactive follow-up queue: press `Tab` during a turn to queue the current
   draft, or `Esc` to hand it off after the active tool call.
 
+### Changed
+
+- Turn dividers show only elapsed time unless files changed, then add compact
+  `+N -N` counts without redundant prose.
+
+### Fixed
+
+- In-app copy now uses native system clipboards locally and tmux's clipboard
+  bridge when available, with OSC 52 retained for remote sessions.
+
 ## [0.1.0] - 2026-09-01
 
 Initial public release.
