@@ -83,7 +83,8 @@ Useful controls:
 | `/` | Show available slash commands |
 | `/menu` | Open projects, sessions, API key, and settings |
 | `Shift+Tab` | Cycle permission mode |
-| `Esc` | Interrupt the active turn |
+| `Tab` | Queue the current draft during an active turn |
+| `Esc` | Stop, or send a queued message after the active tool call |
 | `Ctrl+O` | Release/capture the mouse for native terminal selection |
 | `Ctrl+C` | Quit |
 

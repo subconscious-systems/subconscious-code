@@ -123,10 +123,20 @@ impl Runtime {
 
     /// Push a user action (sync — safe from any thread/task).
     pub fn action(&self, action: UserAction) {
+        self.try_action(action);
+    }
+
+    /// Try to push a user action, returning whether the runtime accepted it.
+    /// Interactive hosts use this when they must only mutate local UI state
+    /// after the matching action is safely in the runtime queue.
+    pub fn try_action(&self, action: UserAction) -> bool {
         if self.actions_tx.try_send(action).is_err() {
             self.events_tx.send(AgentEvent::Notice(
                 "runtime action queue is full; input was not accepted".into(),
             ));
+            false
+        } else {
+            true
         }
     }
 

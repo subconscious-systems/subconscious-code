@@ -6,7 +6,7 @@
 //! `Runtime`/`EventStream` are kept separate so a `ratatui::backend::TestBackend`
 //! render test needs no tokio and no model.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -80,6 +80,12 @@ pub(crate) struct App {
     /// the fallback for terminals/multiplexers that turn a multiline paste
     /// into a burst of Char/Enter events instead of one bracketed Paste event.
     pending_submit: Option<PendingSubmit>,
+    /// Prompts accepted by the runtime queue. They render only when `Ready`
+    /// follows the previous turn's terminal boundary.
+    queued_prompts: VecDeque<String>,
+    /// Esc with a queued prompt waits for the current parallel tool batch to
+    /// finish, then cancels the turn so the runtime starts that prompt.
+    send_queued_after_tool: bool,
 }
 
 impl App {
@@ -109,6 +115,8 @@ impl App {
             live_tools: HashMap::new(),
             outcome: None,
             pending_submit: None,
+            queued_prompts: VecDeque::new(),
+            send_queued_after_tool: false,
         }
     }
 }
@@ -188,6 +196,19 @@ impl App {
     }
 
     fn apply(&mut self, ev: AgentEvent) {
+        // A queued prompt belongs in transcript/history at its real turn
+        // boundary, not when Tab is pressed in the middle of the prior answer.
+        if matches!(&ev, AgentEvent::Ready) && !self.view.busy {
+            if let Some(prompt) = self.queued_prompts.pop_front() {
+                self.record_prompt(&prompt);
+                self.begin_turn_display();
+                self.view.queued_messages = self.queued_prompts.len();
+                self.send_queued_after_tool = false;
+                self.view.queued_after_tool = false;
+            }
+        }
+
+        let mut cancel_after_tool = false;
         let v = &mut self.view;
         match ev {
             AgentEvent::Text(t) => {
@@ -274,6 +295,11 @@ impl App {
                 if v.running == 0 {
                     v.running_tool = None;
                     v.begin_reasoning_phase(Instant::now());
+                    if self.send_queued_after_tool {
+                        self.send_queued_after_tool = false;
+                        v.queued_after_tool = false;
+                        cancel_after_tool = true;
+                    }
                 }
             }
             AgentEvent::Artifact {
@@ -359,6 +385,9 @@ impl App {
                 collapse_unfinished_tool_calls(v, &mut self.live_tools, Instant::now());
                 finish_turn(v);
             }
+        }
+        if cancel_after_tool {
+            self.runtime.action(UserAction::Cancel);
         }
     }
 
@@ -498,6 +527,22 @@ impl App {
 
         // While an ask is open, only the answer keys are live; Enter is a no-op.
         if let Some(ask) = self.view.pending_ask.take() {
+            if key.code == KeyCode::Esc {
+                match esc_action(&self.view) {
+                    EscAction::QueueAfterTool => {
+                        self.arm_queued_after_tool();
+                        // Denial completes this tool call, whose ToolEnd is the
+                        // handoff boundary that starts the queued prompt.
+                        self.runtime.action(UserAction::PermissionAnswer {
+                            id: ask.id,
+                            response: AskResponse::Deny("declined".into()),
+                        });
+                    }
+                    EscAction::Cancel => self.cancel_active_turn(),
+                    _ => self.view.pending_ask = Some(ask),
+                }
+                return;
+            }
             let response = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(AskResponse::Once),
                 KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -506,7 +551,7 @@ impl App {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     Some(AskResponse::Always(suggested_rule(&ask.tool, &ask.input)))
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
                     Some(AskResponse::Deny("declined".into()))
                 }
                 _ => None,
@@ -631,7 +676,8 @@ impl App {
                 // Esc is overloaded by state, and the ordering matters: a
                 // drafted prompt must never be lost to a stray Esc. See
                 // [`esc_action`] for the decision table.
-                EscAction::Cancel => self.runtime.action(UserAction::Cancel),
+                EscAction::QueueAfterTool => self.arm_queued_after_tool(),
+                EscAction::Cancel => self.cancel_active_turn(),
                 EscAction::RestoreDraft => {
                     // Browsing history → return to the live draft, not clear it.
                     self.view.history_pos = None;
@@ -651,6 +697,7 @@ impl App {
                     self.quit = true;
                 }
             },
+            KeyCode::Tab if self.view.busy => self.queue_composer(),
             KeyCode::BackTab => {
                 // Shift+Tab: cycle the permission mode
                 // (Default -> AcceptEdits -> Plan -> Ask -> Auto -> Default).
@@ -1050,23 +1097,25 @@ impl App {
         self.refresh_menu();
     }
 
-    /// Submit `text` to the model as a normal user turn: echo the prompt line,
-    /// mark the turn in flight (so the spinner shows the instant Enter is
-    /// pressed, before the driver is Ready), and dispatch `UserAction::Submit`.
-    /// Shared by the plain-prompt path and the prompt-expansion slash commands.
-    fn submit_prompt(&mut self, text: String) {
-        self.view.transcript.push(user_prompt_line(&text));
+    /// Echo a prompt at its actual turn boundary and retain it for history.
+    fn record_prompt(&mut self, text: &str) {
+        self.view.transcript.push(user_prompt_line(text));
         // Record the prompt for Alt+↑/↓ recall (deduped, bash-style), and leave
         // history-browsing mode — a fresh submit always returns to the live
         // draft.
-        push_history(&mut self.view.prompt_history, text.clone());
+        push_history(&mut self.view.prompt_history, text.to_owned());
         self.view.history_pos = None;
         self.view.history_draft.clear();
         // Persist the prompt for cross-session recall. Best-effort — a failed
         // append never blocks the turn.
         if let Some(p) = sc_history_path() {
-            append_history(&p, &text);
+            append_history(&p, text);
         }
+    }
+
+    /// Optimistically mark a turn in flight so the spinner appears without
+    /// waiting for the driver's `Ready` event.
+    fn begin_turn_display(&mut self) {
         // Optimistically mark the turn in flight so the "thinking" indicator
         // appears the instant Enter is pressed — there's a real gap between
         // Submit and the driver's Ready during which the screen would
@@ -1085,7 +1134,59 @@ impl App {
         self.view.context_tokens = None;
         self.view.context_tokens_estimated = false;
         self.view.cache_hit_rate = None;
-        self.runtime.action(UserAction::Submit(text));
+    }
+
+    /// Submit `text` to the model as a normal user turn: echo the prompt line,
+    /// mark the turn in flight, and dispatch `UserAction::Submit`.
+    fn submit_prompt(&mut self, text: String) {
+        if !self.runtime.try_action(UserAction::Submit(text.clone())) {
+            return;
+        }
+        self.record_prompt(&text);
+        self.begin_turn_display();
+    }
+
+    /// Queue the current draft behind the running turn. The runtime owns the
+    /// execution queue; this mirror exists only to render each prompt when its
+    /// turn starts rather than interleaving it with an active answer.
+    fn queue_composer(&mut self) {
+        if self.view.composer.is_empty() {
+            return;
+        }
+        let text = self.view.composer.clone();
+        if !self.runtime.try_action(UserAction::Queue(text.clone())) {
+            return;
+        }
+        self.view.composer.clear();
+        self.view.clear_paste_markers();
+        self.view.history_pos = None;
+        self.view.history_draft.clear();
+        self.queued_prompts.push_back(text);
+        self.view.queued_messages = self.queued_prompts.len();
+        let count = self.view.queued_messages;
+        let noun = if count == 1 { "message" } else { "messages" };
+        self.view.transcript.push(Line::styled(
+            format!("· queued {count} {noun} — Esc sends after the next tool call"),
+            dim_style(),
+        ));
+        self.refresh_menu();
+        self.jump_to_bottom();
+    }
+
+    fn arm_queued_after_tool(&mut self) {
+        self.send_queued_after_tool = true;
+        self.view.queued_after_tool = true;
+        self.view.transcript.push(Line::styled(
+            "· queued message will send after the current tool call".to_string(),
+            dim_style(),
+        ));
+        self.jump_to_bottom();
+    }
+
+    fn cancel_active_turn(&mut self) {
+        self.send_queued_after_tool = false;
+        self.view.queued_after_tool = false;
+        self.runtime.action(UserAction::Cancel);
     }
 
     /// Push a styled info block: one accent heading line, then chrome body
@@ -1141,6 +1242,9 @@ impl App {
                     .push(mk("  Shift+Tab    cycle permission mode"));
                 self.view
                     .transcript
+                    .push(mk("  Tab          queue a draft during an active turn"));
+                self.view
+                    .transcript
                     .push(mk("  PgUp/PgDn    scroll the transcript"));
                 self.view
                     .transcript
@@ -1155,7 +1259,7 @@ impl App {
                     .transcript
                     .push(mk("  Ctrl+W / U   delete word / clear the line"));
                 self.view.transcript.push(mk(
-                    "  Esc          interrupt a turn · clear a draft · quit when idle",
+                    "  Esc          stop · send queued after tool · clear · quit",
                 ));
                 self.view.transcript.push(mk("  Ctrl+C       quit"));
                 self.view.transcript.push(mk(
@@ -1585,6 +1689,7 @@ fn resolve_staged_submit(
 /// (never quit and lose a drafted prompt to a stray Esc) is testable with no
 /// `Runtime`. Priority:
 ///
+///   busy + queue  → QueueAfterTool (a second Esc cancels immediately)
 ///   busy          → Cancel the in-flight turn
 ///   browsing hist → RestoreDraft (return to the live draft, not clear it)
 ///   draft present → Clear the composer (a second Esc, now empty, quits)
@@ -1593,7 +1698,9 @@ fn resolve_staged_submit(
 /// The menu and ask handlers `return` before the keymap reaches `Esc`, so this
 /// only fires on a bare Esc with neither overlay open.
 fn esc_action(state: &crate::view::ViewState) -> EscAction {
-    if state.busy {
+    if state.busy && state.queued_messages > 0 && !state.queued_after_tool {
+        EscAction::QueueAfterTool
+    } else if state.busy {
         EscAction::Cancel
     } else if state.history_pos.is_some() {
         EscAction::RestoreDraft
@@ -1607,6 +1714,7 @@ fn esc_action(state: &crate::view::ViewState) -> EscAction {
 /// The resolved effect of an `Esc` press. See [`esc_action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscAction {
+    QueueAfterTool,
     Cancel,
     RestoreDraft,
     Clear,
@@ -2198,28 +2306,106 @@ fn git_branch(dir: &Path) -> Option<String> {
     None
 }
 
-/// Put `text` on the *user's* clipboard with OSC 52.
+/// Put `text` on the user's clipboard.
 ///
-/// Not a clipboard crate on purpose: `sc` is routinely run over SSH, where the
-/// process has no access to the clipboard the user is actually pasting into —
-/// a local clipboard API would copy into the void on the remote host. OSC 52
-/// travels back down the same terminal connection and the terminal emulator
-/// does the copying, so it works identically local and remote.
+/// Local sessions prefer the OS clipboard because terminals may silently block
+/// OSC 52. tmux gets its purpose-built clipboard bridge. SSH and unsupported
+/// local environments fall back to OSC 52, which travels through the terminal
+/// connection to the clipboard on the user's machine.
 ///
 /// Inside tmux the sequence has to be wrapped in a DCS passthrough (and its
 /// ESCs doubled) or tmux swallows it. Terminals that refuse OSC 52 for
 /// security drop it silently — there is no reply to wait for — which is why
 /// select mode (Ctrl+O) stays as the fallback.
 fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    if std::env::var_os("TMUX").is_some()
+        && copy_with_command("tmux", &["load-buffer", "-w", "-"], text).is_ok()
+    {
+        return Ok(());
+    }
+    let remote =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    if !remote && copy_to_system_clipboard(text).is_ok() {
+        return Ok(());
+    }
+    copy_with_osc52(text)
+}
+
+fn copy_with_osc52(text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let osc = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
-    let seq = match std::env::var_os("TMUX") {
-        Some(_) => format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b")),
-        None => osc,
-    };
+    let seq = osc52_sequence(text, std::env::var_os("TMUX").is_some());
     let mut out = std::io::stdout();
     out.write_all(seq.as_bytes())?;
     out.flush()
+}
+
+fn osc52_sequence(text: &str, tmux: bool) -> String {
+    let osc = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    if tmux {
+        format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
+    } else {
+        osc
+    }
+}
+
+fn copy_with_command(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("clipboard command has no stdin"))?
+        .write_all(text.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "clipboard command exited with {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_to_system_clipboard(text: &str) -> std::io::Result<()> {
+    copy_with_command("pbcopy", &[], text)
+}
+
+#[cfg(target_os = "windows")]
+fn copy_to_system_clipboard(text: &str) -> std::io::Result<()> {
+    copy_with_command("clip.exe", &[], text)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_to_system_clipboard(text: &str) -> std::io::Result<()> {
+    for (program, args) in [
+        ("wl-copy", &[][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+        ("xsel", &["--clipboard", "--input"][..]),
+    ] {
+        if copy_with_command(program, args, text).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no supported system clipboard command",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn copy_to_system_clipboard(_text: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no system clipboard integration for this platform",
+    ))
 }
 
 /// Standard-alphabet base64 with padding (RFC 4648).
@@ -2367,7 +2553,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(divider.contains("worked for 1m 15s"), "{divider}");
-        assert!(divider.contains("3 lines changed (+2 -1)"), "{divider}");
+        assert!(divider.contains("· +2 -1"), "{divider}");
+        assert!(!divider.contains("changed"), "{divider}");
         assert!(view.turn_file_changes.is_empty());
         assert!(!view.busy);
 
@@ -2488,6 +2675,15 @@ mod tests {
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         // Non-ASCII goes through as its UTF-8 bytes.
         assert_eq!(base64("é".as_bytes()), "w6k=");
+    }
+
+    #[test]
+    fn osc52_sequence_supports_direct_and_tmux_terminals() {
+        let direct = osc52_sequence("copy me", false);
+        assert_eq!(direct, "\x1b]52;c;Y29weSBtZQ==\x07");
+
+        let tmux = osc52_sequence("copy me", true);
+        assert_eq!(tmux, "\x1bPtmux;\x1b\x1b]52;c;Y29weSBtZQ==\x07\x1b\\");
     }
 
     /// A selection reads the same whichever way it was dragged.
@@ -3195,9 +3391,18 @@ mod tests {
         s.composer = "half-typed prompt".into();
         assert_eq!(esc_action(&s), EscAction::Clear);
 
-        // Busy always cancels the turn, even with a draft present.
+        // Busy with no queue cancels the turn, even with a draft present.
         s.busy = true;
         assert_eq!(esc_action(&s), EscAction::Cancel);
+
+        // A queued follow-up makes the first Esc wait for the current tool
+        // boundary; once armed, a second Esc still cancels immediately.
+        s.queued_messages = 1;
+        assert_eq!(esc_action(&s), EscAction::QueueAfterTool);
+        s.queued_after_tool = true;
+        assert_eq!(esc_action(&s), EscAction::Cancel);
+        s.queued_messages = 0;
+        s.queued_after_tool = false;
         s.busy = false;
 
         // Browsing history → restore the stashed draft, not clear.

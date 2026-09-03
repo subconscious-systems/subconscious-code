@@ -175,6 +175,10 @@ pub(crate) struct ViewState {
     /// Cleared when the next preflight estimate arrives to avoid stale rates.
     pub cache_hit_rate: Option<f64>,
     pub busy: bool,
+    /// Follow-up prompts accepted by the runtime but not started yet.
+    pub queued_messages: usize,
+    /// Whether Esc has armed cancellation at the end of the current tool batch.
+    pub queued_after_tool: bool,
     pub pending_ask: Option<PendingAsk>,
     pub composer: String,
     /// Multiline regions displayed as `[pasted N lines]` instead of expanding
@@ -318,6 +322,8 @@ impl ViewState {
             context_tokens_estimated: false,
             cache_hit_rate: None,
             busy: false,
+            queued_messages: 0,
+            queued_after_tool: false,
             pending_ask: None,
             composer: String::new(),
             paste_markers: Vec::new(),
@@ -1664,7 +1670,7 @@ fn draw_status(frame: &mut Frame, state: &ViewState, area: Rect, now: Instant) {
     }
 
     // Right side: a context-sensitive hint. Scrolled up shows the held-view
-    // indicator (where the new content is); busy shows the interrupt key;
+    // indicator (where the new content is); busy shows the stop/queue keys;
     // idle shows the discoverability hint. Right-aligned so it parks at the
     // screen edge instead of trailing the left content.
     let right = right_hint(state);
@@ -1705,23 +1711,17 @@ pub(crate) fn turn_divider_line(
     lines_removed: usize,
 ) -> Line<'static> {
     let p = theme::palette();
-    let changed = lines_added.saturating_add(lines_removed);
-    let noun = if changed == 1 { "line" } else { "lines" };
-    let label = if changed == 0 {
+    let label = if lines_added == 0 && lines_removed == 0 {
         vec![Span::styled(
-            format!("worked for {duration} · 0 lines changed"),
+            format!("worked for {duration}"),
             p.accent_dim(),
         )]
     } else {
         vec![
-            Span::styled(
-                format!("worked for {duration} · {changed} {noun} changed ("),
-                p.accent_dim(),
-            ),
+            Span::styled(format!("worked for {duration} · "), p.accent_dim()),
             Span::styled(format!("+{lines_added}"), p.semantic(Color::Green)),
             Span::styled(" ", p.accent_dim()),
             Span::styled(format!("-{lines_removed}"), p.semantic(Color::Red)),
-            Span::styled(")", p.accent_dim()),
         ]
     };
     let mut spans = Vec::with_capacity(label.len() + 2);
@@ -1807,9 +1807,30 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
         return vec![Span::styled(indicator, p.body())];
     }
     if state.busy {
+        if state.queued_after_tool {
+            return vec![
+                Span::styled("queued after tool", p.body()),
+                Span::styled(" · Esc ", p.code()),
+                Span::styled("stop", p.body()),
+            ];
+        }
+        if state.queued_messages > 0 {
+            return vec![
+                Span::styled("Esc ", p.code()),
+                Span::styled("send after tool", p.body()),
+            ];
+        }
+        if !state.composer.is_empty() {
+            return vec![
+                Span::styled("Tab ", p.code()),
+                Span::styled("queue", p.body()),
+                Span::styled(" · Esc ", p.code()),
+                Span::styled("stop", p.body()),
+            ];
+        }
         return vec![
             Span::styled("Esc ", p.code()),
-            Span::styled("interrupt", p.body()),
+            Span::styled("stop", p.body()),
         ];
     }
     // A drafted prompt is one Esc from being cleared (not lost — the second
@@ -3669,10 +3690,12 @@ mod tests {
 
         assert_eq!(divider.chars().count(), 120, "divider width: {divider:?}");
         assert!(
-            divider.starts_with("─ worked for 12.4s · 0 lines changed ─"),
+            divider.starts_with("─ worked for 12.4s ─"),
             "left-aligned duration: {divider:?}"
         );
-        assert!(divider.contains("0 lines changed"), "{divider:?}");
+        assert!(!divider.contains("changed"), "{divider:?}");
+        assert!(!divider.contains("+0"), "{divider:?}");
+        assert!(!divider.contains("-0"), "{divider:?}");
         assert!(divider.ends_with('─'), "right terminal edge: {divider:?}");
     }
 
@@ -3778,17 +3801,28 @@ mod tests {
         );
     }
 
-    /// Busy → the right hint switches to the interrupt affordance.
+    /// Busy → the right hint switches to the stop affordance.
     #[test]
-    fn status_right_hint_shows_interrupt_when_busy() {
+    fn status_right_hint_shows_stop_when_busy() {
         let mut state = ViewState::new("m".into());
         state.busy = true;
         let screen = rendered(&mut state);
         assert!(screen.contains("Esc"), "busy shows Esc: {screen}");
-        assert!(
-            screen.contains("interrupt"),
-            "busy shows interrupt: {screen}"
-        );
+        assert!(screen.contains("stop"), "busy shows stop: {screen}");
+    }
+
+    #[test]
+    fn status_right_hint_explains_queue_handoff() {
+        let mut state = ViewState::new("m".into());
+        state.busy = true;
+        state.queued_messages = 1;
+        let screen = rendered(&mut state);
+        assert!(screen.contains("send after tool"), "queued hint: {screen}");
+
+        state.queued_after_tool = true;
+        let screen = rendered(&mut state);
+        assert!(screen.contains("queued after tool"), "armed hint: {screen}");
+        assert!(screen.contains("Esc stop"), "second Esc hint: {screen}");
     }
 
     /// Idle with a drafted prompt → the right hint surfaces "Esc clear" so the

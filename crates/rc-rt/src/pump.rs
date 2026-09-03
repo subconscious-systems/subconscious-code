@@ -1,7 +1,8 @@
 //! The action pump: drains `UserAction`s from the host and dispatches them.
 //!
 //! - `Submit` starts a turn with a fresh cancel token the pump owns as a local
-//!   (one task → no shared-slot race with a new turn).
+//!   (one task → no shared-slot race with a new turn); `Queue` retains a
+//!   follow-up until that turn reaches its terminal boundary.
 //! - `Cancel` fires the token and denies any pending ask so the prompter
 //!   unblocks and the turn winds down.
 //! - `SetMode` swaps the engine mode atomically (immediate), tells the host via
@@ -12,6 +13,7 @@
 //!   driver exit once its current turn finishes).
 
 use rc_core::PermissionChecker;
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +32,7 @@ pub(crate) async fn pump_task(
 ) {
     let mut active: Option<(u64, CancellationToken)> = None;
     let mut next_turn_id = 0u64;
+    let mut queued = VecDeque::new();
     loop {
         let action = tokio::select! {
             biased;
@@ -37,6 +40,13 @@ pub(crate) async fn pump_task(
                 if let Some(DriverFeedback::TurnFinished { turn_id }) = feedback {
                     if active.as_ref().is_some_and(|(active_id, _)| *active_id == turn_id) {
                         active = None;
+                        if let Some(prompt) = queued.pop_front() {
+                            let Some(next) = start_turn(&mut next_turn_id, prompt, &driver_tx).await
+                            else {
+                                break;
+                            };
+                            active = Some(next);
+                        }
                     }
                 }
                 continue;
@@ -52,19 +62,19 @@ pub(crate) async fn pump_task(
                     ));
                     continue;
                 }
-                next_turn_id = next_turn_id.wrapping_add(1);
-                let token = CancellationToken::new();
-                active = Some((next_turn_id, token.clone()));
-                if driver_tx
-                    .send(DriverCmd::Run {
-                        turn_id: next_turn_id,
-                        prompt,
-                        cancel: token,
-                    })
-                    .await
-                    .is_err()
-                {
+                let Some(next) = start_turn(&mut next_turn_id, prompt, &driver_tx).await else {
                     break;
+                };
+                active = Some(next);
+            }
+            UserAction::Queue(prompt) => {
+                if active.is_some() {
+                    queued.push_back(prompt);
+                } else {
+                    let Some(next) = start_turn(&mut next_turn_id, prompt, &driver_tx).await else {
+                        break;
+                    };
+                    active = Some(next);
                 }
             }
             UserAction::Cancel => {
@@ -130,4 +140,23 @@ pub(crate) async fn pump_task(
             }
         }
     }
+}
+
+async fn start_turn(
+    next_turn_id: &mut u64,
+    prompt: String,
+    driver_tx: &mpsc::Sender<DriverCmd>,
+) -> Option<(u64, CancellationToken)> {
+    *next_turn_id = next_turn_id.wrapping_add(1);
+    let turn_id = *next_turn_id;
+    let token = CancellationToken::new();
+    driver_tx
+        .send(DriverCmd::Run {
+            turn_id,
+            prompt,
+            cancel: token.clone(),
+        })
+        .await
+        .ok()?;
+    Some((turn_id, token))
 }
