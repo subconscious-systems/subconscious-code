@@ -41,17 +41,30 @@ cd subconscious-code
 cargo install --locked --path crates/rc-cli
 ```
 
-### Install a Linux release
+### Install a release
 
-Tagged releases provide static `x86_64` and `aarch64` Linux binaries. Replace
-`VERSION` with the release you want to install:
+Tagged releases provide precompiled binaries for Apple Silicon and Intel Macs,
+plus static `x86_64` and `aarch64` Linux binaries. Replace `VERSION` with the
+release you want to install:
 
 ```sh
 VERSION=v0.1.0
-TARGET=x86_64-unknown-linux-musl # or aarch64-unknown-linux-musl
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) TARGET=aarch64-apple-darwin ;;
+  Darwin:x86_64) TARGET=x86_64-apple-darwin ;;
+  Linux:aarch64|Linux:arm64) TARGET=aarch64-unknown-linux-musl ;;
+  Linux:x86_64|Linux:amd64) TARGET=x86_64-unknown-linux-musl ;;
+  *) echo "Unsupported platform: $(uname -s) $(uname -m)" >&2; exit 1 ;;
+esac
 curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/sc-$TARGET.tar.gz"
 curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/sc-$TARGET.tar.gz.sha256"
-sha256sum --check "sc-$TARGET.tar.gz.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum --check "sc-$TARGET.tar.gz.sha256"
+else
+  expected="$(awk '{print $1}' "sc-$TARGET.tar.gz.sha256")"
+  actual="$(shasum -a 256 "sc-$TARGET.tar.gz" | awk '{print $1}')"
+  test "$actual" = "$expected"
+fi
 tar -xzf "sc-$TARGET.tar.gz"
 mkdir -p "$HOME/.local/bin"
 install -m 0755 sc "$HOME/.local/bin/sc"
@@ -59,6 +72,8 @@ sc --version
 ```
 
 Release archives and their checksum files include keyless Sigstore bundles.
+The `subc sc install` command uses the same OS/architecture mapping and installs
+the matching archive without requiring Cargo.
 
 Launch `sc`. On first use, the CLI securely prompts for your Subconscious API
 key and saves it to `~/.sc/key` with user-only permissions:

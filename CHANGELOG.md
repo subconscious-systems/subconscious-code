@@ -5,6 +5,15 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+### Added
+
+- Precompiled Apple Silicon and Intel macOS release archives, checksums, and
+  keyless Sigstore bundles for installer-driven setup without Cargo.
+
+### Changed
+
+- Release automation now uses Node 24-compatible GitHub Actions.
+
 ## [0.1.1] - 2026-09-03
 
 ### Added
