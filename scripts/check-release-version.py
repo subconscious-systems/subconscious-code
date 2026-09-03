@@ -35,14 +35,6 @@ def main() -> None:
     rust_version = project_version(
         REPOSITORY_ROOT / "Cargo.toml", "workspace.package.version"
     )
-    harbor_version = project_version(
-        REPOSITORY_ROOT / "integrations/harbor/pyproject.toml", "project.version"
-    )
-    if rust_version != harbor_version:
-        raise SystemExit(
-            "release version mismatch: "
-            f"Rust workspace is {rust_version}, Harbor adapter is {harbor_version}"
-        )
     if not SEMVER.fullmatch(rust_version):
         raise SystemExit(f"release version is not supported SemVer: {rust_version}")
 
@@ -56,7 +48,7 @@ def main() -> None:
     if f"## [{rust_version}]" not in changelog:
         raise SystemExit(f"CHANGELOG.md has no [{rust_version}] release section")
 
-    print(f"release versions agree: {expected_tag}")
+    print(f"release version is valid: {expected_tag}")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,27 @@
 # Benchmarks
 
-The repository includes benchmark adapters and reproducible measurement
-instructions. Generated results, trial summaries, and trajectories are not
-part of the source distribution and should remain in external artifact storage
-or an ignored local output directory.
+The repository includes reproducible measurement instructions and native CLI
+output for evaluation harnesses. Generated results, trial summaries, and
+trajectories are not part of the source distribution and should remain in
+external artifact storage or an ignored local output directory.
 
-## Harbor integration
+## CLI benchmark output
 
-[`integrations/harbor`](../integrations/harbor/README.md) adapts `sc` to Harbor
-and documents the exact setup for SWE-bench-style evaluations. The adapter
-keeps benchmark orchestration outside the agent runtime.
+Run the `sc` binary directly and supply its credential through `SC_API_KEY`.
+For a headless task, `--benchmark-report` writes privacy-safe accounting data
+and `--benchmark-trajectory` writes an ATIF v1.7 transcript:
+
+```sh
+SC_API_KEY="your-api-key" sc \
+  --benchmark-report benchmark-results/report.json \
+  --benchmark-trajectory benchmark-results/trajectory.json \
+  -p "fix the task"
+```
+
+The report intentionally excludes prompt and tool-result content. The ATIF
+trajectory includes user-visible messages and tool activity, so treat it as
+sensitive. External orchestrators should invoke this CLI contract rather than
+requiring an adapter package from this repository.
 
 ## DLR and TTFT measurements
 

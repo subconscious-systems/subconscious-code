@@ -23,13 +23,6 @@ The DLR protocol is a separate Cargo workspace and must be checked separately:
 cargo test --locked --manifest-path integrations/dlr/Cargo.toml --workspace
 ```
 
-The optional Harbor adapter uses Python 3.12+ and `uv`:
-
-```sh
-uv sync --project integrations/harbor --extra test --locked
-uv run --project integrations/harbor pytest
-```
-
 ## Before opening a pull request
 
 Run the checks that apply to your change:

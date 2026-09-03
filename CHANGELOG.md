@@ -14,15 +14,15 @@ Initial public release.
 - OpenAI-compatible streaming with tool calls, retries, request spooling, and
   optional gzip transport.
 - Optional DLR sidecar transport for large, repeated conversation contexts.
-- Crash-safe benchmark reports and ATIF trajectories for Harbor.
-- Reproducible offline Harbor adapters for Subconscious Code and mini-swe-agent.
+- Crash-safe benchmark reports and ATIF trajectories emitted directly by the
+  `sc` CLI.
+- Secure first-launch API-key setup for the interactive CLI.
 
 ### Reliability
 
 - Bounded recovery for transport failures that occur before semantic model
   output, without replaying partially emitted responses.
 - Benchmark completion review, no-progress handling, and endpoint diagnostics.
-- Linux sandboxing, fail-closed headless permissions, and offline benchmark
-  network policy.
+- Linux sandboxing and fail-closed headless permissions.
 
 [0.1.0]: https://github.com/subconscious-systems/subconscious-code/releases/tag/v0.1.0

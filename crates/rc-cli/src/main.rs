@@ -54,7 +54,7 @@ use tokio_util::sync::CancellationToken;
                   context caps and provider-safe tool-result projection."
 )]
 struct Cli {
-    /// One-shot headless mode: run the agent loop for PROMPT and print the answer (§5.8 U14).
+    /// One-shot headless mode: run the agent loop for PROMPT and print the answer.
     #[arg(short, long, value_name = "PROMPT", allow_hyphen_values = true)]
     print: Option<String>,
 
@@ -68,15 +68,15 @@ struct Cli {
     #[arg(long, value_name = "PATH", requires = "print")]
     benchmark_trajectory: Option<PathBuf>,
 
-    /// Override the model for this invocation (§5.6 A9).
+    /// Override the model for this invocation.
     #[arg(long, env = "SC_MODEL")]
     model: Option<String>,
 
-    /// Override the base URL (§5.6 G3).
+    /// Override the base URL.
     #[arg(long, env = "SC_BASE_URL")]
     base_url: Option<String>,
 
-    /// Dump request/response and emit tracing to stderr (§5.9 O5).
+    /// Dump request/response and emit tracing to stderr.
     #[arg(long)]
     debug: bool,
 
@@ -109,13 +109,13 @@ struct Cli {
     #[arg(long, env = "SC_REASONING_EFFORT", value_name = "LEVEL")]
     reasoning_effort: Option<String>,
 
-    /// M7: confine every approved `Bash` command at the kernel level (Linux:
+    /// Confine every approved `Bash` command at the kernel level (Linux:
     /// Landlock + seccomp). Denies writes outside the workspace roots and
     /// network. Off by default; also settable via SC_SANDBOX=1.
     #[arg(long)]
     sandbox: bool,
 
-    /// M7: allow network under `--sandbox` (otherwise denied). Also via
+    /// Allow network under `--sandbox` (otherwise denied). Also via
     /// SC_SANDBOX_NET=1. Implies --sandbox.
     #[arg(long = "sandbox-net")]
     sandbox_net: bool,
@@ -175,6 +175,13 @@ async fn run(cli: Cli) -> Result<()> {
     }
     if let Some(u) = base_url_override.clone() {
         settings.apply_base_url_override(u);
+    }
+
+    // A bare interactive launch is also first-run setup. Headless automation
+    // never prompts: it must provide the credential explicitly through the
+    // configured environment variable or a previously saved key file.
+    if settings.api_key.is_none() && cli.command.is_none() && cli.print.is_none() {
+        settings.api_key = Some(prompt_and_save_api_key()?);
     }
 
     tracing::debug!(model = %settings.model, base_url = %settings.base_url, "settings loaded");
@@ -375,7 +382,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .with_sandbox(sandbox))
         };
 
-    // Headless one-shot: run one turn and print the answer (§5.8 U14).
+    // Headless one-shot: run one turn and print the answer.
     if let Some(prompt) = cli.print.filter(|p| !p.is_empty()) {
         return run_headless(
             build_agent(&session, &api_key, &settings)?,
@@ -462,6 +469,89 @@ async fn run(cli: Cli) -> Result<()> {
         // mode after a switch.
         mode = reconcile_mode(&mut session, &permission, &settings, switched_to_existing);
     }
+}
+
+/// Collect and persist the first API key without echoing it to the terminal.
+///
+/// This is intentionally limited to a bare interactive launch. Piped and
+/// headless invocations must configure credentials before starting so an
+/// automation job can never stop indefinitely at a secret prompt.
+fn prompt_and_save_api_key() -> Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        anyhow::bail!(
+            "no API key: set $SC_API_KEY (or the variable named by provider.api_key_env)"
+        );
+    }
+
+    eprintln!("Welcome to Subconscious Code.");
+    eprintln!("Your API key is stored locally in ~/.sc/key with user-only permissions.");
+    eprint!("Subconscious API key: ");
+    std::io::stderr().flush()?;
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+
+    enable_raw_mode().context("enable secure API-key prompt")?;
+    let guard = RawModeGuard;
+    let entered = (|| -> Result<String> {
+        let mut key = String::new();
+        loop {
+            match event::read().context("read API key")? {
+                Event::Key(key_event)
+                    if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    match key_event.code {
+                        KeyCode::Enter => break,
+                        KeyCode::Backspace => {
+                            key.pop();
+                        }
+                        KeyCode::Char('c')
+                            if key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            anyhow::bail!("API-key setup cancelled");
+                        }
+                        KeyCode::Char(character)
+                            if !key_event.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            ) =>
+                        {
+                            if key.len() >= 16 * 1024 {
+                                anyhow::bail!("API key is unexpectedly long");
+                            }
+                            key.push(character);
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Paste(value) => {
+                    if key.len().saturating_add(value.len()) > 16 * 1024 {
+                        anyhow::bail!("API key is unexpectedly long");
+                    }
+                    key.push_str(&value);
+                }
+                _ => {}
+            }
+        }
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            anyhow::bail!("API key cannot be empty");
+        }
+        Ok(key)
+    })();
+    drop(guard);
+    eprintln!();
+
+    let key = entered?;
+    let path = rc_config::set_api_key(&key).map_err(anyhow::Error::msg)?;
+    eprintln!("API key saved to {}.", path.display());
+    Ok(key)
 }
 
 fn configure_request_transport(
@@ -927,13 +1017,13 @@ fn benchmark_provenance() -> BenchmarkProvenance {
             .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
     };
     BenchmarkProvenance {
-        run_id: std::env::var("SC_HARBOR_RUN_ID")
+        run_id: std::env::var("SC_BENCHMARK_RUN_ID")
             .ok()
             .filter(|id| !id.is_empty()),
-        binary_sha256: clean_hash("SC_HARBOR_INSTALLED_BINARY_SHA256"),
-        source_sha256: clean_hash("SC_HARBOR_SOURCE_SHA256"),
-        artifact_sha256: clean_hash("SC_HARBOR_ARTIFACT_SHA256"),
-        revision: std::env::var("SC_HARBOR_REVISION")
+        binary_sha256: clean_hash("SC_BENCHMARK_BINARY_SHA256"),
+        source_sha256: clean_hash("SC_BENCHMARK_SOURCE_SHA256"),
+        artifact_sha256: clean_hash("SC_BENCHMARK_ARTIFACT_SHA256"),
+        revision: std::env::var("SC_BENCHMARK_REVISION")
             .ok()
             .filter(|revision| !revision.is_empty()),
     }
@@ -1044,7 +1134,7 @@ fn write_benchmark_report(
 ///
 /// Unlike the accounting-only benchmark report, an ATIF trajectory is an
 /// explicit transcript artifact: it contains user/assistant messages, tool
-/// arguments, and tool observations so Harbor can render and inspect the run.
+/// arguments, and tool observations so an evaluation tool can inspect the run.
 /// Hidden model reasoning is deliberately omitted.
 fn build_benchmark_trajectory(
     session: &Session,
@@ -1391,7 +1481,7 @@ mod benchmark_report_tests {
     }
 
     #[test]
-    fn report_has_harbor_metrics_without_transcript_content() {
+    fn report_has_accounting_metrics_without_transcript_content() {
         let session = measured_session();
         let value = serde_json::to_value(build_benchmark_report(
             &session,

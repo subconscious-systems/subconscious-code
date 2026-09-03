@@ -34,13 +34,17 @@ found.
 
 ## 3. Configure a provider
 
-For the default Subconscious endpoint:
+For the default Subconscious endpoint, launch `sc`. If no key is configured,
+the interactive CLI prompts for it without echoing the secret and saves it to
+`~/.sc/key` with mode `0600`:
 
 ```sh
-export SC_API_KEY="your-api-key"
+cd /path/to/project
+sc
 ```
 
-For another compatible endpoint:
+For automation, CI, or another compatible endpoint, configure the environment
+before launch:
 
 ```sh
 export SC_API_KEY="your-provider-key"
@@ -49,7 +53,7 @@ export SC_MODEL="provider/model-name"
 ```
 
 Do not put a literal API key in `settings.json`. Environment variables take
-priority, and `/menu` can save a key separately to `~/.sc/key` with mode `0600`.
+priority, and `/menu` can replace the key stored in `~/.sc/key`.
 
 ## 4. Verify the endpoint
 
