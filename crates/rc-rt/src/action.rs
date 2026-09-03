@@ -8,6 +8,9 @@ use rc_core::{AgentMode, AskResponse};
 pub enum UserAction {
     /// Submit a user prompt; the driver runs one turn.
     Submit(String),
+    /// Queue a user prompt behind the in-flight turn. If the turn finishes or
+    /// is cancelled, the queued prompt starts automatically.
+    Queue(String),
     /// Cancel the in-flight turn, including its model/tool cancellation budget,
     /// and deny any pending permission prompt so the turn can terminate.
     Cancel,

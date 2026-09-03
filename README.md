@@ -90,7 +90,9 @@ sc
 
 Inside the TUI, type a request normally. Use `@path` to include a file, `/menu`
 to edit settings or resume a session, `Shift+Tab` to change permission mode,
-`Esc` to interrupt a turn, and `Ctrl+C` to quit.
+`Tab` to queue a draft while a turn runs, `Esc` to stop, and `Ctrl+C` to quit.
+If a message is queued, `Esc` waits for the current tool call to finish and
+then sends it; press `Esc` again to stop immediately.
 
 For a non-interactive read-only task:
 
@@ -308,11 +310,12 @@ fields without prompt or tool-result content. The trajectory is an explicit
 transcript artifact and may contain sensitive task data; review it before
 sharing.
 
-In the TUI: `Shift+Tab` cycles permission mode, `Esc` cancels a turn, `Ctrl+C`
-quits, `@` completes file paths, `/` completes commands (`/menu`, `/clear`,
-`/help`, `/mode`, `/rewind`). The status bar shows the model, mode, and current
-context tokens/cache-hit rate; a preflight estimate is shown until the provider
-returns the authoritative prompt-token count.
+In the TUI: `Shift+Tab` cycles permission mode, `Tab` queues a draft during a
+turn, `Esc` stops (or sends a queued message after the active tool call), and
+`Ctrl+C` quits. `@` completes file paths and `/` completes commands (`/menu`,
+`/clear`, `/help`, `/mode`, `/rewind`). The status bar shows the model, mode,
+and current context tokens/cache-hit rate; a preflight estimate is shown until
+the provider returns the authoritative prompt-token count.
 
 ### `/menu`
 

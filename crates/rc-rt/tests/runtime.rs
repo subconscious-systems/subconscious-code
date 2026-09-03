@@ -4,6 +4,7 @@
 //! `rc-cli/tests/*.rs`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -319,6 +320,149 @@ async fn duplicate_submit_is_rejected_until_the_active_turn_finishes() {
     assert!(got
         .iter()
         .any(|event| matches!(event, AgentEvent::Text(text) if text == "first turn finished")));
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn queued_prompt_starts_after_the_active_turn_finishes() {
+    struct QueuedModel {
+        calls: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Model for QueuedModel {
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            let text = if call == 0 {
+                "first finished"
+            } else {
+                "queued finished"
+            };
+            sink.on_text(text);
+            Ok(resp_stop(text))
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let rt = Runtime::new(
+        agent(
+            Arc::new(QueuedModel {
+                calls: AtomicUsize::new(0),
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Arc::new(ToolRegistry::new(vec![])),
+            Arc::new(AllowAllChecker),
+        ),
+        session(),
+        None,
+    );
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Submit("first".into()));
+    entered.notified().await;
+    rt.action(UserAction::Queue("follow up".into()));
+    release.notify_one();
+
+    let got = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut events = Vec::new();
+        let mut idles = 0;
+        while idles < 2 {
+            match rx.recv().await {
+                Some(Ok(event)) => {
+                    if matches!(event, AgentEvent::Idle) {
+                        idles += 1;
+                    }
+                    events.push(event);
+                }
+                Some(Err(_)) => {}
+                None => panic!("event stream closed before queued turn"),
+            }
+        }
+        events
+    })
+    .await
+    .expect("queued turn timed out");
+
+    assert_eq!(
+        got.iter()
+            .filter(|event| matches!(event, AgentEvent::Ready))
+            .count(),
+        2
+    );
+    assert!(got
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Text(text) if text == "first finished")));
+    assert!(got
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Text(text) if text == "queued finished")));
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_an_active_turn_preserves_and_starts_its_queue() {
+    struct CancelThenRunModel {
+        calls: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Model for CancelThenRunModel {
+        async fn complete(
+            &self,
+            _req: ModelRequest,
+            sink: &dyn EventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
+            sink.on_text("queue survived cancellation");
+            Ok(resp_stop("queue survived cancellation"))
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let rt = Runtime::new(
+        agent(
+            Arc::new(CancelThenRunModel {
+                calls: AtomicUsize::new(0),
+                entered: entered.clone(),
+            }),
+            Arc::new(ToolRegistry::new(vec![])),
+            Arc::new(AllowAllChecker),
+        ),
+        session(),
+        None,
+    );
+    let mut rx = rt.subscribe();
+    rt.action(UserAction::Submit("first".into()));
+    entered.notified().await;
+    rt.action(UserAction::Queue("follow up".into()));
+    rt.action(UserAction::Cancel);
+
+    let got = tokio::time::timeout(Duration::from_secs(2), async {
+        drain_until(&mut rx, |event| {
+            matches!(event, AgentEvent::Text(text) if text == "queue survived cancellation")
+        })
+        .await
+    })
+    .await
+    .expect("queued turn did not start after cancellation");
+    assert!(got
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Outcome(LoopOutcome::Cancelled))));
     rt.shutdown().await;
 }
 
