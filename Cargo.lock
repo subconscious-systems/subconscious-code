@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "rc-algebra"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "serde",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "rc-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1722,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "rc-config"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "rc-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "rc-ctx"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rc-algebra",
  "rc-core",
@@ -1765,15 +1765,15 @@ dependencies = [
 
 [[package]]
 name = "rc-hooks"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "rc-mcp"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "rc-perm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "globset",
  "serde",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "rc-proto"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "axum",
  "blake3",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "rc-rt"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "rc-sandbox"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "landlock",
  "libc",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "rc-session"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "rc-core",
@@ -1848,15 +1848,15 @@ dependencies = [
 
 [[package]]
 name = "rc-skills"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "rc-tokenize"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "rc-tools"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "rc-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3078,7 +3078,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "xxhash-rust"

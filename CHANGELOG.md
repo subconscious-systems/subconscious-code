@@ -5,6 +5,8 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-04
+
 ### Added
 
 - `sc update` checks the running binary against the newest GitHub release and
@@ -75,7 +77,8 @@ Initial public release.
 - Benchmark completion review, no-progress handling, and endpoint diagnostics.
 - Linux sandboxing and fail-closed headless permissions.
 
-[Unreleased]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/subconscious-systems/subconscious-code/releases/tag/v0.1.0
