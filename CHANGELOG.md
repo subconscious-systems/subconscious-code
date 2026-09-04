@@ -5,6 +5,12 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+### Added
+
+- `sc update` checks the running binary against the newest GitHub release and
+  reports the `subc sc install` command when an update is available. A `--json`
+  mode provides the same status for scripts.
+
 ### Changed
 
 - Mouse-wheel history navigation now moves one transcript row per event, and

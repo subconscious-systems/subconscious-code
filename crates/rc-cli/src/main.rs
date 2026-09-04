@@ -19,6 +19,7 @@
 
 mod doctor;
 mod resource_scope;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -140,6 +141,13 @@ enum Command {
         #[arg(long = "body-ladder")]
         body_ladder: bool,
     },
+    /// Check the installed version against the newest published release.
+    /// Installation remains owned by `subc sc install`.
+    Update {
+        /// Emit a machine-readable status object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -166,6 +174,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    // Version discovery is independent of the model endpoint, project, and API
+    // key. Keep it ahead of settings/first-run setup so `sc update` is useful
+    // even on a machine that has not configured the agent yet.
+    if let Some(Command::Update { json }) = &cli.command {
+        return update::run(*json).await;
+    }
+
     let benchmark_mode = cli.benchmark_report.is_some() || cli.benchmark_trajectory.is_some();
     let mut settings = Settings::load(&std::env::current_dir()?);
     let model_override = cli.model.clone();
@@ -188,12 +203,18 @@ async fn run(cli: Cli) -> Result<()> {
 
     // `sc doctor` runs before the API-key requirement so it can *report* a
     // missing key as a failed check instead of erroring out with no diagnostics.
-    if let Some(Command::Doctor { body_ladder }) = cli.command {
-        let ok = doctor::run(&settings, body_ladder).await?;
-        if !ok {
-            anyhow::bail!("doctor: one or more checks failed");
+    if let Some(command) = cli.command {
+        match command {
+            Command::Doctor { body_ladder } => {
+                let ok = doctor::run(&settings, body_ladder).await?;
+                if !ok {
+                    anyhow::bail!("doctor: one or more checks failed");
+                }
+                return Ok(());
+            }
+            // Handled before settings are loaded above.
+            Command::Update { .. } => unreachable!("update returned before agent setup"),
         }
-        return Ok(());
     }
 
     // Mutable because `/menu` can save a new key mid-run: the reload path below
@@ -768,7 +789,7 @@ fn fresh_session_id() -> String {
 
 #[cfg(test)]
 mod session_id_tests {
-    use super::{fresh_session_id, Cli};
+    use super::{fresh_session_id, Cli, Command};
     use clap::Parser;
 
     #[test]
@@ -790,6 +811,13 @@ mod session_id_tests {
             .expect("dash-prefixed prompts are task content, not CLI flags");
 
         assert_eq!(cli.print.as_deref(), Some("- Update the display grid"));
+    }
+
+    #[test]
+    fn update_accepts_machine_readable_output() {
+        let cli = Cli::try_parse_from(["sc", "update", "--json"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Update { json: true })));
     }
 }
 

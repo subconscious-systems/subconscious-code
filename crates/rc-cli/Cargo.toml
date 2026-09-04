@@ -37,6 +37,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
+reqwest.workspace = true
 uuid = { version = "=1.20.0", features = ["v4"] }
 crossterm = "0.28"
 
