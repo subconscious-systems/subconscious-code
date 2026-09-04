@@ -113,6 +113,16 @@ struct ToolHitbox {
     height: u16,
 }
 
+/// One transcript row currently visible on screen. The source index is stable
+/// across viewport changes, unlike the screen row, so a selection can remain
+/// attached to history while the user scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibleTranscriptRow {
+    screen_row: u16,
+    source_index: usize,
+    source_row: usize,
+}
+
 impl ToolHitbox {
     fn contains(self, column: u16, row: u16) -> bool {
         column >= self.x
@@ -242,16 +252,24 @@ pub(crate) struct ViewState {
     /// `Some` it owns both the frame and the keymap, so there's no half-state
     /// where a keystroke lands in the composer hidden behind it.
     pub menu_overlay: Option<crate::menu::MenuState>,
-    /// The live mouse selection, in *screen* cells. `None` when nothing is
-    /// selected. Screen coordinates rather than transcript offsets because
-    /// what the user is selecting is what they can see — after wrapping,
-    /// markdown styling and collapsing, the rendered buffer is the only place
-    /// that text exists in the shape they are pointing at.
+    /// A live selection outside the transcript, in screen cells. Transcript
+    /// drags use [`Self::transcript_selection`] so they stay attached to
+    /// history when the viewport moves.
     pub selection: Option<Selection>,
+    /// A transcript selection in stable logical-line coordinates. This is what
+    /// allows a drag to span more than one viewport and lets its highlight
+    /// remain correct when history is scrolled after copying.
+    pub transcript_selection: Option<TranscriptSelection>,
+    /// True between left-button down and up. Wheel events during that interval
+    /// extend a transcript selection; later browsing only preserves it.
+    pub selection_dragging: bool,
+    /// Screen-row to logical transcript-row mapping from the most recent draw.
+    /// Mouse handling consumes it before the next frame is rendered.
+    visible_transcript_rows: Vec<VisibleTranscriptRow>,
     /// The selected text, harvested from the render buffer during [`draw`].
     pub selection_text: Option<String>,
-    /// Set on mouse-up: the run loop copies [`Self::selection_text`] to the
-    /// clipboard after the next draw (the text only exists once drawn).
+    /// Set on mouse-up: the run loop copies [`Self::selection_text`] after the
+    /// next draw, once screen or transcript selection harvesting is complete.
     pub copy_pending: bool,
     /// A short-lived "copied N chars" confirmation and when it was shown.
     pub copy_notice: Option<(String, Instant)>,
@@ -260,11 +278,10 @@ pub(crate) struct ViewState {
     /// Resolved once at startup — it is the fact that scrolls off the top of a
     /// long transcript and never comes back, so the persistent chrome owns it.
     pub location: String,
-    /// Whether mouse capture is on. While it is, the app receives every drag
-    /// and the terminal never sees one, so text cannot be selected — the one
-    /// thing a terminal is otherwise always good for. Off hands the mouse back
-    /// for selection and copy, at the cost of wheel scrolling. Toggled with
-    /// Ctrl+O (`/select`).
+    /// Whether mouse capture is on. While it is, the app handles wheel history
+    /// and copies drags itself. Off hands both gestures back to the terminal as
+    /// a fallback for clipboard policies that reject app-initiated copy.
+    /// Toggled with Ctrl+O (`/select`).
     pub mouse_capture: bool,
 }
 
@@ -278,6 +295,38 @@ pub(crate) struct Selection {
     pub anchor: (u16, u16),
     /// Where the pointer is now.
     pub head: (u16, u16),
+}
+
+/// A point in retained transcript history. Columns remain display columns;
+/// line indices are stable while a user is browsing because new content is
+/// appended below them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptPoint {
+    pub line: usize,
+    pub visual_row: usize,
+    pub column: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptSelection {
+    pub anchor: TranscriptPoint,
+    pub head: TranscriptPoint,
+}
+
+impl TranscriptSelection {
+    pub fn ordered(&self) -> (TranscriptPoint, TranscriptPoint) {
+        let a = (self.anchor.line, self.anchor.visual_row, self.anchor.column);
+        let b = (self.head.line, self.head.visual_row, self.head.column);
+        if a <= b {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
 }
 
 impl Selection {
@@ -348,10 +397,27 @@ impl ViewState {
             location: String::new(),
             mouse_capture: false,
             selection: None,
+            transcript_selection: None,
+            selection_dragging: false,
+            visible_transcript_rows: Vec::new(),
             selection_text: None,
             copy_pending: false,
             copy_notice: None,
         }
+    }
+
+    /// Resolve a screen cell from the last frame to its stable transcript
+    /// coordinate. Rows outside the transcript return `None`, preserving the
+    /// existing screen-space selection behavior for status/composer text.
+    pub(crate) fn transcript_point_at(&self, column: u16, row: u16) -> Option<TranscriptPoint> {
+        self.visible_transcript_rows
+            .iter()
+            .find(|visible| visible.screen_row == row)
+            .map(|visible| TranscriptPoint {
+                line: visible.source_index,
+                visual_row: visible.source_row,
+                column,
+            })
     }
 
     /// Whether the pre-conversation welcome card is showing right now (the
@@ -813,6 +879,8 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
         // A modal owns the screen; a selection made behind it would highlight
         // cells that are no longer there.
         state.selection = None;
+        state.transcript_selection = None;
+        state.visible_transcript_rows.clear();
         state.selection_text = None;
         return;
     }
@@ -870,6 +938,10 @@ pub(crate) fn draw(frame: &mut Frame, state: &mut ViewState) {
 /// dragged across. Reading them back means "copy" always matches what the eye
 /// selected, with no second, divergent path through the transcript model.
 fn apply_selection(frame: &mut Frame, state: &mut ViewState) {
+    if let Some(selection) = state.transcript_selection {
+        apply_transcript_selection(frame, state, selection);
+        return;
+    }
     let Some(selection) = state.selection else {
         state.selection_text = None;
         return;
@@ -909,12 +981,97 @@ fn apply_selection(frame: &mut Frame, state: &mut ViewState) {
     state.selection_text = (!text.trim().is_empty()).then_some(text);
 }
 
+/// Highlight the visible portion of a transcript selection and harvest the
+/// entire logical range, including rows currently above or below the viewport.
+/// The clipboard therefore follows history rather than the terminal screen.
+fn apply_transcript_selection(
+    frame: &mut Frame,
+    state: &mut ViewState,
+    selection: TranscriptSelection,
+) {
+    if selection.is_empty() {
+        state.selection_text = None;
+        return;
+    }
+    let (start, end) = selection.ordered();
+    let width = frame.area().width;
+    let visible = state.visible_transcript_rows.clone();
+    let buf = frame.buffer_mut();
+
+    for row in visible {
+        let row_key = (row.source_index, row.source_row);
+        let start_key = (start.line, start.visual_row);
+        let end_key = (end.line, end.visual_row);
+        if row_key < start_key || row_key > end_key {
+            continue;
+        }
+        let from = if row_key == start_key {
+            start.column
+        } else {
+            0
+        };
+        let to = if row_key == end_key {
+            end.column
+        } else {
+            width.saturating_sub(1)
+        };
+        for col in from..=to.min(width.saturating_sub(1)) {
+            buf[(col, row.screen_row)].set_style(Style::new().add_modifier(Modifier::REVERSED));
+        }
+    }
+
+    let mut text = String::new();
+    for index in start.line..=end.line {
+        let Some(line) = selectable_transcript_line(state, index) else {
+            continue;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        // A logical row can occupy multiple visual rows after wrapping. Its
+        // retained text has no wrap newlines, so selecting across two of those
+        // rows copies the whole logical row rather than guessing at a second,
+        // divergent wrapping algorithm.
+        let same_line_wrap = start.line == end.line && start.visual_row != end.visual_row;
+        let from = if index == start.line && !same_line_wrap {
+            usize::from(start.column).min(chars.len())
+        } else {
+            0
+        };
+        let through = if index == end.line && !same_line_wrap {
+            usize::from(end.column).saturating_add(1).min(chars.len())
+        } else {
+            chars.len()
+        };
+        if from < through {
+            text.extend(chars[from..through].iter());
+        }
+        if index < end.line {
+            text.push('\n');
+        }
+    }
+    state.selection_text = (!text.trim().is_empty()).then_some(text);
+}
+
+fn selectable_transcript_line(state: &ViewState, index: usize) -> Option<String> {
+    let line = if index < state.transcript.len() {
+        &state.transcript[index]
+    } else {
+        state.current_parsed.get(index - state.transcript.len())?
+    };
+    Some(
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect(),
+    )
+}
+
 fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: Instant) {
     let h = area.height as usize;
     let w = area.width;
     state.area_height = h;
     state.reasoning_hitboxes.clear();
     state.tool_hitboxes.clear();
+    state.visible_transcript_rows.clear();
 
     // Welcome card before the first turn: the brand logo on the left, the
     // model + cwd + key hints on the right, all in one bordered box. It lives
@@ -1044,6 +1201,8 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     // Each tuple is (retained block, physical row, wrapped height, label width).
     let mut reasoning_rows: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut tool_rows: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut physical_sources = Vec::new();
+    let mut source_row_counts: HashMap<usize, usize> = HashMap::new();
     if w > 0 {
         let mut physical_row = 0usize;
         for (offset, line) in lines.iter().enumerate() {
@@ -1052,6 +1211,11 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
                 .line_count(w)
                 .max(1);
             let global_index = line_sources[offset];
+            let source_row = source_row_counts.entry(global_index).or_default();
+            physical_sources.extend(
+                (*source_row..source_row.saturating_add(row_count)).map(|row| (global_index, row)),
+            );
+            *source_row = source_row.saturating_add(row_count);
             if global_index < tr_len {
                 if let Some(block_index) = state
                     .reasoning_blocks
@@ -1095,6 +1259,20 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     } else {
         0
     };
+    state.visible_transcript_rows.extend(
+        physical_sources
+            .iter()
+            .skip(scroll_y as usize)
+            .take(h)
+            .enumerate()
+            .map(
+                |(offset, (source_index, source_row))| VisibleTranscriptRow {
+                    screen_row: area.y.saturating_add(offset as u16),
+                    source_index: *source_index,
+                    source_row: *source_row,
+                },
+            ),
+    );
     // Reconstruct each logical line's physical wrapped rows using the same
     // `Paragraph` + `Wrap` configuration as the real render. This makes the
     // click target land on the label even when earlier transcript lines wrap
@@ -2646,6 +2824,79 @@ mod tests {
             Some("alpha one\nbeta two"),
             "the harvested text is what was on screen, unpadded"
         );
+    }
+
+    #[test]
+    fn transcript_selection_survives_and_copies_across_viewports() {
+        let mut state = ViewState::new("m".into());
+        for index in 0..20 {
+            state
+                .transcript
+                .push(Line::raw(format!("history row {index:02}")));
+        }
+
+        state.follow = false;
+        state.scroll_top = 0;
+        let _ = rendered_sized(&mut state, 40, 12);
+        let anchor = state
+            .transcript_point_at(0, 1)
+            .expect("old history is addressable after scrolling up");
+
+        state.scroll_top = 15;
+        let _ = rendered_sized(&mut state, 40, 12);
+        let head = state
+            .transcript_point_at(13, 1)
+            .expect("newer history is addressable in another viewport");
+        assert!(head.line > anchor.line);
+
+        state.transcript_selection = Some(TranscriptSelection { anchor, head });
+        let _ = rendered_sized(&mut state, 40, 12);
+        let copied = state
+            .selection_text
+            .as_deref()
+            .expect("the logical range is harvested")
+            .to_string();
+        assert!(copied.starts_with("history row 01"), "{copied}");
+        assert!(copied.ends_with("history row 15"), "{copied}");
+        assert!(
+            copied.contains("history row 08"),
+            "off-screen rows between both views are included: {copied}"
+        );
+
+        state.scroll_top = 0;
+        let _ = rendered_sized(&mut state, 40, 12);
+        assert_eq!(
+            state.selection_text.as_deref(),
+            Some(copied.as_str()),
+            "moving the viewport does not change the selected history"
+        );
+    }
+
+    #[test]
+    fn wrapped_transcript_rows_are_distinct_selection_points() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let mut state = ViewState::new("m".into());
+        state.transcript.push(Line::raw(text));
+        let _ = rendered_sized(&mut state, 20, 12);
+        let points: Vec<_> = state
+            .visible_transcript_rows
+            .iter()
+            .filter(|row| row.source_index == 0)
+            .map(|row| {
+                state
+                    .transcript_point_at(1, row.screen_row)
+                    .expect("visible wrapped row maps to history")
+            })
+            .collect();
+        assert!(points.len() > 1, "fixture must wrap");
+        assert_ne!(points[0], points[1]);
+
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: points[0],
+            head: points[1],
+        });
+        let _ = rendered_sized(&mut state, 20, 12);
+        assert_eq!(state.selection_text.as_deref(), Some(text));
     }
 
     /// A press that never moved selects nothing, so a plain click can keep its

@@ -735,7 +735,22 @@ async fn session_store_is_replayable_while_the_next_request_is_still_running() {
     rt.action(UserAction::Submit("checkpoint this".into()));
     second_started.notified().await;
 
-    let loaded = rc_session::load(&path).unwrap();
+    // Persistence runs on its own blocking writer thread. The second model
+    // request proves all three records have been enqueued, but it must not be
+    // used as a scheduling signal that the writer thread has already flushed
+    // them. Wait briefly for the documented durable state while the request is
+    // still paused, instead of racing the filesystem immediately.
+    let loaded = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let loaded = rc_session::load(&path).unwrap();
+            if loaded.messages.len() == 3 {
+                break loaded;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| rc_session::load(&path).unwrap());
     assert_eq!(loaded.messages.len(), 3, "user/call/result must be durable");
     assert!(matches!(loaded.messages[2], Turn::ToolResult { .. }));
 
