@@ -24,8 +24,7 @@ use serde_json::Value;
 use crate::complete::{self, Completion};
 use crate::diff;
 use crate::theme;
-use crate::view::Selection;
-use crate::view::{self, CompletionMenu, PendingAsk, ViewState};
+use crate::view::{self, CompletionMenu, PendingAsk, Selection, TranscriptSelection, ViewState};
 use crate::Term;
 
 /// Poll cadence while a turn is in flight. `crossterm::event::poll` only wakes
@@ -34,9 +33,12 @@ use crate::Term;
 /// spinner smooth. The cost is a ~125 Hz idle-ish wake while busy, which is
 /// negligible next to the work the loop is already doing.
 const TICK_BUSY: Duration = Duration::from_millis(8);
-/// Poll cadence while idle. Nothing is streaming, so there's no latency to
-/// optimize — a slower tick saves CPU (and battery) while the user reads.
-const TICK_IDLE: Duration = Duration::from_millis(33);
+/// Poll cadence while idle. Idle timeouts only check the runtime channel; they
+/// no longer repaint the terminal. This modest wake keeps out-of-band state
+/// responsive without making iTerm2 treat an untouched session as active.
+const TICK_IDLE: Duration = Duration::from_millis(250);
+/// Fine-grained history navigation: one terminal row per wheel event.
+const WHEEL_LINES: i32 = 1;
 /// A normal human cannot type the first character of the next prompt this
 /// quickly after Enter, but a terminal that has lost bracketed-paste framing
 /// can. Hold plain submissions briefly so an Enter-delimited paste can be
@@ -143,13 +145,18 @@ pub(crate) fn run(
     // with the engine from frame one instead of claiming "default" until
     // something happens to change it.
     app.view.mode = initial_mode;
+    let mut redraw = true;
     loop {
-        app.drain_events();
-        app.flush_pending_submit_if_due();
-        terminal.draw(|f| view::draw(f, &mut app.view))?;
-        // After the draw, never before: `view::draw` is what harvests the
-        // selected text out of the finished buffer.
-        app.flush_copy();
+        let stream_changed = app.drain_events();
+        let submit_changed = app.flush_pending_submit_if_due();
+        if should_draw(redraw, stream_changed, submit_changed, app.view.busy) {
+            terminal.draw(|f| view::draw(f, &mut app.view))?;
+            // After the draw, never before: `view::draw` is what harvests the
+            // selected text out of the finished buffer.
+            redraw = app.flush_copy();
+        } else {
+            redraw = false;
+        }
         if app.quit {
             break;
         }
@@ -157,7 +164,7 @@ pub(crate) fn run(
         // broadcast channel buffers anything that arrives between wakes, so a
         // longer idle tick loses no events — it only delays *display*, which
         // doesn't matter when there's nothing to display.
-        let tick = if app.view.busy { TICK_BUSY } else { TICK_IDLE };
+        let tick = app.next_tick();
         if event::poll(tick)? {
             match event::read()? {
                 // Keyboard drives the composer and the keymap. Only Press events
@@ -176,16 +183,37 @@ pub(crate) fn run(
                 Event::Mouse(ev) => app.handle_mouse(ev),
                 _ => {}
             }
+            redraw = true;
         }
     }
     app.runtime.shutdown_blocking(Duration::from_secs(5));
     Ok(app.outcome)
 }
 
+/// Idle poll timeouts deliberately do not cause terminal output. Besides
+/// avoiding needless CPU/render work, this lets terminal emulators mark a tab
+/// as quiescent instead of perpetually active while the user is only reading.
+fn should_draw(input_dirty: bool, stream_dirty: bool, submit_dirty: bool, busy: bool) -> bool {
+    input_dirty || stream_dirty || submit_dirty || busy
+}
+
 impl App {
+    fn next_tick(&self) -> Duration {
+        if let Some(pending) = &self.pending_submit {
+            return PASTE_RESCUE_WINDOW.saturating_sub(pending.staged.elapsed());
+        }
+        if self.view.busy {
+            TICK_BUSY
+        } else {
+            TICK_IDLE
+        }
+    }
+
     /// Pull every available event off the stream and fold it into the view state.
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self) -> bool {
+        let mut changed = false;
         while let Some(ev) = self.stream.try_next() {
+            changed = true;
             match ev {
                 Ok(e) => self.apply(e),
                 Err(n) => self.view.transcript.push(Line::from(format!(
@@ -193,6 +221,7 @@ impl App {
                 ))),
             }
         }
+        changed
     }
 
     fn apply(&mut self, ev: AgentEvent) {
@@ -811,7 +840,7 @@ impl App {
         self.submit_prompt(prompt);
     }
 
-    fn flush_pending_submit_if_due(&mut self) {
+    fn flush_pending_submit_if_due(&mut self) -> bool {
         let due = self
             .pending_submit
             .as_ref()
@@ -819,6 +848,7 @@ impl App {
         if due {
             self.resolve_pending_submit(false);
         }
+        due
     }
 
     /// Recompute the completion menu from the current composer buffer. Clears
@@ -924,73 +954,135 @@ impl App {
         }
     }
 
-    /// Mouse wheel scroll. Each notch moves a few lines; reaching the bottom
+    /// Mouse wheel scroll. Each notch moves one line; reaching the bottom
     /// re-pins to follow, reaching the top holds at line 0. Single-pass (one
     /// `total_lines` computation) so a fast trackpad swipe doesn't re-parse the
     /// streaming markdown once per line.
     fn handle_mouse(&mut self, ev: MouseEvent) {
-        const WHEEL_LINES: i32 = 3;
         match ev.kind {
-            // Scrolling moves the text out from under a highlight, so the
-            // selection can't survive it.
             MouseEventKind::ScrollUp => {
-                self.clear_selection();
-                self.scroll_by(-WHEEL_LINES)
+                let transcript_selection = self.view.transcript_selection.is_some();
+                if !transcript_selection {
+                    self.clear_selection();
+                }
+                self.scroll_by(-WHEEL_LINES);
+                if transcript_selection && self.view.selection_dragging {
+                    self.extend_transcript_selection_to_viewport_edge(true);
+                }
             }
             MouseEventKind::ScrollDown => {
-                self.clear_selection();
-                self.scroll_by(WHEEL_LINES)
+                let transcript_selection = self.view.transcript_selection.is_some();
+                if !transcript_selection {
+                    self.clear_selection();
+                }
+                self.scroll_by(WHEEL_LINES);
+                if transcript_selection && self.view.selection_dragging {
+                    self.extend_transcript_selection_to_viewport_edge(false);
+                }
             }
             // A press no longer acts immediately: not until the button comes
             // up do we know whether this was a click (toggle a block) or a
             // drag (select text).
             MouseEventKind::Down(MouseButton::Left) => {
+                self.clear_selection();
                 self.view.copy_notice = None;
-                self.view.selection = Some(Selection {
-                    anchor: (ev.column, ev.row),
-                    head: (ev.column, ev.row),
-                });
+                self.view.selection_dragging = true;
+                if let Some(point) = self.view.transcript_point_at(ev.column, ev.row) {
+                    self.view.transcript_selection = Some(TranscriptSelection {
+                        anchor: point,
+                        head: point,
+                    });
+                } else {
+                    self.view.selection = Some(Selection {
+                        anchor: (ev.column, ev.row),
+                        head: (ev.column, ev.row),
+                    });
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(point) = self.view.transcript_point_at(ev.column, ev.row) {
+                    if let Some(sel) = self.view.transcript_selection.as_mut() {
+                        sel.head = point;
+                        return;
+                    }
+                }
                 if let Some(sel) = self.view.selection.as_mut() {
                     sel.head = (ev.column, ev.row);
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => match self.view.selection {
-                // Dragged: copy on release, with no extra keystroke — the
-                // selection *is* the copy gesture.
-                Some(sel) if !sel.is_empty() => self.view.copy_pending = true,
-                // Never moved: a plain click, which keeps its old meaning.
-                _ => {
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(point) = self.view.transcript_point_at(ev.column, ev.row) {
+                    if let Some(sel) = self.view.transcript_selection.as_mut() {
+                        sel.head = point;
+                    }
+                }
+                self.view.selection_dragging = false;
+                let dragged = self
+                    .view
+                    .transcript_selection
+                    .is_some_and(|sel| !sel.is_empty())
+                    || self.view.selection.is_some_and(|sel| !sel.is_empty());
+                if dragged {
+                    // Copy on release, with no extra keystroke — the selection
+                    // itself is the copy gesture.
+                    self.view.copy_pending = true;
+                } else {
+                    // Never moved: a plain click, which keeps its old meaning.
                     self.clear_selection();
                     self.toggle_expandable_at(ev.column, ev.row);
                 }
-            },
+            }
             _ => {}
+        }
+    }
+
+    /// Extend an active transcript drag to the newly exposed edge after a
+    /// wheel event. Logical transcript indices make this work even though the
+    /// anchor has already left the visible terminal buffer.
+    fn extend_transcript_selection_to_viewport_edge(&mut self, upper: bool) {
+        let total = self.total_lines();
+        if total == 0 {
+            return;
+        }
+        let top = self.current_top(total);
+        let line = if upper {
+            top
+        } else {
+            top.saturating_add(self.view.area_height.saturating_sub(1))
+                .min(total - 1)
+        };
+        if let Some(selection) = self.view.transcript_selection.as_mut() {
+            selection.head.line = line;
+            selection.head.visual_row = if upper { 0 } else { usize::MAX };
+            selection.head.column = if upper { 0 } else { u16::MAX };
         }
     }
 
     /// Drop any selection and the text harvested for it.
     fn clear_selection(&mut self) {
         self.view.selection = None;
+        self.view.transcript_selection = None;
+        self.view.selection_dragging = false;
         self.view.selection_text = None;
     }
 
     /// Copy a finished drag to the clipboard. Called right after a draw,
-    /// because the text is read out of the rendered buffer and only exists
-    /// once the frame has been painted.
-    fn flush_copy(&mut self) {
+    /// because screen selections are harvested from the finished buffer and
+    /// transcript selections are refreshed against their logical range there.
+    fn flush_copy(&mut self) -> bool {
         if !self.view.copy_pending {
-            return;
+            return false;
         }
         self.view.copy_pending = false;
         let Some(text) = self.view.selection_text.clone() else {
-            return;
+            return false;
         };
         if copy_to_clipboard(&text).is_ok() {
             let n = text.chars().count();
             self.view.copy_notice = Some((format!("copied {n} chars"), Instant::now()));
+            return true;
         }
+        false
     }
 
     /// Move the held scroll position by `delta` lines (negative = up). Clamps
@@ -1249,9 +1341,12 @@ impl App {
                 self.view
                     .transcript
                     .push(mk("  Alt+↑/↓      recall prompt history"));
-                self.view.transcript.push(mk(
-                    "  drag         select text with your terminal, then copy",
-                ));
+                self.view
+                    .transcript
+                    .push(mk("  drag         select and copy text on release"));
+                self.view
+                    .transcript
+                    .push(mk("  drag+wheel   extend selection through history"));
                 self.view.transcript.push(mk(
                     "  Ctrl+O       toggle wheel scrolling / native selection",
                 ));
@@ -1452,10 +1547,9 @@ impl App {
 
     /// Hand the mouse back to the terminal, or take it again.
     ///
-    /// Mouse capture is what makes the wheel scroll the transcript, but it
-    /// also means the terminal never sees a drag — so there is no way to
-    /// select text, and copy/paste out of `sc` is impossible. Neither state is
-    /// right all the time, so it is a toggle rather than a default.
+    /// Mouse capture gives the app wheel navigation and in-app copy. Releasing
+    /// it remains useful for terminals whose clipboard policy blocks OSC 52
+    /// and which therefore need to own selection themselves.
     fn toggle_mouse_capture(&mut self) {
         self.view.mouse_capture = !self.view.mouse_capture;
         let mut out = std::io::stdout();
@@ -2684,6 +2778,20 @@ mod tests {
 
         let tmux = osc52_sequence("copy me", true);
         assert_eq!(tmux, "\x1bPtmux;\x1b\x1b]52;c;Y29weSBtZQ==\x07\x1b\\");
+    }
+
+    #[test]
+    fn idle_poll_timeout_does_not_request_a_terminal_redraw() {
+        assert!(!should_draw(false, false, false, false));
+        assert!(should_draw(true, false, false, false));
+        assert!(should_draw(false, true, false, false));
+        assert!(should_draw(false, false, true, false));
+        assert!(should_draw(false, false, false, true));
+    }
+
+    #[test]
+    fn wheel_navigation_is_one_line_per_event() {
+        assert_eq!(WHEEL_LINES, 1);
     }
 
     /// A selection reads the same whichever way it was dragged.

@@ -5,6 +5,18 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+### Changed
+
+- Mouse-wheel history navigation now moves one transcript row per event, and
+  transcript selections remain anchored while scrolling across viewports.
+- The TUI stops repainting on idle poll timeouts, allowing terminal tabs to
+  become quiescent while no turn or input is active.
+
+### Fixed
+
+- Copying a transcript selection now includes the complete range between its
+  endpoints, including history rows outside the current viewport.
+
 ## [0.1.2] - 2026-09-03
 
 ### Added
