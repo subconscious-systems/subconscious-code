@@ -16,6 +16,8 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 - Copying a transcript selection now includes the complete range between its
   endpoints, including history rows outside the current viewport.
+- The incremental-session durability test now waits for the asynchronous
+  writer's flush instead of racing its filesystem thread in fast CI runners.
 
 ## [0.1.2] - 2026-09-03
 
