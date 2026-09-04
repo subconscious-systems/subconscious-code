@@ -1708,6 +1708,7 @@ dependencies = [
  "rc-tokenize",
  "rc-tools",
  "rc-tui",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

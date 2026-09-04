@@ -75,6 +75,16 @@ Release archives and their checksum files include keyless Sigstore bundles.
 The `subc sc install` command uses the same OS/architecture mapping and installs
 the matching archive without requiring Cargo.
 
+To see whether the installed binary is behind the newest release:
+
+```sh
+sc update
+```
+
+Use `sc update --json` for scripts. While the repository is private, the check
+uses an authenticated GitHub CLI session when available; otherwise set
+`GH_TOKEN`. Install an available update with `subc sc install`.
+
 Launch `sc`. On first use, the CLI securely prompts for your Subconscious API
 key and saves it to `~/.sc/key` with user-only permissions:
 
