@@ -218,9 +218,13 @@ pub fn logo_glyph() -> &'static str {
     static GLYPH: OnceLock<String> = OnceLock::new();
     GLYPH
         .get_or_init(|| {
-            let custom = std::env::var_os("HOME")
+            #[cfg(not(windows))]
+            let custom_path = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
-                .map(|home| home.join(".sc").join("logo.txt"))
+                .map(|home| home.join(".sc").join("logo.txt"));
+            #[cfg(windows)]
+            let custom_path = rc_config::user_dir().map(|dir| dir.join("logo.txt"));
+            let custom = custom_path
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .and_then(|body| {
                     body.lines()

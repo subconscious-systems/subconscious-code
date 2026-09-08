@@ -682,9 +682,15 @@ fn env_bool(name: &str) -> Option<bool> {
 }
 
 /// `~/.sc/` — the user-global config directory.
+#[cfg(not(windows))]
 pub fn user_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".sc"))
 }
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::user_dir;
 
 fn user_settings_path() -> Option<PathBuf> {
     user_dir().map(|d| d.join("settings.json"))

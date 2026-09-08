@@ -1678,8 +1678,13 @@ fn loop_prompt(direction: Option<&str>) -> String {
 /// assembler rather than merely checking whether a path exists.
 fn memory_status_lines(cwd: &Path) -> Vec<String> {
     let mut candidates = Vec::with_capacity(3);
+    #[cfg(not(windows))]
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(PathBuf::from(home).join(".sc").join("AGENTS.md"));
+    }
+    #[cfg(windows)]
+    if let Some(dir) = rc_config::user_dir() {
+        candidates.push(dir.join("AGENTS.md"));
     }
     candidates.push(cwd.join(".sc").join("AGENTS.md"));
     candidates.push(cwd.join("AGENTS.md"));
@@ -1945,6 +1950,12 @@ fn cycle_mode(m: AgentMode) -> AgentMode {
 /// A rough "don't ask again for this" rule, matching rc-cli's stdin prompter:
 /// `Bash(<first-token>:*)` for Bash, the bare tool name otherwise.
 fn suggested_rule(tool: &str, input: &Value) -> String {
+    #[cfg(windows)]
+    if tool == "PowerShell" {
+        return rc_core::powershell_grant(
+            input.get("command").and_then(Value::as_str).unwrap_or(""),
+        );
+    }
     if tool == "Bash" {
         if let Some(cmd) = input.get("command").and_then(|val| val.as_str()) {
             let first = cmd.split_whitespace().next().unwrap_or("");
@@ -2314,19 +2325,33 @@ const MAX_HISTORY: usize = 2000;
 
 /// The prompt-history file: `~/.sc/history.txt` — the same `~/.sc` config dir
 /// `sc` already uses. `None` when `$HOME` is unset.
+#[cfg(not(windows))]
 fn sc_history_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".sc").join("history.txt"))
 }
 
+#[cfg(windows)]
+fn sc_history_path() -> Option<PathBuf> {
+    rc_config::user_dir().map(|dir| dir.join("history.txt"))
+}
+
 /// `~/.sc/sessions` — where `/menu` reads the project/session listing from.
 /// Mirrors `rc-cli`'s `sessions_dir()`; a missing `HOME` yields a path that
 /// simply lists empty rather than failing the menu open.
+#[cfg(not(windows))]
 fn sessions_dir_for_menu() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
         .join(".sc")
+        .join("sessions")
+}
+
+#[cfg(windows)]
+fn sessions_dir_for_menu() -> PathBuf {
+    rc_config::user_dir()
+        .unwrap_or_else(|| PathBuf::from(".sc"))
         .join("sessions")
 }
 

@@ -134,6 +134,7 @@ headless mode for code changes.
 | Guide | Use it for |
 | --- | --- |
 | [Getting started](docs/GETTING_STARTED.md) | Installation, first run, provider setup, and terminal controls |
+| [Native Windows](docs/WINDOWS.md) | Windows x64 builds, PowerShell, optional Git Bash, and Windows permissions |
 | [Configuration](docs/CONFIGURATION.md) | Settings files, environment variables, permissions, DLR, and examples |
 | [Architecture](docs/ARCHITECTURE.md) | Crate boundaries, request flow, persistence, and transport design |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Endpoint, terminal, context-size, DLR, and sandbox problems |

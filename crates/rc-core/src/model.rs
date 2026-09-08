@@ -575,7 +575,8 @@ mod tests {
         assert_eq!(resp.finish_reason, FinishReason::Stop);
     }
 
-    #[tokio::test]
+    #[cfg_attr(windows, tokio::test(start_paused = true))]
+    #[cfg_attr(not(windows), tokio::test)]
     async fn transport_activity_resets_idle_timeout_without_becoming_output() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentStreamEvent, ProtoError>>(8);
         let stream: Pin<Box<dyn Stream<Item = Result<AgentStreamEvent, ProtoError>> + Send>> =

@@ -158,8 +158,11 @@ impl Tool for List {
             } else {
                 ("other", None, "")
             };
+            let display = relative.to_string_lossy();
+            #[cfg(windows)]
+            let display = display.replace('\\', "/");
             entries.push(Entry {
-                path: format!("{}{suffix}", relative.to_string_lossy()),
+                path: format!("{display}{suffix}"),
                 kind,
                 size,
             });

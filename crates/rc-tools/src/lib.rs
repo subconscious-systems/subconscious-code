@@ -7,8 +7,10 @@
 //! destructive-command safety floor.
 
 pub mod append;
+#[cfg_attr(windows, path = "windows/shell.rs")]
 pub mod bash;
 pub mod edit;
+#[cfg_attr(windows, path = "windows/env_hygiene.rs")]
 pub mod env_hygiene;
 pub mod glob;
 pub mod grep;

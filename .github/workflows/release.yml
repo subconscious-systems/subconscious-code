@@ -113,9 +113,48 @@ jobs:
             dist/sc-${{ matrix.target }}.tar.gz.sha256.sigstore.json
           if-no-files-found: error
 
+  release-windows:
+    name: Release binary (x86_64-pc-windows-msvc)
+    needs: release-preflight
+    runs-on: windows-2025
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Test Windows implementation
+        env:
+          SC_POWERSHELL_PATH: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        run: cargo test --locked --workspace
+      - name: Build self-contained sc.exe
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin sc
+      - run: ./scripts/package-windows.ps1
+      - name: Exercise the executable against a local mock gateway
+        run: node scripts/windows-smoke.mjs
+      - name: Sign Windows archive and checksum
+        run: |
+          foreach ($file in @('dist/sc-x86_64-pc-windows-msvc.zip', 'dist/sc-x86_64-pc-windows-msvc.zip.sha256')) {
+            cosign sign-blob --yes --bundle "$file.sigstore.json" $file
+            if ($LASTEXITCODE -ne 0) { throw "Signing failed: $file" }
+          }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: sc-x86_64-pc-windows-msvc
+          path: dist/sc-x86_64-pc-windows-msvc.zip*
+          if-no-files-found: error
+
   github-release:
     name: Publish GitHub release
-    needs: release-binaries
+    needs: [release-binaries, release-windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -128,5 +167,6 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           fail_on_unmatched_files: true
           files: dist/*

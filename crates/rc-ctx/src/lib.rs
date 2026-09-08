@@ -159,9 +159,16 @@ impl Memory {
     /// Later (higher-precedence) files override earlier ones in the prompt.
     pub fn load_chain(cwd: &Path) -> Vec<Memory> {
         let mut chain = Vec::new();
+        #[cfg(not(windows))]
         if let Some(home) = std::env::var_os("HOME") {
             let p = Path::new(&home).join(".sc").join("AGENTS.md");
             if let Some(m) = load_memory(&p, "~/.sc/AGENTS.md") {
+                chain.push(m);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(dir) = rc_config::user_dir() {
+            if let Some(m) = load_memory(&dir.join("AGENTS.md"), "~/.sc/AGENTS.md") {
                 chain.push(m);
             }
         }

@@ -13,5 +13,8 @@ rc-algebra = { path = "../rc-algebra" }
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+rc-config = { path = "../rc-config" }
+
 [dev-dependencies]
 tempfile = "3"
