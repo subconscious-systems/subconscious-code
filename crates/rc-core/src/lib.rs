@@ -23,6 +23,8 @@ pub mod registry;
 pub mod state;
 pub mod tool;
 pub mod turn;
+#[cfg(windows)]
+pub mod windows_process;
 
 pub use agent::{AgentLoop, LoopError, LoopOutcome};
 pub use context::{ContextAssembler, LegacyAssembler};
@@ -33,6 +35,8 @@ pub use model::{
 };
 pub use project::{project, project_with, verify_invariant};
 pub use prompt::{AskResponse, NullPrompter, Prompter};
+#[cfg(windows)]
+pub use rc_perm::rules::powershell_grant;
 pub use rc_perm::{
     resolve_within, resolve_within_loose, AllowAllChecker, BypassChecker, Decision, Mode,
     PermissionChecker, PermissionEngine,

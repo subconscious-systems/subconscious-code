@@ -235,6 +235,8 @@ mod tests {
 
         match out {
             ToolOutcome::Ok { content, .. } => {
+                #[cfg(windows)]
+                let content = content.replace('\\', "/");
                 assert!(content.contains(".github/workflows/ci.yml"), "{content}");
             }
             o => panic!("expected ok, got {o:?}"),

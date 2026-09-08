@@ -8,6 +8,14 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
+#[cfg(windows)]
+#[path = "windows/powershell.rs"]
+mod powershell;
+#[cfg(windows)]
+pub use powershell::{
+    exact_grant as powershell_grant, is_catastrophic as powershell_is_catastrophic,
+};
+
 #[derive(Debug, Clone)]
 pub enum Decision {
     Allow,
@@ -265,6 +273,10 @@ impl PermissionChecker for AllowAllChecker {
 pub struct BypassChecker;
 impl PermissionChecker for BypassChecker {
     fn check(&self, tool: &str, input: &Value, _: &Path, _: &[PathBuf], _: &[String]) -> Decision {
+        #[cfg(windows)]
+        if tool == "PowerShell" {
+            return powershell::bypass(input);
+        }
         if tool == "Bash" {
             if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
                 if is_catastrophic_cmd(cmd) {
@@ -419,6 +431,11 @@ impl PermissionChecker for PermissionEngine {
     ) -> Decision {
         let mode = self.mode();
         let grant_rules = parse_rules(grants);
+
+        #[cfg(windows)]
+        if tool == "PowerShell" {
+            return self.powershell_check(input, &grant_rules, mode);
+        }
 
         // Session grants for path tools: a matching grant → Allow.
         if tool != "Bash" {
@@ -855,10 +872,22 @@ mod tests {
 
     #[test]
     fn resolve_within_rejects_paths_outside_roots() {
+        #[cfg(not(windows))]
         let roots = vec![std::env::temp_dir()];
         let cwd = std::env::temp_dir();
         // /etc/passwd exists on macOS/Linux and is not under the temp root.
+        #[cfg(not(windows))]
         let res = crate::path::resolve_within(&roots, &cwd, "/etc/passwd");
+        #[cfg(windows)]
+        let res = {
+            let allowed = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            crate::path::resolve_within(
+                &[allowed.path().to_path_buf()],
+                &cwd,
+                &outside.path().to_string_lossy(),
+            )
+        };
         assert!(
             res.is_err(),
             "expected an outside-roots refusal, got {res:?}"

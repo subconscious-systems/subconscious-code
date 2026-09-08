@@ -8,12 +8,26 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout};
+use std::process::Child;
+#[cfg(unix)]
+use std::process::ChildStdout;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+#[cfg(unix)]
+pub type ProcessGroup = Option<i32>;
+#[cfg(windows)]
+pub type ProcessGroup = crate::windows_process::Job;
+#[cfg(unix)]
+pub type SupervisedOutput = ChildStdout;
+#[cfg(windows)]
+pub type SupervisedOutput = crate::windows_process::Output;
 
 /// A shared, lockable read registry. Cheap to clone (the inner is an `Arc`).
 pub type SharedReadRegistry = std::sync::Arc<Mutex<ReadRegistry>>;
@@ -106,8 +120,8 @@ impl ShellState {
         &mut self,
         shell: BgShell,
         child: Child,
-        stdout: ChildStdout,
-        pgid: Option<i32>,
+        stdout: SupervisedOutput,
+        pgid: ProcessGroup,
     ) -> std::io::Result<()> {
         let Some(supervisor) = &self.supervisor else {
             return Err(std::io::Error::new(
@@ -143,8 +157,8 @@ enum SupervisorCommand {
     Add {
         shell: BgShell,
         child: Child,
-        stdout: ChildStdout,
-        pgid: Option<i32>,
+        stdout: SupervisedOutput,
+        pgid: ProcessGroup,
     },
     Shutdown(std::sync::mpsc::Sender<()>),
 }
@@ -176,8 +190,8 @@ impl BackgroundSupervisor {
         &self,
         shell: BgShell,
         child: Child,
-        stdout: ChildStdout,
-        pgid: Option<i32>,
+        stdout: SupervisedOutput,
+        pgid: ProcessGroup,
     ) -> std::io::Result<()> {
         if let Err(std::sync::mpsc::SendError(SupervisorCommand::Add {
             child: mut unsupervised,
@@ -217,8 +231,8 @@ impl Drop for BackgroundSupervisor {
 struct SupervisedProcess {
     shell: BgShell,
     child: Child,
-    stdout: ChildStdout,
-    pgid: Option<i32>,
+    stdout: SupervisedOutput,
+    pgid: ProcessGroup,
     log: SegmentedLog,
 }
 
@@ -273,7 +287,7 @@ fn supervisor_loop(receiver: std::sync::mpsc::Receiver<SupervisorCommand>) {
                     // A background command owns its whole process group. Once
                     // the leader exits, terminate daemonized descendants and
                     // reap the leader so neither orphans nor zombies remain.
-                    kill_group(process.pgid);
+                    kill_group(&process.pgid);
                     let _ = drain_supervised(process);
                     let code = status.code().unwrap_or(-1);
                     let _ = writeln!(process.log, "\n[process exited: {code}]");
@@ -301,13 +315,13 @@ fn add_supervised(
     processes: &mut Vec<SupervisedProcess>,
     shell: BgShell,
     mut child: Child,
-    stdout: ChildStdout,
-    pgid: Option<i32>,
+    stdout: SupervisedOutput,
+    pgid: ProcessGroup,
 ) {
     let log = match set_nonblocking(&stdout).and_then(|()| SegmentedLog::new(&shell.log_path)) {
         Ok(log) => log,
         Err(error) => {
-            kill_group(pgid);
+            kill_group(&pgid);
             let _ = child.kill();
             let _ = child.wait();
             if let Ok(mut state) = shell.status.lock() {
@@ -326,6 +340,7 @@ fn add_supervised(
     });
 }
 
+#[cfg(unix)]
 fn drain_supervised(process: &mut SupervisedProcess) -> bool {
     let mut bytes = [0u8; 16 * 1024];
     let mut wrote = false;
@@ -343,8 +358,13 @@ fn drain_supervised(process: &mut SupervisedProcess) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn drain_supervised(process: &mut SupervisedProcess) -> bool {
+    process.stdout.drain_into(&mut process.log)
+}
+
 fn kill_supervised(process: &mut SupervisedProcess) {
-    kill_group(process.pgid);
+    kill_group(&process.pgid);
     let _ = process.child.kill();
     let _ = process.child.wait();
     let _ = drain_supervised(process);
@@ -354,13 +374,15 @@ fn kill_supervised(process: &mut SupervisedProcess) {
     }
 }
 
-fn kill_group(pgid: Option<i32>) {
+#[cfg(unix)]
+fn kill_group(pgid: &ProcessGroup) {
     if let Some(pgid) = pgid {
         // SAFETY: this process group was created with setsid before exec.
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
     }
 }
 
+#[cfg(unix)]
 fn set_nonblocking(stdout: &ChildStdout) -> std::io::Result<()> {
     let fd = stdout.as_raw_fd();
     // SAFETY: fcntl operates on the owned pipe fd and neither call aliases
@@ -369,6 +391,17 @@ fn set_nonblocking(stdout: &ChildStdout) -> std::io::Result<()> {
     if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn kill_group(job: &ProcessGroup) {
+    job.kill();
+}
+
+#[cfg(windows)]
+fn set_nonblocking(_stdout: &SupervisedOutput) -> std::io::Result<()> {
+    // Windows drains use PeekNamedPipe before every read instead of fcntl.
     Ok(())
 }
 

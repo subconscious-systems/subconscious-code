@@ -1081,10 +1081,13 @@ mod tests {
             elapsed >= Duration::from_millis(80),
             "should have backed off (retried), took {elapsed:?}"
         );
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "should give up fast, took {elapsed:?}"
-        );
+        #[cfg(not(windows))]
+        let deadline = Duration::from_secs(3);
+        // Winsock may take about two seconds to report each refused connection;
+        // the three attempts are not instantaneous as on Unix.
+        #[cfg(windows)]
+        let deadline = Duration::from_secs(10);
+        assert!(elapsed < deadline, "should give up fast, took {elapsed:?}");
     }
 
     #[test]

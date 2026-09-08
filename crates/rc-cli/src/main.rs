@@ -775,9 +775,17 @@ mod lazy_assembler_tests {
 }
 
 /// `~/.sc/sessions/` — where session JSONL files live. Created on first use.
+#[cfg(not(windows))]
 fn sessions_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set; cannot locate ~/.sc/sessions")?;
     Ok(PathBuf::from(home).join(".sc").join("sessions"))
+}
+
+#[cfg(windows)]
+fn sessions_dir() -> Result<PathBuf> {
+    Ok(rc_config::user_dir()
+        .context("Windows user profile is not set; cannot locate .sc/sessions")?
+        .join("sessions"))
 }
 
 /// Opaque, collision-resistant identity shared by local persistence and the
@@ -2199,6 +2207,12 @@ impl Prompter for StdinPrompter {
 /// A rough "don't ask again for this" rule: `Bash(<first-token>:*)` for Bash,
 /// the bare tool name for everything else (grants the whole tool for the session).
 fn suggested_rule(tool: &str, input: &Value) -> String {
+    #[cfg(windows)]
+    if tool == "PowerShell" {
+        return rc_core::powershell_grant(
+            input.get("command").and_then(Value::as_str).unwrap_or(""),
+        );
+    }
     if tool == "Bash" {
         if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
             let first = cmd.split_whitespace().next().unwrap_or("");

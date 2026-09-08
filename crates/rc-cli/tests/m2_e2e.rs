@@ -52,6 +52,12 @@ fn call(id: &str, name: &str, args: serde_json::Value) -> FinalizedToolCall {
 
 #[tokio::test]
 async fn add_verbose_flag_and_compile() {
+    let shell_name = Bash::new().name().to_string();
+    let compile_command = if shell_name == "PowerShell" {
+        "rustc --edition 2021 main.rs -o out.exe; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Write-Output COMPILE_OK"
+    } else {
+        "rustc --edition 2021 main.rs -o out && echo COMPILE_OK"
+    };
     let dir = tempdir().unwrap();
     let main_rs = dir.path().join("main.rs");
     std::fs::write(&main_rs, "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
@@ -98,8 +104,8 @@ async fn add_verbose_flag_and_compile() {
             reasoning: None,
             tool_calls: vec![call(
                 "c3",
-                "Bash",
-                serde_json::json!({ "command": "rustc --edition 2021 main.rs -o out && echo COMPILE_OK" }),
+                &shell_name,
+                serde_json::json!({ "command": compile_command }),
             )],
             finish_reason: FinishReason::ToolCalls,
             usage: None,
@@ -145,7 +151,7 @@ async fn add_verbose_flag_and_compile() {
         .messages
         .iter()
         .find_map(|t| match t {
-            Turn::ToolResult { tool, result, .. } if tool == "Bash" => Some(result.render()),
+            Turn::ToolResult { tool, result, .. } if tool == &shell_name => Some(result.render()),
             _ => None,
         })
         .expect("a Bash tool result");
