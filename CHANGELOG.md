@@ -5,6 +5,22 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-08
+
+### Added
+
+- Native Windows x64 support on the stable release channel: a self-contained
+  `sc.exe`, ZIP archive, SHA-256 checksum, and Sigstore verification bundles.
+- A separate PowerShell backend, exact-script approvals, process-tree cleanup,
+  Windows profile discovery, and an explicit optional Git Bash backend.
+
+### Compatibility
+
+- Promotes the Windows preview implementation without changing Unix shell
+  behavior. Windows ARM64 and kernel sandboxing remain unsupported.
+- Automated Windows and Unix checks and public-release installation passed;
+  browser login and real model inference still require user-device verification.
+
 ## [0.1.4-windows.0] - 2026-09-08
 
 ### Added
@@ -94,7 +110,8 @@ Initial public release.
 - Benchmark completion review, no-progress handling, and endpoint diagnostics.
 - Linux sandboxing and fail-closed headless permissions.
 
-[Unreleased]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.4-windows.0...HEAD
+[Unreleased]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.3...v0.1.4
 [0.1.4-windows.0]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.3...v0.1.4-windows.0
 [0.1.3]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/subconscious-systems/subconscious-code/compare/v0.1.1...v0.1.2
