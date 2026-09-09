@@ -14,11 +14,13 @@ Windows-enabled releases contain `sc-x86_64-pc-windows-msvc.zip` and its
 `.sha256` file. The archive contains one root `sc.exe`. Older releases without
 those assets cannot be installed on Windows through `subc sc install`.
 
-The Windows preview requires the Windows-enabled `subc` CLI. Pin the preview
-release explicitly; the stable release channel is unchanged:
+Windows x64 binaries are available in stable releases starting with `sc` 0.1.4.
+Use `subconscious-cli` 4.1.0 or newer to install them. Clear any preview version
+pin from the current PowerShell session before installing the latest release:
 
 ```powershell
-$env:SC_CODE_VERSION = '0.1.4-windows.0'
+npm.cmd install -g subconscious-cli@latest
+Remove-Item Env:SC_CODE_VERSION -ErrorAction SilentlyContinue
 subc.cmd sc install
 subc.cmd sc
 ```
