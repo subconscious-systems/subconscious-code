@@ -5,6 +5,18 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-09
+
+### Fixed
+
+- Windows releases now ship `marathon.exe` in a `marathon-*.zip` archive,
+  avoiding the built-in Windows `sc` service-control command. Windows help,
+  version output, and update instructions use Marathon.
+- Install and launch with `subconscious-cli` 4.1.1 or newer using
+  `subc marathon install` and `subc marathon`. Existing `.sc` settings,
+  sessions, and `SC_*` environment variables remain compatible.
+- Unix binaries, release archive names, and shell behavior are unchanged.
+
 ## [0.1.4] - 2026-09-08
 
 ### Added

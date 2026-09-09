@@ -12,16 +12,23 @@ try {
     $reader.BaseStream.Position = $offset
     if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'Expected an x64 PE executable' }
 } finally { $reader.Dispose() }
-& $binary --version
-if ($LASTEXITCODE -ne 0) { throw 'Windows executable smoke test failed' }
 New-Item -ItemType Directory -Force $dist | Out-Null
-$archive = Join-Path $dist "sc-$Target.zip"
-Compress-Archive -LiteralPath $binary -DestinationPath $archive -Force
+# Keep the internal Cargo target and all Unix packaging unchanged. Windows
+# must never publish/install a binary named like the system service controller.
+$executable = Join-Path $dist 'marathon.exe'
+Copy-Item -LiteralPath $binary -Destination $executable -Force
+$version = & $executable --version
+if ($LASTEXITCODE -ne 0 -or $version -notmatch '^marathon ') { throw 'Marathon version smoke test failed' }
+Write-Output $version
+$help = & $executable --help
+if ($LASTEXITCODE -ne 0 -or ($help -join "`n") -notmatch 'Usage: marathon') { throw 'Marathon help smoke test failed' }
+$archive = Join-Path $dist "marathon-$Target.zip"
+Compress-Archive -LiteralPath $executable -DestinationPath $archive -Force
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [IO.Compression.ZipFile]::OpenRead($archive)
 try {
-    if ($zip.Entries.Count -ne 1 -or $zip.Entries[0].FullName -ne 'sc.exe') { throw 'Expected exactly one root sc.exe' }
+    if ($zip.Entries.Count -ne 1 -or $zip.Entries[0].FullName -ne 'marathon.exe') { throw 'Expected exactly one root marathon.exe' }
 } finally { $zip.Dispose() }
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-[IO.File]::WriteAllText("$archive.sha256", "$hash  sc-$Target.zip`n", (New-Object Text.UTF8Encoding $false))
+[IO.File]::WriteAllText("$archive.sha256", "$hash  marathon-$Target.zip`n", (New-Object Text.UTF8Encoding $false))
 Write-Output "Packaged $archive"

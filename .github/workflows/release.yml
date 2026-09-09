@@ -133,7 +133,7 @@ jobs:
         env:
           SC_POWERSHELL_PATH: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
         run: cargo test --locked --workspace
-      - name: Build self-contained sc.exe
+      - name: Build self-contained Windows agent
         env:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin sc
@@ -142,14 +142,14 @@ jobs:
         run: node scripts/windows-smoke.mjs
       - name: Sign Windows archive and checksum
         run: |
-          foreach ($file in @('dist/sc-x86_64-pc-windows-msvc.zip', 'dist/sc-x86_64-pc-windows-msvc.zip.sha256')) {
+          foreach ($file in @('dist/marathon-x86_64-pc-windows-msvc.zip', 'dist/marathon-x86_64-pc-windows-msvc.zip.sha256')) {
             cosign sign-blob --yes --bundle "$file.sigstore.json" $file
             if ($LASTEXITCODE -ne 0) { throw "Signing failed: $file" }
           }
       - uses: actions/upload-artifact@v6
         with:
-          name: sc-x86_64-pc-windows-msvc
-          path: dist/sc-x86_64-pc-windows-msvc.zip*
+          name: marathon-x86_64-pc-windows-msvc
+          path: dist/marathon-x86_64-pc-windows-msvc.zip*
           if-no-files-found: error
 
   github-release:

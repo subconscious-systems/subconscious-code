@@ -40,8 +40,8 @@ jobs:
         run: node scripts/windows-smoke.mjs
       - uses: actions/upload-artifact@v6
         with:
-          name: sc-x86_64-pc-windows-msvc
+          name: marathon-x86_64-pc-windows-msvc
           path: |
-            dist/sc-x86_64-pc-windows-msvc.zip
-            dist/sc-x86_64-pc-windows-msvc.zip.sha256
+            dist/marathon-x86_64-pc-windows-msvc.zip
+            dist/marathon-x86_64-pc-windows-msvc.zip.sha256
           if-no-files-found: error

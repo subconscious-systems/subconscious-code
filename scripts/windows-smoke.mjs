@@ -1,5 +1,5 @@
 // Real Windows executable + real PowerShell, with a local mock model only.
-// Run: node scripts/windows-smoke.mjs path/to/sc.exe
+// Run: node scripts/windows-smoke.mjs path/to/marathon.exe
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 assert.equal(process.platform, 'win32', 'Run this smoke test on native Windows');
-const binary = path.resolve(process.argv[2] || 'target/x86_64-pc-windows-msvc/release/sc.exe');
+const binary = path.resolve(process.argv[2] || 'dist/marathon.exe');
 const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'sc-windows-smoke-'));
 await fs.mkdir(path.join(profile, '.sc'));
 await fs.writeFile(path.join(profile, '.sc', 'AGENTS.md'), 'WINDOWS_PROFILE_MEMORY_MARKER');
