@@ -117,10 +117,10 @@ local mock streaming gateway, verifies secret filtering and tool-result replay,
 and loads global memory from an isolated Windows profile with no `HOME`:
 
 ```powershell
-node scripts/windows-smoke.mjs ./target/x86_64-pc-windows-msvc/release/sc.exe
+node scripts/windows-smoke.mjs ./dist/marathon.exe
 ```
 
-Node is needed only for this test harness, not to run `sc.exe`.
+Node is needed only for this test harness, not to run `marathon.exe`.
 
 Verified on the supplied Windows x64 VM on 2026-09-08: 553 workspace tests
 passed (3 pre-existing ignored benchmarks), formatting and Clippy were clean,
