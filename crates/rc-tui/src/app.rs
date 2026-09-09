@@ -1538,7 +1538,7 @@ impl App {
                 "terminal setup",
                 &[
                     "  bind Shift+Enter to send a newline / CSI-u sequence".into(),
-                    "  sc accepts bracketed paste and ordinary Enter submits".into(),
+                    "  marathon accepts bracketed paste and ordinary Enter submits".into(),
                 ],
             ),
             SlashAction::Prompt(text) => self.submit_prompt(text),
@@ -2324,7 +2324,7 @@ fn push_history(history: &mut Vec<String>, entry: String) {
 const MAX_HISTORY: usize = 2000;
 
 /// The prompt-history file: `~/.sc/history.txt` — the same `~/.sc` config dir
-/// `sc` already uses. `None` when `$HOME` is unset.
+/// `marathon` already uses. `None` when `$HOME` is unset.
 #[cfg(not(windows))]
 fn sc_history_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;

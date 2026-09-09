@@ -47,7 +47,7 @@ body:
     id: diagnostics
     attributes:
       label: Sanitized diagnostics
-      description: Include relevant logs or `sc doctor` output after removing sensitive values.
+      description: Include relevant logs or `marathon doctor` output after removing sensitive values.
   - type: dropdown
     id: dlr
     attributes:

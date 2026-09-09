@@ -1,6 +1,6 @@
 # Configuration
 
-`sc` uses layered JSON settings plus environment variables and CLI flags.
+`marathon` uses layered JSON settings plus environment variables and CLI flags.
 Configuration is resolved in this order, with later layers winning:
 
 1. Compiled defaults
@@ -68,10 +68,10 @@ backstop, not a byte cap.
 ## Credentials
 
 The API key is resolved from the variable named by `provider.api_key_env`
-(`SC_API_KEY` by default), then from `~/.sc/key`. A bare interactive `sc`
+(`SC_API_KEY` by default), then from `~/.sc/key`. A bare interactive `marathon`
 launch prompts securely and creates the key file when neither source is set;
 `/menu` can replace it later. Never store a literal key in either settings file;
-`sc doctor` warns when it finds a key-shaped value there.
+`marathon doctor` warns when it finds a key-shaped value there.
 
 ```sh
 export SC_API_KEY="your-api-key"

@@ -1,4 +1,4 @@
-//! `sc doctor` — verify a gateway before trusting it with real work.
+//! `marathon doctor` — verify a gateway before trusting it with real work.
 //!
 //! This exists because the two things Subconscious Code promises are properties
 //! of the *whole path*, not of this binary: an unlimited context is useless if
@@ -63,7 +63,7 @@ const LADDER: &[usize] = &[
 /// Run the doctor. Returns `Ok(false)` if any check failed, so the caller can
 /// exit non-zero without treating a failed probe as a crash.
 pub async fn run(settings: &Settings, body_ladder: bool) -> Result<bool> {
-    println!("sc doctor — {}", settings.base_url);
+    println!("marathon doctor — {}", settings.base_url);
     println!();
     println!("configuration");
     for line in config_lines(settings) {
@@ -78,8 +78,8 @@ pub async fn run(settings: &Settings, body_ladder: bool) -> Result<bool> {
             Status::Fail("no API key — set $SC_API_KEY".into()).render("api key")
         );
         println!();
-        println!("Run bare `sc` to save a key, or set SC_API_KEY for automation,");
-        println!("then re-run: sc doctor");
+        println!("Run bare `marathon` to save a key, or set SC_API_KEY for automation,");
+        println!("then re-run: marathon doctor");
         return Ok(false);
     };
 

@@ -323,7 +323,7 @@ impl MenuState {
                         field.env
                     ),
                     None if reload_client => {
-                        format!("saved to {} — reloading sc", path.display())
+                        format!("saved to {} — reloading marathon", path.display())
                     }
                     None => format!("saved to {}", path.display()),
                 });
@@ -340,7 +340,7 @@ impl MenuState {
     /// (delete `~/.sc/key` by hand to revert to env-only).
     ///
     /// On success this asks the host for an [`Outcome::Reload`] rather than
-    /// telling the user to restart `sc`. The running client holds the key it
+    /// telling the user to restart `marathon`. The running client holds the key it
     /// was built with, so a save with no rebuild looks like it did nothing —
     /// which is exactly how it read. The reload keeps the conversation and
     /// adopts the key that was just typed even when the env var would outrank
@@ -366,7 +366,7 @@ impl MenuState {
                 self.editing = None;
                 self.editing_api_key = false;
                 self.settings = Settings::load(project_dir);
-                // The env var is still what a *fresh* `sc` resolves first, so
+                // The env var is still what a *fresh* `marathon` resolves first, so
                 // a saved key that differs from it reverts on the next launch.
                 // Reloading now is honest about both halves.
                 self.status = Some(if env_set {
@@ -375,7 +375,7 @@ impl MenuState {
                         path.display()
                     )
                 } else {
-                    format!("saved to {} — reloading sc", path.display())
+                    format!("saved to {} — reloading marathon", path.display())
                 });
                 self.pending_outcome = Some(Outcome::Reload);
             }

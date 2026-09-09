@@ -197,7 +197,7 @@ fn load_memory(path: &Path, label: &str) -> Option<Memory> {
 
 /// The identity line that opens the §4.6 system prompt.
 const IDENTITY: &str =
-    "You are `sc` (Subconscious Code), a terminal agent that helps with software engineering \
+    "You are `marathon` (Subconscious Code), a terminal agent that helps with software engineering \
 tasks in the user's repository. Use the provided tools to inspect and edit files. Be concise and \
 direct. When you have enough information, answer in plain text.";
 
@@ -590,7 +590,7 @@ mod tests {
             git_branch: Some("main".into()),
         };
         let prompt = build_system_prompt(&env, &[]);
-        assert!(prompt.contains("You are `sc` (Subconscious Code)"));
+        assert!(prompt.contains("You are `marathon` (Subconscious Code)"));
         assert!(prompt.contains("Working directory: /repo"));
         assert!(prompt.contains("Platform: macOS"));
         assert!(prompt.contains("Date: Monday Jul 28, 2026"));

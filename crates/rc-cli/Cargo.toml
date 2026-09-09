@@ -12,7 +12,7 @@ keywords = ["agent", "cli", "terminal", "llm", "openai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "sc"
+name = "marathon"
 path = "src/main.rs"
 
 [dependencies]

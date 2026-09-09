@@ -19,28 +19,28 @@ You also need an API key for an OpenAI-compatible Chat Completions endpoint.
 The endpoint must support streaming responses and tool calls for the complete
 agent experience.
 
-## 2. Build and install `sc`
+## 2. Build and install `marathon`
 
 ```sh
 git clone https://github.com/subconscious-systems/subconscious-code.git
 cd subconscious-code
 cargo install --locked --path crates/rc-cli
-sc --version
+marathon --version
 ```
 
-`cargo install` places `sc` in Cargo's binary directory, normally
+`cargo install` places `marathon` in Cargo's binary directory, normally
 `~/.cargo/bin`. Ensure that directory is on `PATH` if the final command is not
 found.
 
 ## 3. Configure a provider
 
-For the default Subconscious endpoint, launch `sc`. If no key is configured,
+For the default Subconscious endpoint, launch `marathon`. If no key is configured,
 the interactive CLI prompts for it without echoing the secret and saves it to
 `~/.sc/key` with mode `0600`:
 
 ```sh
 cd /path/to/project
-sc
+marathon
 ```
 
 For automation, CI, or another compatible endpoint, configure the environment
@@ -60,7 +60,7 @@ priority, and `/menu` can replace the key stored in `~/.sc/key`.
 Run the built-in compatibility checks before starting work:
 
 ```sh
-sc doctor
+marathon doctor
 ```
 
 Doctor checks resolved configuration, authentication, non-streaming and
@@ -71,7 +71,7 @@ failing before diagnostics are printed.
 
 ```sh
 cd /path/to/project
-sc
+marathon
 ```
 
 Useful controls:
@@ -99,7 +99,7 @@ Explain the project layout and identify the main executable entry point.
 `-p` runs one turn and writes the final answer to stdout:
 
 ```sh
-sc -p "summarize the test strategy"
+marathon -p "summarize the test strategy"
 ```
 
 Headless mode has nobody available to approve mutations, so writes and shell

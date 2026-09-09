@@ -1,6 +1,6 @@
-//! Release update discovery for the `sc update` command.
+//! Release update discovery for the `marathon update` command.
 //!
-//! Installation belongs to the Subconscious CLI (`subc sc install`), which
+//! Installation belongs to the Subconscious CLI (`subc marathon install`), which
 //! already detects the platform, downloads the correct signed release asset,
 //! and verifies its checksum. This module only answers whether the running
 //! binary is behind the newest full GitHub release.
@@ -14,11 +14,7 @@ use tokio::process::Command;
 const REPOSITORY: &str = "subconscious-systems/subconscious-code";
 const RELEASES_API: &str =
     "https://api.github.com/repos/subconscious-systems/subconscious-code/releases/latest";
-const INSTALL_COMMAND: &str = if cfg!(windows) {
-    "subc marathon install"
-} else {
-    "subc sc install"
-};
+const INSTALL_COMMAND: &str = "subc marathon install";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
@@ -89,7 +85,7 @@ pub(crate) async fn run(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Prefer `gh`, exactly like `subc sc install`: it carries the user's existing
+/// Prefer `gh`, exactly like `subc marathon install`: it carries the user's existing
 /// GitHub authentication and can see a private release. Anonymous/token HTTP
 /// is the portable fallback and will work without credentials once public.
 async fn latest_release() -> Result<LatestRelease> {

@@ -9,7 +9,7 @@
 //! The API key is resolved from the env var named by `provider.api_key_env`
 //! (default `SC_API_KEY`), falling back to `~/.sc/key` — a dedicated file the
 //! TUI `/menu` "Change API key" option writes at mode 0600 — when the env var
-//! is unset. It is never stored in a *settings* file: `sc doctor` (G7)
+//! is unset. It is never stored in a *settings* file: `marathon doctor` (G7)
 //! complains loudly if a key-shaped string appears in a settings file. The
 //! `~/.sc/key` file is the sanctioned exception.
 //!
@@ -122,7 +122,7 @@ pub struct Settings {
     /// Extra repair symbols requested during a RESYNC/MISSING exchange.
     pub dlr_repair_margin_pct: u32,
     /// Whether the TUI grabs the mouse. On by default so the wheel and trackpad
-    /// scroll conversation history immediately. `sc` performs selection and
+    /// scroll conversation history immediately. `marathon` performs selection and
     /// copies on release while captured; Ctrl+O releases the mouse when native
     /// terminal selection is preferred.
     pub mouse: bool,
@@ -274,7 +274,7 @@ const DEFAULT_REASONING_EFFORT: &str = "high";
 
 /// Non-fatal problems found while loading settings: a malformed
 /// `settings.json` parse error, or a secret-shaped string in one. `Settings::load`
-/// drops these; `Settings::load_with_report` collects them so `sc doctor` can
+/// drops these; `Settings::load_with_report` collects them so `marathon doctor` can
 /// surface them instead of silently ignoring a typo'd config.
 #[derive(Debug, Default, Clone)]
 pub struct LoadReport {
@@ -293,18 +293,18 @@ impl Settings {
     /// Load settings with M0 precedence: defaults → user → project → env.
     /// Parse errors are reported via the returned [`LoadReport`] rather than
     /// failing the whole load — a typo in `~/.sc/settings.json` shouldn't make
-    /// `sc` unusable, but it should be visible (e.g. in `sc doctor`).
+    /// `marathon` unusable, but it should be visible (e.g. in `marathon doctor`).
     pub fn load(project_dir: &Path) -> Self {
         let mut report = LoadReport::default();
         let s = Self::load_with_report(project_dir, &mut report);
-        // The report is dropped here; `sc doctor` calls `load_with_report`
+        // The report is dropped here; `marathon doctor` calls `load_with_report`
         // directly to surface warnings. A normal `load` just proceeds.
         let _ = report;
         s
     }
 
     /// Load settings and capture any file parse errors / secret-scan hits into
-    /// `report`. Used by `sc doctor` to surface a malformed `settings.json`
+    /// `report`. Used by `marathon doctor` to surface a malformed `settings.json`
     /// instead of silently ignoring it.
     pub fn load_with_report(project_dir: &Path, report: &mut LoadReport) -> Self {
         let mut base_url = DEFAULT_BASE_URL.to_string();
@@ -744,7 +744,7 @@ pub fn saved_api_key() -> Option<String> {
 
 /// Write `value` to `~/.sc/key` (mode 0600), creating `~/.sc/` if needed. This
 /// is the persistence path for the TUI "Change API key" menu option. The env
-/// var still wins, so a saved key takes effect on the next `sc` launch unless
+/// var still wins, so a saved key takes effect on the next `marathon` launch unless
 /// the env var is set in the shell.
 pub fn set_api_key(value: &str) -> Result<PathBuf, String> {
     let path = key_file_path().ok_or("HOME is not set; cannot locate ~/.sc/key")?;
@@ -786,7 +786,7 @@ pub(crate) fn read_settings(path: &Path) -> Result<SettingsFile, String> {
 /// `SC_API_KEY`); a literal key in the file is a secret leak. Returns the first
 /// suspicious line, if any.
 ///
-/// This is the G7 promise from the module doc: `sc doctor` complains loudly if
+/// This is the G7 promise from the module doc: `marathon doctor` complains loudly if
 /// a key-shaped string appears in any settings file. "Key-shaped" is heuristic
 /// — a long base64-ish token in a `provider.api_key` / `api_key` / `key` field,
 /// or a `Bearer`-prefixed string.

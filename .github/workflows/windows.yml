@@ -34,7 +34,7 @@ jobs:
       - name: Build self-contained Windows executable
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin sc
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin marathon
       - run: ./scripts/package-windows.ps1
       - name: Exercise the real executable against a local mock gateway
         run: node scripts/windows-smoke.mjs
