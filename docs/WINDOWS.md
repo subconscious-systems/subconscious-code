@@ -1,6 +1,6 @@
 # Native Windows
 
-`sc.exe` supports Windows x64 without WSL or Git Bash. It uses Windows
+`marathon.exe` supports Windows x64 without WSL or Git Bash. It uses Windows
 PowerShell 5.1 or PowerShell 7 for shell tools. Git is only needed when your
 project's commands use Git. Node and Rust are not runtime dependencies of the
 release executable.
@@ -10,19 +10,18 @@ macOS/Linux keep their existing Bash behavior.
 
 ## Install and run
 
-Windows-enabled releases contain `sc-x86_64-pc-windows-msvc.zip` and its
-`.sha256` file. The archive contains one root `sc.exe`. Older releases without
-those assets cannot be installed on Windows through `subc sc install`.
+Releases starting with 0.1.5 contain `marathon-x86_64-pc-windows-msvc.zip` and
+its `.sha256` file. The archive contains one root `marathon.exe`, avoiding the
+built-in Windows `sc` service-control command.
 
-Windows x64 binaries are available in stable releases starting with `sc` 0.1.4.
-Use `subconscious-cli` 4.1.0 or newer to install them. Clear any preview version
+Use `subconscious-cli` 4.1.1 or newer to install Marathon. Clear any preview version
 pin from the current PowerShell session before installing the latest release:
 
 ```powershell
 npm.cmd install -g subconscious-cli@latest
 Remove-Item Env:SC_CODE_VERSION -ErrorAction SilentlyContinue
-subc.cmd sc install
-subc.cmd sc
+subc.cmd marathon install
+subc.cmd marathon
 ```
 
 For a local build, use a Rust MSVC toolchain and Visual Studio C++ Build Tools:
@@ -31,16 +30,22 @@ For a local build, use a Rust MSVC toolchain and Visual Studio C++ Build Tools:
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 cargo build --locked --release --target x86_64-pc-windows-msvc --bin sc
 ./scripts/package-windows.ps1
-./target/x86_64-pc-windows-msvc/release/sc.exe --version
+./dist/marathon.exe --version
 ```
 
 The static CRT flag avoids requiring a separate Visual C++ redistributable.
+The internal Cargo target is still `sc` to preserve Unix build compatibility;
+the Windows package script gives the executable its public `marathon.exe` name.
 The package script validates the PE architecture and archive layout and creates
 the SHA-256 checksum. It does not publish anything.
 
 Settings, saved keys, history, global `AGENTS.md`, and sessions use
 `%USERPROFILE%\.sc` (with a `HOMEDRIVE`/`HOMEPATH` fallback). A Unix `HOME`
 environment variable is not required. Headless `-p` runs remain ephemeral.
+`SC_*` variables and existing sessions are unchanged. The CLI keeps `subc sc`
+as an alias for `subc marathon`, but never falls back to `sc.exe` on Windows.
+The installer leaves any existing `sc.exe` untouched, including Windows' own
+binary. Pinned legacy release assets are installed as `marathon.exe` too.
 
 ## Shell selection
 
@@ -50,7 +55,7 @@ the Windows PowerShell executable is used. To pin a shell explicitly:
 ```powershell
 $env:SC_WINDOWS_SHELL = 'powershell'
 $env:SC_POWERSHELL_PATH = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-sc
+marathon
 ```
 
 The model sees a tool named **PowerShell** with PowerShell-specific instructions.
@@ -71,7 +76,7 @@ Git Bash is an explicit alternative:
 $env:SC_WINDOWS_SHELL = 'bash'
 # Only needed for nonstandard installations:
 $env:SC_GIT_BASH_PATH = 'C:\Program Files\Git\bin\bash.exe'
-sc
+marathon
 ```
 
 That selects the **Bash** tool and its existing Bash permission rules, and runs

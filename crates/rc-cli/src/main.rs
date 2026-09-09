@@ -44,15 +44,21 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+const CLI_NAME: &str = if cfg!(windows) { "marathon" } else { "sc" };
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "sc",
+    name = CLI_NAME,
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SC_BUILD_ID")),
-    about = "Subconscious Code — a large-context terminal coding agent.",
-    long_about = "Subconscious Code (`sc`): a headless one-shot (`sc -p \"<prompt>\"`) or \
+    about = if cfg!(windows) { "Marathon — a large-context terminal coding agent." } else { "Subconscious Code — a large-context terminal coding agent." },
+    long_about = if cfg!(windows) {
+        "Marathon: a headless one-shot (`marathon -p \"<prompt>\"`) or the interactive \
+         TUI (just `marathon`). Speaks an OpenAI-compatible chat completions backend, \
+         with configurable context caps and provider-safe tool-result projection."
+    } else { "Subconscious Code (`sc`): a headless one-shot (`sc -p \"<prompt>\"`) or \
                   the interactive TUI (just `sc`). Either way it speaks an \
                   OpenAI-compatible chat completions backend, with configurable \
-                  context caps and provider-safe tool-result projection."
+                  context caps and provider-safe tool-result projection." }
 )]
 struct Cli {
     /// One-shot headless mode: run the agent loop for PROMPT and print the answer.
@@ -507,7 +513,11 @@ fn prompt_and_save_api_key() -> Result<String> {
         );
     }
 
-    eprintln!("Welcome to Subconscious Code.");
+    if cfg!(windows) {
+        eprintln!("Welcome to Marathon.");
+    } else {
+        eprintln!("Welcome to Subconscious Code.");
+    }
     eprintln!("Your API key is stored locally in ~/.sc/key with user-only permissions.");
     eprint!("Subconscious API key: ");
     std::io::stderr().flush()?;

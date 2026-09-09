@@ -14,7 +14,11 @@ use tokio::process::Command;
 const REPOSITORY: &str = "subconscious-systems/subconscious-code";
 const RELEASES_API: &str =
     "https://api.github.com/repos/subconscious-systems/subconscious-code/releases/latest";
-const INSTALL_COMMAND: &str = "subc sc install";
+const INSTALL_COMMAND: &str = if cfg!(windows) {
+    "subc marathon install"
+} else {
+    "subc sc install"
+};
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
@@ -60,18 +64,26 @@ pub(crate) async fn run(json: bool) -> Result<()> {
     match ordering {
         Ordering::Greater => {
             println!(
-                "Update available: sc {} -> {}",
-                report.current_version, report.latest_version
+                "Update available: {} {} -> {}",
+                super::CLI_NAME,
+                report.current_version,
+                report.latest_version
             );
             println!("Run: {}", report.install_command);
             if !report.release_url.is_empty() {
                 println!("Release: {}", report.release_url);
             }
         }
-        Ordering::Equal => println!("sc {} is up to date.", report.current_version),
+        Ordering::Equal => println!(
+            "{} {} is up to date.",
+            super::CLI_NAME,
+            report.current_version
+        ),
         Ordering::Less => println!(
-            "sc {} is newer than the latest release ({}).",
-            report.current_version, report.latest_version
+            "{} {} is newer than the latest release ({}).",
+            super::CLI_NAME,
+            report.current_version,
+            report.latest_version
         ),
     }
     Ok(())
