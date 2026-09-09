@@ -1,8 +1,8 @@
-//! `sc` — Subconscious Code: a terminal coding agent speaking OpenAI-compatible
+//! `marathon` — Subconscious Code: a terminal coding agent speaking OpenAI-compatible
 //! chat completions.
 //!
-//! Two entry points: a headless one-shot (`sc -p "<prompt>"`) and the
-//! interactive TUI (bare `sc`). Both drive the same agent loop over the same
+//! Two entry points: a headless one-shot (`marathon -p "<prompt>"`) and the
+//! interactive TUI (bare `marathon`). Both drive the same agent loop over the same
 //! tools, permission engine, and context assembler.
 //!
 //! Context behavior is configurable, with a provider-safe model-facing cap on
@@ -44,21 +44,16 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-const CLI_NAME: &str = if cfg!(windows) { "marathon" } else { "sc" };
+const CLI_NAME: &str = "marathon";
 
 #[derive(Parser, Debug)]
 #[command(
     name = CLI_NAME,
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SC_BUILD_ID")),
-    about = if cfg!(windows) { "Marathon — a large-context terminal coding agent." } else { "Subconscious Code — a large-context terminal coding agent." },
-    long_about = if cfg!(windows) {
-        "Marathon: a headless one-shot (`marathon -p \"<prompt>\"`) or the interactive \
-         TUI (just `marathon`). Speaks an OpenAI-compatible chat completions backend, \
-         with configurable context caps and provider-safe tool-result projection."
-    } else { "Subconscious Code (`sc`): a headless one-shot (`sc -p \"<prompt>\"`) or \
-                  the interactive TUI (just `sc`). Either way it speaks an \
-                  OpenAI-compatible chat completions backend, with configurable \
-                  context caps and provider-safe tool-result projection." }
+    about = "Marathon — a large-context terminal coding agent.",
+    long_about = "Marathon: a headless one-shot (`marathon -p \"<prompt>\"`) or the interactive \
+                  TUI (just `marathon`). Speaks an OpenAI-compatible chat completions backend, \
+                  with configurable context caps and provider-safe tool-result projection."
 )]
 struct Cli {
     /// One-shot headless mode: run the agent loop for PROMPT and print the answer.
@@ -129,12 +124,12 @@ struct Cli {
 
     /// Verify the endpoint before trusting it: config, non-streaming, streaming,
     /// and tool-call support. Exits non-zero if a check fails. Run as
-    /// `sc doctor` (see [`Command::Doctor`).
+    /// `marathon doctor` (see [`Command::Doctor`).
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-/// Optional subcommands. `None` (bare `sc`, or `sc -p "..."`) runs the agent.
+/// Optional subcommands. `None` (bare `marathon`, or `marathon -p "..."`) runs the agent.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Verify the endpoint before trusting it: config, non-streaming, streaming,
@@ -148,7 +143,7 @@ enum Command {
         body_ladder: bool,
     },
     /// Check the installed version against the newest published release.
-    /// Installation remains owned by `subc sc install`.
+    /// Installation remains owned by `subc marathon install`.
     Update {
         /// Emit a machine-readable status object.
         #[arg(long)]
@@ -181,7 +176,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     // Version discovery is independent of the model endpoint, project, and API
-    // key. Keep it ahead of settings/first-run setup so `sc update` is useful
+    // key. Keep it ahead of settings/first-run setup so `marathon update` is useful
     // even on a machine that has not configured the agent yet.
     if let Some(Command::Update { json }) = &cli.command {
         return update::run(*json).await;
@@ -207,7 +202,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     tracing::debug!(model = %settings.model, base_url = %settings.base_url, "settings loaded");
 
-    // `sc doctor` runs before the API-key requirement so it can *report* a
+    // `marathon doctor` runs before the API-key requirement so it can *report* a
     // missing key as a failed check instead of erroring out with no diagnostics.
     if let Some(command) = cli.command {
         match command {
@@ -513,11 +508,7 @@ fn prompt_and_save_api_key() -> Result<String> {
         );
     }
 
-    if cfg!(windows) {
-        eprintln!("Welcome to Marathon.");
-    } else {
-        eprintln!("Welcome to Subconscious Code.");
-    }
+    eprintln!("Welcome to Marathon.");
     eprintln!("Your API key is stored locally in ~/.sc/key with user-only permissions.");
     eprint!("Subconscious API key: ");
     std::io::stderr().flush()?;
@@ -808,7 +799,22 @@ fn fresh_session_id() -> String {
 #[cfg(test)]
 mod session_id_tests {
     use super::{fresh_session_id, Cli, Command};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn marathon_is_the_native_command_on_every_platform() {
+        let mut command = Cli::command();
+        assert_eq!(command.get_name(), "marathon");
+        assert!(command.render_version().starts_with("marathon "));
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("Usage: marathon"));
+        let update_help = command
+            .find_subcommand_mut("update")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(update_help.contains("subc marathon install"));
+    }
 
     #[test]
     fn fresh_session_ids_are_unique_header_safe_uuids() {
@@ -825,7 +831,7 @@ mod session_id_tests {
 
     #[test]
     fn print_accepts_a_prompt_beginning_with_a_hyphen() {
-        let cli = Cli::try_parse_from(["sc", "--print", "- Update the display grid"])
+        let cli = Cli::try_parse_from(["marathon", "--print", "- Update the display grid"])
             .expect("dash-prefixed prompts are task content, not CLI flags");
 
         assert_eq!(cli.print.as_deref(), Some("- Update the display grid"));
@@ -833,7 +839,7 @@ mod session_id_tests {
 
     #[test]
     fn update_accepts_machine_readable_output() {
-        let cli = Cli::try_parse_from(["sc", "update", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["marathon", "update", "--json"]).unwrap();
 
         assert!(matches!(cli.command, Some(Command::Update { json: true })));
     }
@@ -1695,7 +1701,7 @@ mod benchmark_report_tests {
 
     #[test]
     fn benchmark_report_requires_headless_print_mode() {
-        let error = Cli::try_parse_from(["sc", "--benchmark-report", "report.json"])
+        let error = Cli::try_parse_from(["marathon", "--benchmark-report", "report.json"])
             .expect_err("reporting without --print must be rejected");
         assert_eq!(
             error.kind(),
@@ -1705,7 +1711,7 @@ mod benchmark_report_tests {
 
     #[test]
     fn benchmark_trajectory_requires_headless_print_mode() {
-        let error = Cli::try_parse_from(["sc", "--benchmark-trajectory", "trajectory.json"])
+        let error = Cli::try_parse_from(["marathon", "--benchmark-trajectory", "trajectory.json"])
             .expect_err("trajectory without --print must be rejected");
         assert_eq!(
             error.kind(),
@@ -2082,8 +2088,8 @@ async fn run_tui(
     // (os error 6)", which says nothing about what to do next.
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         anyhow::bail!(
-            "sc needs a terminal for the interactive TUI.\n\
-             For non-interactive use, run a one-shot: sc -p \"<prompt>\""
+            "marathon needs a terminal for the interactive TUI.\n\
+             For non-interactive use, run a one-shot: marathon -p \"<prompt>\""
         );
     }
 

@@ -33,7 +33,7 @@ older commits and development snapshots are not maintained.
 - Bind a development DLR sidecar to loopback. For remote deployment, require
   TLS, an ingress token, strict upstream allowlisting, durable state, and
   network-level access controls.
-- Sanitize `sc doctor` output, sessions, traces, and benchmark artifacts before
+- Sanitize `marathon doctor` output, sessions, traces, and benchmark artifacts before
   sharing them; prompts and tool results may contain sensitive source.
 
 The threat model and hardening details for DLR are documented in

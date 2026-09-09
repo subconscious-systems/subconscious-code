@@ -5,6 +5,18 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-09
+
+### Changed
+
+- The native command and Cargo binary target are now `marathon` on macOS,
+  Linux, and Windows. Help, update instructions, and source-install guides
+  use the same name on every platform.
+- Unix release archives are named `marathon-<target>.tar.gz` and contain
+  `marathon`. Legacy `sc` archives remain available for older CLI installers.
+- Install with CLI 4.1.2 or newer using `subc marathon install`. Existing
+  `.sc` settings, sessions, `SC_*` variables, and shell behavior are unchanged.
+
 ## [0.1.5] - 2026-09-09
 
 ### Fixed

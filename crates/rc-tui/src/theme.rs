@@ -1,4 +1,4 @@
-//! Brand theme + color budget for the `sc` TUI.
+//! Brand theme + color budget for the `marathon` TUI.
 //!
 //! One accent does the brand work — headings and the startup splash. Chrome
 //! (bullets, dim rules, the gutter, tool glyphs, status labels, compose hints)

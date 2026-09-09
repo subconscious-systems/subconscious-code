@@ -1,9 +1,9 @@
 param([string]$Target = 'x86_64-pc-windows-msvc')
 $ErrorActionPreference = 'Stop'
 if ($Target -ne 'x86_64-pc-windows-msvc') { throw "Unsupported Windows release target: $Target" }
-$binary = Join-Path $PSScriptRoot "..\target\$Target\release\sc.exe"
+$binary = Join-Path $PSScriptRoot "..\target\$Target\release\marathon.exe"
 $dist = Join-Path $PSScriptRoot '..\dist'
-if (-not (Test-Path -LiteralPath $binary)) { throw "Build sc first: $binary" }
+if (-not (Test-Path -LiteralPath $binary)) { throw "Build marathon first: $binary" }
 $reader = New-Object IO.BinaryReader([IO.File]::OpenRead($binary))
 try {
     if ($reader.ReadUInt16() -ne 0x5a4d) { throw 'Missing MZ header' }
@@ -13,8 +13,7 @@ try {
     if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'Expected an x64 PE executable' }
 } finally { $reader.Dispose() }
 New-Item -ItemType Directory -Force $dist | Out-Null
-# Keep the internal Cargo target and all Unix packaging unchanged. Windows
-# must never publish/install a binary named like the system service controller.
+# Package the same canonical executable name on every platform.
 $executable = Join-Path $dist 'marathon.exe'
 Copy-Item -LiteralPath $binary -Destination $executable -Force
 $version = & $executable --version

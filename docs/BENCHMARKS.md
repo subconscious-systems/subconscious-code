@@ -7,12 +7,12 @@ external artifact storage or an ignored local output directory.
 
 ## CLI benchmark output
 
-Run the `sc` binary directly and supply its credential through `SC_API_KEY`.
+Run the `marathon` binary directly and supply its credential through `SC_API_KEY`.
 For a headless task, `--benchmark-report` writes privacy-safe accounting data
 and `--benchmark-trajectory` writes an ATIF v1.7 transcript:
 
 ```sh
-SC_API_KEY="your-api-key" sc \
+SC_API_KEY="your-api-key" marathon \
   --benchmark-report benchmark-results/report.json \
   --benchmark-trajectory benchmark-results/trajectory.json \
   -p "fix the task"

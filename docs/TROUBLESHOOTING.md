@@ -3,7 +3,7 @@
 Start with:
 
 ```sh
-sc doctor
+marathon doctor
 ```
 
 It prints the resolved endpoint, model, transport, credential presence, and
@@ -11,7 +11,7 @@ results of non-streaming, streaming, and tool-call checks.
 
 ## `no API key`
 
-Run bare `sc` in a terminal to complete the secure first-launch prompt, or set
+Run bare `marathon` in a terminal to complete the secure first-launch prompt, or set
 the variable named by `provider.api_key_env` (`SC_API_KEY` by default) for
 automation. Use `/menu` → Change API key to replace a saved key. Do not add a
 literal key to `settings.json`.
@@ -22,7 +22,7 @@ export SC_API_KEY="your-api-key"
 
 ## 404 or an incorrect request path
 
-`SC_BASE_URL` should normally end in `/v1`; `sc` appends
+`SC_BASE_URL` should normally end in `/v1`; `marathon` appends
 `/chat/completions`. For example:
 
 ```sh
@@ -35,7 +35,7 @@ that proxy and confirm the final path in its access logs.
 ## Streaming works but tools do not
 
 The endpoint must emit OpenAI-compatible streaming tool-call deltas, including
-stable call IDs and JSON arguments. Run `sc doctor`; its tool-call check catches
+stable call IDs and JSON arguments. Run `marathon doctor`; its tool-call check catches
 many endpoints that support plain text but not agent use.
 
 ## DLR reports unavailable
@@ -64,7 +64,7 @@ resending it through JSON; this prevents duplicate model invocations.
 Measure the endpoint's body ceiling deliberately:
 
 ```sh
-sc doctor --body-ladder
+marathon doctor --body-ladder
 ```
 
 This sends 1, 10, 32, 100, and 500 MiB test bodies until one fails. Do not run
@@ -109,10 +109,10 @@ just to hide an unexpected path.
 
 ## Resume cannot find a session
 
-`sc --continue` skips header-only sessions with no history. Inspect
-`~/.sc/sessions/` and use `sc --resume /absolute/path/session.jsonl` for a
+`marathon --continue` skips header-only sessions with no history. Inspect
+`~/.sc/sessions/` and use `marathon --resume /absolute/path/session.jsonl` for a
 specific valid file.
 
-If a reproducible problem remains, open a GitHub issue with `sc --version`, OS,
-terminal, sanitized `sc doctor` output, and minimal reproduction. Remove keys,
+If a reproducible problem remains, open a GitHub issue with `marathon --version`, OS,
+terminal, sanitized `marathon doctor` output, and minimal reproduction. Remove keys,
 prompts, proprietary source, and session contents first.

@@ -1933,7 +1933,7 @@ async fn loop_without_assembler_uses_legacy_default_prompt() {
     match req.messages.first() {
         Some(WireMessage::System { content }) => {
             assert!(
-                content.contains("You are `sc`"),
+                content.contains("You are `marathon`"),
                 "default prompt: {content}"
             );
             assert!(

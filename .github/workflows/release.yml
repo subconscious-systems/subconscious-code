@@ -78,35 +78,39 @@ jobs:
       - uses: taiki-e/install-action@cross
         if: runner.os == 'Linux'
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Build sc
-        run: ${{ matrix.builder }} build --locked --release --target "${{ matrix.target }}" --bin sc
+      - name: Build Marathon
+        run: ${{ matrix.builder }} build --locked --release --target "${{ matrix.target }}" --bin marathon
       - name: Package and validate binary
         env:
           FILE_PATTERN: ${{ matrix.file_pattern }}
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist/package
-          cp "target/$TARGET/release/sc" dist/package/sc
-          tar -C dist/package -czf "dist/sc-$TARGET.tar.gz" sc
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "sc-$TARGET.tar.gz" > "sc-$TARGET.tar.gz.sha256")
-          else
-            (cd dist && shasum -a 256 "sc-$TARGET.tar.gz" > "sc-$TARGET.tar.gz.sha256")
-          fi
-          cosign sign-blob --yes \
-            --bundle "dist/sc-$TARGET.tar.gz.sigstore.json" \
-            "dist/sc-$TARGET.tar.gz"
-          cosign sign-blob --yes \
-            --bundle "dist/sc-$TARGET.tar.gz.sha256.sigstore.json" \
-            "dist/sc-$TARGET.tar.gz.sha256"
-          file "target/$TARGET/release/sc" | grep -F "$FILE_PATTERN"
+          file "target/$TARGET/release/marathon" | grep -F "$FILE_PATTERN"
           if [[ "$TARGET" != "aarch64-unknown-linux-musl" ]]; then
-            "target/$TARGET/release/sc" --version
+            "target/$TARGET/release/marathon" --version | grep '^marathon '
+            "target/$TARGET/release/marathon" --help | grep 'Usage: marathon'
           fi
+          # Canonical Marathon package plus a compatibility archive for older
+          # subc installers. Both contain the same newly named agent binary.
+          for name in marathon sc; do
+            cp "target/$TARGET/release/marathon" "dist/package/$name"
+            archive="$name-$TARGET.tar.gz"
+            tar -C dist/package -czf "dist/$archive" "$name"
+            [[ "$(tar -tzf "dist/$archive")" == "$name" ]]
+            if command -v sha256sum >/dev/null 2>&1; then
+              (cd dist && sha256sum "$archive" > "$archive.sha256")
+            else
+              (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+            fi
+            cosign sign-blob --yes --bundle "dist/$archive.sigstore.json" "dist/$archive"
+            cosign sign-blob --yes --bundle "dist/$archive.sha256.sigstore.json" "dist/$archive.sha256"
+          done
       - uses: actions/upload-artifact@v6
         with:
-          name: sc-${{ matrix.target }}
+          name: marathon-${{ matrix.target }}
           path: |
+            dist/marathon-${{ matrix.target }}.tar.gz*
             dist/sc-${{ matrix.target }}.tar.gz
             dist/sc-${{ matrix.target }}.tar.gz.sha256
             dist/sc-${{ matrix.target }}.tar.gz.sigstore.json
@@ -136,7 +140,7 @@ jobs:
       - name: Build self-contained Windows agent
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin sc
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin marathon
       - run: ./scripts/package-windows.ps1
       - name: Exercise the executable against a local mock gateway
         run: node scripts/windows-smoke.mjs

@@ -1,11 +1,11 @@
-# sc — Subconscious Code
+# marathon — Subconscious Code
 
 ![CI](https://github.com/subconscious-systems/subconscious-code/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Rust](https://img.shields.io/badge/rust-1.89%2B-orange)
 
 A fast, native terminal coding agent for OpenAI-compatible chat-completions
-endpoints. `sc` provides an interactive TUI, resumable sessions, permissioned
+endpoints. `marathon` provides an interactive TUI, resumable sessions, permissioned
 tools, large-request streaming, and an optional delta transport for long agent
 conversations. The client is a single Rust binary with no Python or Node runtime.
 
@@ -14,7 +14,7 @@ conversations. The client is a single Rust binary with no Python or Node runtime
 > tested. MCP, hooks, and skills crates are placeholders and are not yet part of
 > the user-facing product.
 
-## Why `sc`
+## Why `marathon`
 
 - Interactive terminal UI and headless automation from the same binary.
 - Works with compatible self-hosted or hosted `/v1/chat/completions` APIs.
@@ -48,7 +48,7 @@ plus static `x86_64` and `aarch64` Linux binaries. Replace `VERSION` with the
 release you want to install:
 
 ```sh
-VERSION=v0.1.0
+VERSION=v0.1.6
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) TARGET=aarch64-apple-darwin ;;
   Darwin:x86_64) TARGET=x86_64-apple-darwin ;;
@@ -56,41 +56,41 @@ case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) TARGET=x86_64-unknown-linux-musl ;;
   *) echo "Unsupported platform: $(uname -s) $(uname -m)" >&2; exit 1 ;;
 esac
-curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/sc-$TARGET.tar.gz"
-curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/sc-$TARGET.tar.gz.sha256"
+curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/marathon-$TARGET.tar.gz"
+curl -fLO "https://github.com/subconscious-systems/subconscious-code/releases/download/$VERSION/marathon-$TARGET.tar.gz.sha256"
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum --check "sc-$TARGET.tar.gz.sha256"
+  sha256sum --check "marathon-$TARGET.tar.gz.sha256"
 else
-  expected="$(awk '{print $1}' "sc-$TARGET.tar.gz.sha256")"
-  actual="$(shasum -a 256 "sc-$TARGET.tar.gz" | awk '{print $1}')"
+  expected="$(awk '{print $1}' "marathon-$TARGET.tar.gz.sha256")"
+  actual="$(shasum -a 256 "marathon-$TARGET.tar.gz" | awk '{print $1}')"
   test "$actual" = "$expected"
 fi
-tar -xzf "sc-$TARGET.tar.gz"
+tar -xzf "marathon-$TARGET.tar.gz"
 mkdir -p "$HOME/.local/bin"
-install -m 0755 sc "$HOME/.local/bin/sc"
-sc --version
+install -m 0755 marathon "$HOME/.local/bin/marathon"
+marathon --version
 ```
 
 Release archives and their checksum files include keyless Sigstore bundles.
-The `subc sc install` command uses the same OS/architecture mapping and installs
+The `subc marathon install` command uses the same OS/architecture mapping and installs
 the matching archive without requiring Cargo.
 
 To see whether the installed binary is behind the newest release:
 
 ```sh
-sc update
+marathon update
 ```
 
-Use `sc update --json` for scripts. While the repository is private, the check
+Use `marathon update --json` for scripts. While the repository is private, the check
 uses an authenticated GitHub CLI session when available; otherwise set
-`GH_TOKEN`. Install an available update with `subc sc install`.
+`GH_TOKEN`. Install an available update with `subc marathon install`.
 
-Launch `sc`. On first use, the CLI securely prompts for your Subconscious API
+Launch `marathon`. On first use, the CLI securely prompts for your Subconscious API
 key and saves it to `~/.sc/key` with user-only permissions:
 
 ```sh
 cd /path/to/your/project
-sc
+marathon
 ```
 
 For automation, provide the key through the environment and verify the endpoint
@@ -98,8 +98,8 @@ before running a headless task:
 
 ```sh
 export SC_API_KEY="your-api-key"
-sc doctor
-sc -p "explain the architecture and identify the main entry point"
+marathon doctor
+marathon -p "explain the architecture and identify the main entry point"
 ```
 
 For another compatible provider, set its base URL and model. Custom providers
@@ -109,8 +109,8 @@ use ordinary JSON unless you explicitly configure a DLR endpoint:
 export SC_API_KEY="your-provider-key"
 export SC_BASE_URL="https://provider.example/v1"
 export SC_MODEL="provider/model-name"
-sc doctor
-sc
+marathon doctor
+marathon
 ```
 
 Inside the TUI, type a request normally. Use `@path` to include a file, `/menu`
@@ -122,7 +122,7 @@ then sends it; press `Esc` again to stop immediately.
 For a non-interactive read-only task:
 
 ```sh
-sc -p "explain the architecture and identify the main entry point"
+marathon -p "explain the architecture and identify the main entry point"
 ```
 
 Headless writes and shell commands fail closed unless allowed in project
@@ -149,7 +149,7 @@ Please report vulnerabilities privately as described in
 
 ### Core Philosophy
 
-`sc` is built for models with large context windows rather than aggressively
+`marathon` is built for models with large context windows rather than aggressively
 shrinking every read. Most inputs remain unlimited. Tool results alone have a
 conservative model-facing default because provider token limits are real and a
 single broad command can otherwise make the next request fail before the model
@@ -221,7 +221,7 @@ See [Permissions](#permissions) for the modes and how to configure rules.
 
 A session is one conversation thread, appended to `~/.sc/sessions/<id>.jsonl` as
 it happens — one line per turn, flushed immediately, so a crash leaves a readable
-prefix rather than a corrupt file. `sc --continue` reloads the newest one and
+prefix rather than a corrupt file. `marathon --continue` reloads the newest one and
 restores its visible transcript, saved model, latest permission mode, and full
 request context before continuing. The wire format is in
 [rc-session](#the-core-crates) below.
@@ -267,7 +267,7 @@ test against the local sidecar before those routes are deployed, override it:
 ```sh
 export SC_DLR_URL=http://127.0.0.1:32180
 export SC_DLR_INGRESS_TOKEN="$DLR_INGRESS_TOKEN"
-sc doctor
+marathon doctor
 ```
 
 The setting `provider.dlr_enabled` (also available under `/menu` → Settings)
@@ -313,10 +313,10 @@ forward, and first SSE bytes; it intentionally excludes model queue and prefill.
 ## Use
 
 ```sh
-sc                       # interactive TUI
-sc --continue            # resume the most recent session
-sc -p "explain src/"     # headless one-shot, prints the answer to stdout
-sc doctor --body-ladder    # measure the gateway's real maximum request size
+marathon                       # interactive TUI
+marathon --continue            # resume the most recent session
+marathon -p "explain src/"     # headless one-shot, prints the answer to stdout
+marathon doctor --body-ladder    # measure the gateway's real maximum request size
 ```
 
 ### Headless benchmarks
@@ -325,7 +325,7 @@ The CLI can write a stable performance report and an ATIF v1.7 trajectory for
 headless evaluation runs:
 
 ```sh
-SC_API_KEY="your-api-key" sc \
+SC_API_KEY="your-api-key" marathon \
   --benchmark-report report.json \
   --benchmark-trajectory trajectory.json \
   -p "fix the task"
@@ -348,7 +348,7 @@ the provider returns the authoritative prompt-token count.
 `/menu` opens a full-screen modal — arrows to move, `↵` to select, `←` to go
 back, `Esc` to close:
 
-- **Projects** — every directory `sc` has been run in, derived from the session
+- **Projects** — every directory `marathon` has been run in, derived from the session
   files in `~/.sc/sessions` (there is no project registry to keep in sync).
   Each shows its session count and when it was last touched. Open one to see
   its sessions, labeled by their first prompt, and resume any of them or start
@@ -381,7 +381,7 @@ the TUI answers inline (`y` once / `s` session / `a` always / `n` no).
 
 **Headless runs fail closed.** With no TTY there's nobody to ask, so a `-p` run
 *denies* every write and command — the model gets a denied tool result and
-carries on. That's deliberate, but it means `sc -p "fix the bug"` won't modify
+carries on. That's deliberate, but it means `marathon -p "fix the bug"` won't modify
 anything until you either grant rules or bypass:
 
 ```json
@@ -391,7 +391,7 @@ anything until you either grant rules or bypass:
 Save that object as `./.sc/settings.json` to grant only this project those
 headless permissions.
 
-Or `sc -p "..." --dangerously-skip-permissions` (still hard-denies catastrophic
+Or `marathon -p "..." --dangerously-skip-permissions` (still hard-denies catastrophic
 commands; refuses to run in CI without `SC_DANGEROUS=1`).
 
 `Shift+Tab` cycles the mode, ordered from most cautious to most permissive:
@@ -520,7 +520,7 @@ The critical optimization that makes large context feasible:
 - The dominant copy was the `Turn` → `WireMessage` projection; that's now gone
   (refcount bumps instead)
 - Expect the real multiple to be **lower**, but budget to the old number until
-  you measure on the Linux box: `sc doctor --body-ladder` with a real ≥12 MB file
+  you measure on the Linux box: `marathon doctor --body-ladder` with a real ≥12 MB file
 
 ### Other Size-Related Choices
 
@@ -572,11 +572,11 @@ remain in the session JSONL and are deliberately omitted from ATIF trajectories.
 
 ### Linux Session Resource Containment
 
-On a systemd Linux host, every interactive or headless `sc` run automatically
+On a systemd Linux host, every interactive or headless `marathon` run automatically
 re-enters a transient user scope. The scope contains the editor and all tool
 descendants, so concurrent builds cannot force the entire host into memory
 reclaim. Where a user systemd manager is unavailable (common inside benchmark
-containers), `sc` applies an inherited `RLIMIT_AS` hard-memory fallback instead.
+containers), `marathon` applies an inherited `RLIMIT_AS` hard-memory fallback instead.
 This is process containment only; it does not limit model context.
 
 Defaults are sized from the host: one eighth of RAM (4–12 GiB), a soft memory
@@ -588,7 +588,7 @@ Override these for a benchmark worker with:
 
 | Variable | Meaning |
 | --- | --- |
-| `SC_RESOURCE_MEMORY_MAX_MB` | Hard memory limit for one `sc` process tree |
+| `SC_RESOURCE_MEMORY_MAX_MB` | Hard memory limit for one `marathon` process tree |
 | `SC_RESOURCE_MEMORY_HIGH_MB` | Reclaim threshold below the hard limit |
 | `SC_RESOURCE_SWAP_MAX_MB` | Swap allowed to the scope |
 | `SC_RESOURCE_TASKS_MAX` | Maximum processes/threads in the scope |
@@ -605,11 +605,11 @@ active turn before the kernel's hard OOM boundary.
 ### Gateway Ceiling — Measure This First
 
 **The client is not the bottleneck — the gateway is.** A 12 MB request is
-possible on the wire, but the gateway may reject it. Measure with `sc doctor
+possible on the wire, but the gateway may reject it. Measure with `marathon doctor
 --body-ladder`:
 
 ```sh
-sc doctor --body-ladder
+marathon doctor --body-ladder
 ```
 
 This uploads 1 / 10 / 32 / 100 / 500 MB bodies until one is refused, then names
@@ -621,7 +621,7 @@ the likely culprit:
 | Exactly **1 MB** | nginx's default `client_max_body_size` | Raisable in the nginx config |
 | **≥ 32 MB** | Nothing — clears Claude Code's cap | None needed |
 
-If the gateway caps at 10 MB, `sc` is *more* limited than Claude Code's 32 MB —
+If the gateway caps at 10 MB, `marathon` is *more* limited than Claude Code's 32 MB —
 a showstopper for the thesis. Measure first.
 
 ## Architecture

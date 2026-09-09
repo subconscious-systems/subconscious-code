@@ -1,6 +1,6 @@
 //! Linux host-protection for agent sessions.
 //!
-//! Each `sc` process re-enters itself inside a transient systemd user scope when
+//! Each `marathon` process re-enters itself inside a transient systemd user scope when
 //! available. Minimal containers fall back to an inherited `RLIMIT_AS`. Either
 //! ceiling covers the editor and every tool descendant, including detached
 //! background commands, so two runaway builds cannot push the whole host into

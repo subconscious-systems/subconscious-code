@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// GLM-class gateways reject any one message whose serialized `content`
 /// exceeds ~1 MB — `400 "messages[N].content must not exceed 1048576 serialized
 /// bytes"` — a per-**message** limit, not a per-string or total-body one (see
-/// `sc doctor --body-ladder`). A large user paste or tool result is therefore
+/// `marathon doctor --body-ladder`). A large user paste or tool result is therefore
 /// split into multiple messages, each under this cap (1 MB is 1_048_576); the
 /// gateway accepts consecutive user messages and multiple `role:tool` messages
 /// sharing one `tool_call_id` (both verified against the real gateway), and the
@@ -29,7 +29,7 @@ const MAX_STRING_ESCAPED: usize = 1_000_000;
 /// [`rc_ctx::ContextAssembler`], which builds the real system prompt and
 /// calls [`project_with`] with it.
 const SYSTEM_PROMPT: &str =
-    "You are `sc` (Subconscious Code), an agent that helps with software engineering tasks in \
+    "You are `marathon` (Subconscious Code), an agent that helps with software engineering tasks in \
 the user's repository. Use the provided tools to inspect and edit files. Be concise and direct. \
 When you have enough information, answer in plain text.";
 

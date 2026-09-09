@@ -28,14 +28,13 @@ For a local build, use a Rust MSVC toolchain and Visual Studio C++ Build Tools:
 
 ```powershell
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
-cargo build --locked --release --target x86_64-pc-windows-msvc --bin sc
+cargo build --locked --release --target x86_64-pc-windows-msvc --bin marathon
 ./scripts/package-windows.ps1
 ./dist/marathon.exe --version
 ```
 
 The static CRT flag avoids requiring a separate Visual C++ redistributable.
-The internal Cargo target is still `sc` to preserve Unix build compatibility;
-the Windows package script gives the executable its public `marathon.exe` name.
+The Cargo target is `marathon` on every platform starting with 0.1.6.
 The package script validates the PE architecture and archive layout and creates
 the SHA-256 checksum. It does not publish anything.
 
