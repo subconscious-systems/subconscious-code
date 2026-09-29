@@ -34,7 +34,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use rc_rt::Runtime;
 
-pub use menu::Outcome;
+pub use menu::{set_served_models, Outcome};
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 

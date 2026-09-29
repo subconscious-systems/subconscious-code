@@ -76,7 +76,7 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
         ("/usage", "Show token usage (alias of /cost)"),
         ("/menu", "Open the menu: projects, sessions, and settings"),
         ("/status", "Show session status (model, mode, cwd, busy)"),
-        ("/model", "Show the active model"),
+        ("/model", "Switch model: pick from a list, or /model <name>"),
         ("/mode", "Cycle the permission mode"),
         (
             "/permissions",

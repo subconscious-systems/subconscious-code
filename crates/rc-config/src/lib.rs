@@ -256,8 +256,8 @@ const DEFAULT_BASE_URL: &str = "https://api.subconscious.dev/v1";
 // DLR appends `/v1/dlr/*` itself, so this is the origin rather than the
 // OpenAI-compatible `/v1` base used by ordinary JSON requests.
 const DEFAULT_DLR_URL: &str = "https://api.subconscious.dev";
-const DEFAULT_MODEL: &str = "subconscious/glm-5.2";
-const DEFAULT_SMALL_MODEL: &str = "subconscious/glm-5.2";
+const DEFAULT_MODEL: &str = "subconscious/glm-5.3-marathon";
+const DEFAULT_SMALL_MODEL: &str = "subconscious/glm-5.3-marathon";
 /// Off: see [`Settings::timeout_ms`].
 const DEFAULT_TIMEOUT_MS: u64 = 0;
 /// The liveness backstop that replaces the total timeout. Two minutes with no

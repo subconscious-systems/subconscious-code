@@ -98,6 +98,15 @@ pub async fn run(settings: &Settings, body_ladder: bool) -> Result<bool> {
     println!("connectivity");
     let mut failed = false;
 
+    let s = match client.list_models().await {
+        Ok(served) => served_status(&settings.model, &served),
+        // `GET /models` is optional for custom endpoints; the chat probes below
+        // still decide whether the model works.
+        Err(e) => Status::Warn(format!("could not list models: {}", describe(&e))),
+    };
+    failed |= s.is_fail();
+    println!("{}", s.render("model"));
+
     let s = probe_non_streaming(&client).await;
     failed |= s.is_fail();
     println!("{}", s.render("non-streaming"));
@@ -221,6 +230,23 @@ fn config_lines(s: &Settings) -> Vec<String> {
         format!("  cap: glob results   {}", cap(s.context.glob_cap)),
         format!("  max iterations      {}", s.context.max_iters),
     ]
+}
+
+/// Whether the endpoint lists `model`. A retired model otherwise surfaces only
+/// as a 403 on the first chat request, which reads like a key problem. Being
+/// listed is not proof the key may use it (the gateway lists models it then
+/// refuses), so the chat probes after this one remain the real check.
+fn served_status(model: &str, served: &[String]) -> Status {
+    if served.iter().any(|m| m == model) {
+        Status::Pass(format!("{model} is listed by the endpoint"))
+    } else if served.is_empty() {
+        Status::Warn("endpoint lists no models".into())
+    } else {
+        Status::Fail(format!(
+            "{model} is not served; available: {}",
+            served.join(", ")
+        ))
+    }
 }
 
 async fn probe_non_streaming(client: &ChatClient) -> Status {
@@ -678,6 +704,17 @@ mod tests {
         assert_eq!(human(32 << 20), "32 MB");
         assert_eq!(human(16 * 1024), "16 KB");
         assert_eq!(human(512), "512 B");
+    }
+
+    #[test]
+    fn served_status_fails_a_retired_model_and_names_the_alternatives() {
+        let served = ["a/new".to_string(), "b/other".to_string()];
+        assert!(matches!(served_status("a/new", &served), Status::Pass(_)));
+        match served_status("a/old", &served) {
+            Status::Fail(d) => assert!(d.contains("a/new, b/other"), "{d}"),
+            _ => panic!("a model the endpoint doesn't list must fail"),
+        }
+        assert!(matches!(served_status("a/old", &[]), Status::Warn(_)));
     }
 
     #[test]

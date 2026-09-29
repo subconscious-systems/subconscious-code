@@ -727,6 +727,48 @@ impl ChatClient {
         Ok(parsed)
     }
 
+    /// The model ids this key may use, in the endpoint's order. Subconscious
+    /// scopes `GET /models/available` to the key, while `GET /models` lists
+    /// the whole fleet, including models it then refuses with
+    /// `model_not_allowed`. So `/models` is only the fallback, for providers
+    /// without the scoped route; `subc` resolves its catalog the same way.
+    /// Always plain JSON to the base URL: DLR only carries chat requests.
+    pub async fn list_models(&self) -> Result<Vec<String>, ProtoError> {
+        match self.get_model_list("models/available").await {
+            Ok(models) => Ok(models),
+            Err(_) => self.get_model_list("models").await,
+        }
+    }
+
+    async fn get_model_list(&self, path: &str) -> Result<Vec<String>, ProtoError> {
+        #[derive(serde::Deserialize)]
+        struct ModelList {
+            data: Vec<ModelEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ModelEntry {
+            id: String,
+        }
+
+        let resp = self
+            .http
+            .get(format!("{}/{path}", self.base_url))
+            .bearer_auth(self.api_key.clone())
+            .header(CLIENT_HEADER, CLIENT_NAME)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProtoError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let list: ModelList = resp.json().await?;
+        Ok(list.data.into_iter().map(|m| m.id).collect())
+    }
+
     /// One streaming round trip. Returns an [`AgentStreamEvent`] stream and the
     /// number of wire-layer retries (429/5xx) the request survived (0 for a clean
     /// first attempt), surfaced to the host via `EventSink::on_retry` and

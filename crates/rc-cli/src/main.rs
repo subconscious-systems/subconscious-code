@@ -184,7 +184,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     let benchmark_mode = cli.benchmark_report.is_some() || cli.benchmark_trajectory.is_some();
     let mut settings = Settings::load(&std::env::current_dir()?);
-    let model_override = cli.model.clone();
+    let mut model_override = cli.model.clone();
     let base_url_override = cli.base_url.clone();
     if let Some(m) = model_override.clone() {
         settings.model = m;
@@ -421,10 +421,12 @@ async fn run(cli: Cli) -> Result<()> {
     // session it wants next; everything cwd-scoped is rebuilt around it here,
     // which is precisely why the switch can't happen inside rc-tui.
     loop {
+        publish_served_models(&settings, &api_key);
         let model_name = session.model.clone();
         // Kept for the reload path, which needs them after `session` has moved
         // into the TUI.
         let session_id = session.id.clone();
+        let session_cwd = session.cwd.clone();
         let next = run_tui(
             Arc::new(build_agent(&session, &api_key, &settings)?),
             session,
@@ -438,9 +440,17 @@ async fn run(cli: Cli) -> Result<()> {
         let Some(next) = next else { return Ok(()) };
         // A reload re-enters the *same* session, so it restores that session's
         // own mode exactly as a resume does.
-        let reload_settings = matches!(&next, rc_tui::Outcome::Reload);
-        let switched_to_existing =
-            matches!(&next, rc_tui::Outcome::Resume(_) | rc_tui::Outcome::Reload);
+        // A model picked in `/menu` is newer intent than `--model` or
+        // `SC_MODEL`, so it becomes this run's override. `subc marathon` always
+        // sets `SC_MODEL`, which would otherwise undo every pick on reload.
+        if let rc_tui::Outcome::SwitchModel(model) = &next {
+            model_override = Some(model.clone());
+        }
+        let reload_settings = matches!(
+            &next,
+            rc_tui::Outcome::Reload | rc_tui::Outcome::SwitchModel(_)
+        );
+        let switched_to_existing = reload_settings || matches!(&next, rc_tui::Outcome::Resume(_));
         let (next_session, next_path) = match next {
             rc_tui::Outcome::Resume(path) => {
                 let resumed = rc_session::load(&path)
@@ -451,28 +461,38 @@ async fn run(cli: Cli) -> Result<()> {
                 Session::new(fresh_session_id(), dir, settings.model.clone()),
                 None,
             ),
-            // `/menu` saved an API key. Adopt it — the user typed it into this
-            // process, so it wins here even where the env var would outrank it
-            // at startup — and reopen the same session from its own file, which
-            // already holds every turn (the store appends as they happen).
-            rc_tui::Outcome::Reload => {
+            // `/menu` saved a setting the client is built from. A saved API key
+            // is adopted — the user typed it into this process, so it wins here
+            // even where the env var would outrank it at startup — and the same
+            // session reopens from its own file, which already holds every turn
+            // (the store appends as they happen).
+            rc_tui::Outcome::Reload | rc_tui::Outcome::SwitchModel(_) => {
                 if let Some(saved) = rc_config::saved_api_key() {
                     api_key = saved;
                 }
                 let path = session_path
                     .clone()
                     .unwrap_or_else(|| sessions_dir.join(format!("{session_id}.jsonl")));
-                let reloaded = rc_session::load(&path).with_context(|| {
-                    format!("/menu: could not reopen {} to reload", path.display())
-                })?;
-                (reloaded, Some(path))
+                if path.exists() {
+                    let reloaded = rc_session::load(&path).with_context(|| {
+                        format!("/menu: could not reopen {} to reload", path.display())
+                    })?;
+                    (reloaded, Some(path))
+                } else {
+                    // The store is lazy, so a session with no turns yet has no
+                    // file to reopen; restart the same empty session instead.
+                    (
+                        Session::new(session_id, session_cwd, settings.model.clone()),
+                        None,
+                    )
+                }
             }
         };
         session = next_session;
         session_path = next_path;
         if reload_settings {
-            // Settings that change the HTTP client (currently the DLR toggle)
-            // take effect without abandoning the active conversation.
+            // Settings that change the HTTP client (the model and the DLR
+            // toggle) take effect without abandoning the active conversation.
             settings = Settings::load(&session.cwd);
             if let Some(model) = model_override.clone() {
                 settings.model = model;
@@ -2063,6 +2083,26 @@ fn publish_checkpoint(
         write_benchmark_trajectory(path, session, outcome, elapsed)?;
     }
     Ok(())
+}
+
+/// Ask the endpoint which models it serves, in the background, so `/menu` can
+/// offer them. Startup never waits on this; a failure (or an endpoint without
+/// `GET /models`) just leaves the picker with the saved roster.
+fn publish_served_models(settings: &Settings, api_key: &str) {
+    let Ok(client) = ChatClient::new(
+        settings.base_url.clone(),
+        api_key.to_string(),
+        settings.model.clone(),
+        Some(Duration::from_secs(10)),
+    ) else {
+        return;
+    };
+    tokio::spawn(async move {
+        match client.list_models().await {
+            Ok(models) => rc_tui::set_served_models(models),
+            Err(e) => tracing::debug!("could not list served models: {e}"),
+        }
+    });
 }
 
 /// Interactive TUI: wire the agent loop into the rc-rt runtime and hand it to

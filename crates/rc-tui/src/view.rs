@@ -2554,6 +2554,7 @@ fn menu_heading(menu: &MenuState) -> String {
             None => dir.display().to_string(),
         },
         MenuPage::Settings => "settings".to_string(),
+        MenuPage::Models => "models  (● in use)".to_string(),
     }
 }
 
@@ -2564,6 +2565,7 @@ fn menu_help(menu: &MenuState) -> &'static str {
         MenuPage::Projects => "↑↓ move · ↵ open · ← back · r refresh · Esc close",
         MenuPage::Sessions(_) => "↑↓ move · ↵ resume · ← back · Esc close",
         MenuPage::Settings => "↑↓ move · ↵ edit/add · ←→ change · d remove model · Esc close",
+        MenuPage::Models => "↑↓ move · ↵ switch · ← back · Esc close",
     }
 }
 
@@ -2581,7 +2583,22 @@ fn menu_row_line(menu: &MenuState, row: &Row, selected: bool, now: Instant) -> L
         Row::Goto(MenuPage::Projects) => {
             format!("Projects{:>12}", plural(menu.projects.len(), "project"))
         }
+        Row::Goto(MenuPage::Models) => {
+            format!("Models{:>14}", plural(menu.settings.models.len(), "model"))
+        }
         Row::Goto(MenuPage::Settings) => "Settings".to_string(),
+        Row::Model(name) => {
+            let in_use = if *name == menu.running_model {
+                "●"
+            } else {
+                " "
+            };
+            let mut text = format!("{in_use} {name}");
+            if !menu.served.is_empty() && !menu.served.contains(name) {
+                text.push_str("  (not served)");
+            }
+            text
+        }
         Row::Goto(_) => "…".to_string(),
         Row::ChangeApiKey => {
             // Never show the key itself — only where the active one came from,
@@ -2641,6 +2658,13 @@ fn menu_row_line(menu: &MenuState, row: &Row, selected: bool, now: Instant) -> L
                     if let Some(at) = at {
                         note.push_str(&format!("  [{}/{n}]", at + 1));
                     }
+                }
+                // Why a saved model fails: the endpoint no longer offers it.
+                if f.kind == rc_config::edit::FieldKind::Model
+                    && !menu.served.is_empty()
+                    && !menu.served.contains(&value)
+                {
+                    note.push_str("  (not served)");
                 }
                 if f.env_override().is_some() {
                     note.push_str(&format!("  (${} overrides)", f.env));
@@ -2754,6 +2778,8 @@ mod tests {
             settings: rc_config::Settings::load(std::path::Path::new("/nonexistent")),
             editing: None,
             editing_api_key: false,
+            served: Vec::new(),
+            running_model: String::new(),
             status: None,
             pending_outcome: None,
         }
@@ -3055,6 +3081,42 @@ mod tests {
             !screen.contains("[1/1]"),
             "no position for a lone model: {screen}"
         );
+    }
+
+    /// A saved model the endpoint no longer lists is flagged, which is the
+    /// difference between "the picker is broken" and "pick another one".
+    #[test]
+    fn settings_model_row_flags_a_model_the_endpoint_does_not_serve() {
+        let mut m = menu_with_models(&["old/retired", "new/served"]);
+        m.served = vec!["new/served".into()];
+        let mut state = ViewState::new("m".into());
+        state.menu_overlay = Some(m);
+        let screen = rendered_sized(&mut state, 78, 18);
+        assert!(screen.contains("(not served)"), "flagged: {screen}");
+
+        let mut m = menu_with_models(&["new/served", "old/retired"]);
+        m.served = vec!["new/served".into()];
+        state.menu_overlay = Some(m);
+        let screen = rendered_sized(&mut state, 78, 18);
+        assert!(!screen.contains("(not served)"), "not flagged: {screen}");
+    }
+
+    /// The models page marks the model in use and any the endpoint dropped.
+    #[test]
+    fn models_page_marks_the_running_model_and_unserved_ones() {
+        let mut m = menu_with_models(&["old/retired", "new/served"]);
+        m.served = vec!["new/served".into()];
+        m.running_model = "new/served".into();
+        m.goto_models();
+        let mut state = ViewState::new("m".into());
+        state.menu_overlay = Some(m);
+        let screen = rendered_sized(&mut state, 78, 18);
+        assert!(screen.contains("● new/served"), "in use marked: {screen}");
+        assert!(
+            screen.contains("old/retired  (not served)"),
+            "unserved marked: {screen}"
+        );
+        assert!(screen.contains("↵ switch"), "key hints: {screen}");
     }
 
     /// While adding a model the editor replaces the key hints, so the only

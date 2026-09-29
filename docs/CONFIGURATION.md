@@ -19,9 +19,9 @@ ignored by older clients.
 
 ```json
 {
-  "model": "subconscious/glm-5.2",
-  "models": ["subconscious/glm-5.2"],
-  "small_model": "subconscious/glm-5.2",
+  "model": "subconscious/glm-5.3-marathon",
+  "models": ["subconscious/glm-5.3-marathon"],
+  "small_model": "subconscious/glm-5.3-marathon",
   "provider": {
     "base_url": "https://api.subconscious.dev/v1",
     "api_key_env": "SC_API_KEY",
@@ -86,7 +86,7 @@ environment-variable name, while the secret stays in that variable.
 | --- | --- | --- |
 | `SC_API_KEY` | Provider credential | unset |
 | `SC_BASE_URL` | OpenAI-compatible base URL | `https://api.subconscious.dev/v1` |
-| `SC_MODEL` | Model sent to the provider | `subconscious/glm-5.2` |
+| `SC_MODEL` | Model sent to the provider | `subconscious/glm-5.3-marathon` |
 | `SC_MAX_TOKENS` | Completion allowance; `0` uses provider default | `8192` |
 | `SC_TEMPERATURE` | Sampling temperature | provider default |
 | `SC_REASONING_EFFORT` | Provider reasoning level; `off` omits it | `high` |

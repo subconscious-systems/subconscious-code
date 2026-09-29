@@ -441,3 +441,71 @@ async fn respects_retry_after_header_on_429() {
         2
     );
 }
+
+fn model_list(ids: &[&str]) -> ResponseTemplate {
+    let data: Vec<_> = ids
+        .iter()
+        .map(|id| serde_json::json!({ "id": id, "object": "model", "owned_by": "x" }))
+        .collect();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "object": "list", "data": data }))
+}
+
+/// The key-scoped list wins: `/models` would also offer models the key is
+/// refused.
+#[tokio::test]
+async fn lists_the_models_this_key_may_use() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models/available"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(model_list(&["a/allowed"]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(model_list(&["a/allowed", "b/refused"]))
+        .mount(&server)
+        .await;
+    let client = ChatClient::new(server.uri(), "test-key".into(), "mock".into(), None).unwrap();
+
+    assert_eq!(client.list_models().await.unwrap(), ["a/allowed"]);
+}
+
+/// A provider without the scoped route (wiremock 404s it) falls back to the
+/// plain OpenAI `/models` list.
+#[tokio::test]
+async fn falls_back_to_the_public_model_list_in_order() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                { "id": "b/two", "object": "model", "owned_by": "x" },
+                { "id": "a/one", "object": "model", "owned_by": "x" }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let client = ChatClient::new(server.uri(), "test-key".into(), "mock".into(), None).unwrap();
+
+    assert_eq!(client.list_models().await.unwrap(), ["b/two", "a/one"]);
+}
+
+#[tokio::test]
+async fn listing_models_surfaces_http_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("no such route"))
+        .mount(&server)
+        .await;
+    let client = ChatClient::new(server.uri(), "test-key".into(), "mock".into(), None).unwrap();
+
+    let err = client.list_models().await.unwrap_err();
+    assert!(
+        matches!(err, rc_proto::ProtoError::Status { status: 404, .. }),
+        "{err}"
+    );
+}

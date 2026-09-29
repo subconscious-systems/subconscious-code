@@ -118,6 +118,7 @@ to edit settings or resume a session, `Shift+Tab` to change permission mode,
 `Tab` to queue a draft while a turn runs, `Esc` to stop, and `Ctrl+C` to quit.
 If a message is queued, `Esc` waits for the current tool call to finish and
 then sends it; press `Esc` again to stop immediately.
+Use `/model` to pick another model for the conversation.
 
 For a non-interactive read-only task:
 
@@ -234,7 +235,7 @@ side — a resumed session keeps its original ID, so the grouping survives
 ## Provider and transport configuration
 
 Defaults target `https://api.subconscious.dev/v1` with model
-`subconscious/glm-5.2`. Override these per invocation with `--base-url` and
+`subconscious/glm-5.3-marathon`. Override these per invocation with `--base-url` and
 `--model`, per shell with `SC_BASE_URL` and `SC_MODEL`, or persistently in
 `~/.sc/settings.json`. See [Configuration](docs/CONFIGURATION.md) for precedence
 and complete examples.
@@ -354,6 +355,14 @@ back, `Esc` to close:
   its sessions, labeled by their first prompt, and resume any of them or start
   a fresh session in that directory. Switching sessions rebuilds the agent
   in-process; no restart.
+- **Models** — every saved model plus every model the API key may use
+  (`GET /v1/models/available`, or `GET /v1/models` on providers without it),
+  with `●` on the one in use and `(not served)` on a saved model the endpoint
+  dropped. `↵` switches the running conversation to the selected model for
+  the rest of the run, even over `--model` or `SC_MODEL`, and saves it as the
+  default. `/model` opens this page
+  directly; `/model <name>` switches without it, taking an exact id or any
+  fragment that names one model (`/model deepseek`).
 - **Settings** — the resolved value of every setting that
   `~/.sc/settings.json` actually backs, editable in place (`↵` to type, `←/→`
   to cycle a choice) and saved straight to that file. Unknown keys in the file
@@ -366,12 +375,16 @@ back, `Esc` to close:
     (`[2/3]`). Persisted as a `models` array beside `model`:
 
     ```json
-    { "model": "subconscious/glm-5.2",
-      "models": ["subconscious/glm-5.2"] }
+    { "model": "subconscious/glm-5.3-marathon",
+      "models": ["subconscious/glm-5.3-marathon"] }
     ```
 
     The roster always contains the model in use, so an existing install with
-    no `models` key still starts with a working list of one.
+    no `models` key still starts with a working list of one. Models the
+    API key may use follow the saved ones, so `←/→` reaches
+    them without typing a name; only a model you pick is saved. A saved model
+    the endpoint no longer lists is marked `(not served)`. Picking a model
+    switches the running conversation to it.
   - **Base URL** — the `base_url` row is free text; `↵`, edit, `↵` to save.
 
 ## Permissions
@@ -438,7 +451,7 @@ perfectly serviceable — set the caps you want in `~/.sc/settings.json`:
 ```json
 {
   "provider": { "base_url": "https://your-endpoint/v1", "api_key_env": "SC_API_KEY" },
-  "model": "subconscious/glm-5.2",
+  "model": "subconscious/glm-5.3-marathon",
   "context": { "tool_result_cap": 16384, "read_default_limit": 2000 }
 }
 ```
@@ -750,7 +763,7 @@ valid prefix. Line 1 is a `SessionHeader`; every line after it is one `Turn`,
 tagged by a `type` field:
 
 ```jsonl
-{"id":"<uuid>","cwd":"/repo","model":"subconscious/glm-5.2","mode":"default","extra_dirs":[]}
+{"id":"<uuid>","cwd":"/repo","model":"subconscious/glm-5.3-marathon","mode":"default","extra_dirs":[]}
 {"type":"user","content":"explain src/","ts":1755300000000}
 {"type":"assistant","text":"Let me look.","calls":[{...}],"usage":{...}}
 {"type":"tool_result","call_id":"call_1","tool":"Bash",

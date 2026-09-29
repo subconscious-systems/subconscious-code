@@ -495,6 +495,13 @@ impl App {
         }
     }
 
+    /// The `/menu` state for this session, told which model it is running.
+    fn new_menu(&self) -> crate::menu::MenuState {
+        let mut menu = crate::menu::MenuState::new(&sessions_dir_for_menu(), &self.cwd);
+        menu.running_model = self.view.model_name.clone();
+        menu
+    }
+
     /// Act on the selected menu row.
     fn activate_menu_row(&mut self) {
         let Some(menu) = self.view.menu_overlay.as_mut() else {
@@ -504,7 +511,14 @@ impl App {
             return;
         };
         match row {
+            crate::menu::Row::Goto(crate::menu::MenuPage::Models) => menu.goto_models(),
             crate::menu::Row::Goto(page) => menu.goto(page),
+            crate::menu::Row::Model(name) => {
+                menu.pick_model(&name, &self.cwd);
+                if let Some(outcome) = menu.pending_outcome.take() {
+                    self.leave_with(outcome);
+                }
+            }
             crate::menu::Row::Project(dir) => menu.goto(crate::menu::MenuPage::Sessions(dir)),
             crate::menu::Row::Field(_) => menu.begin_edit(),
             crate::menu::Row::ChangeApiKey => menu.begin_api_key_edit(),
@@ -1303,12 +1317,7 @@ impl App {
     fn run_slash(&mut self, action: SlashAction) {
         let p = theme::palette();
         match action {
-            SlashAction::Menu => {
-                self.view.menu_overlay = Some(crate::menu::MenuState::new(
-                    &sessions_dir_for_menu(),
-                    &self.cwd,
-                ));
-            }
+            SlashAction::Menu => self.view.menu_overlay = Some(self.new_menu()),
             SlashAction::Help => {
                 self.view
                     .transcript
@@ -1434,11 +1443,27 @@ impl App {
                 ];
                 self.push_info("status", &lines);
             }
-            SlashAction::Model => {
-                self.view.transcript.push(Line::styled(
-                    format!("model: {}", self.view.model_name),
-                    p.chrome(),
-                ));
+            SlashAction::Model(None) => {
+                let mut menu = self.new_menu();
+                menu.goto_models();
+                self.view.menu_overlay = Some(menu);
+            }
+            SlashAction::Model(Some(query)) => {
+                let mut menu = self.new_menu();
+                let refused = match menu.resolve_model(&query) {
+                    Ok(name) => {
+                        menu.pick_model(&name, &self.cwd);
+                        menu.status
+                    }
+                    Err(e) => Some(e),
+                };
+                match menu.pending_outcome.take() {
+                    Some(outcome) => self.leave_with(outcome),
+                    None => self.view.transcript.push(Line::styled(
+                        format!("model: {}", refused.unwrap_or_default()),
+                        p.chrome(),
+                    )),
+                }
             }
             SlashAction::SelectMode => self.toggle_mouse_capture(),
             SlashAction::Permissions => {
@@ -1519,7 +1544,7 @@ impl App {
                 self.quit = true;
             }
             SlashAction::Resume => {
-                let mut menu = crate::menu::MenuState::new(&sessions_dir_for_menu(), &self.cwd);
+                let mut menu = self.new_menu();
                 let page = if menu.project(&self.cwd).is_some() {
                     crate::menu::MenuPage::Sessions(self.cwd.clone())
                 } else {
@@ -1529,7 +1554,7 @@ impl App {
                 self.view.menu_overlay = Some(menu);
             }
             SlashAction::Login => {
-                let mut menu = crate::menu::MenuState::new(&sessions_dir_for_menu(), &self.cwd);
+                let mut menu = self.new_menu();
                 menu.begin_api_key_edit();
                 self.view.menu_overlay = Some(menu);
             }
@@ -1598,6 +1623,12 @@ fn classify_slash(text: &str) -> Option<SlashAction> {
             (!direction.is_empty()).then(|| direction.to_string()),
         ));
     }
+    if let Some(query) = t.strip_prefix("/model ") {
+        let query = query.trim();
+        return Some(SlashAction::Model(
+            (!query.is_empty()).then(|| query.to_string()),
+        ));
+    }
     if let Some(rest) = t.strip_prefix("/rewind") {
         let rest = rest.trim();
         if rest.is_empty() {
@@ -1613,7 +1644,7 @@ fn classify_slash(text: &str) -> Option<SlashAction> {
         "/context" => Some(SlashAction::Context),
         "/cost" | "/usage" => Some(SlashAction::Cost),
         "/status" | "/s" => Some(SlashAction::Status),
-        "/model" => Some(SlashAction::Model),
+        "/model" => Some(SlashAction::Model(None)),
         "/mode" => Some(SlashAction::CycleMode),
         "/permissions" | "/approval" => Some(SlashAction::Permissions),
         "/select" | "/mouse" => Some(SlashAction::SelectMode),
@@ -1741,7 +1772,8 @@ enum SlashAction {
     Cost,
     Context,
     Status,
-    Model,
+    /// `/model` opens the picker; `/model <name>` switches directly.
+    Model(Option<String>),
     Permissions,
     /// Toggle mouse capture so the terminal can select text (`/select`).
     SelectMode,
@@ -2287,6 +2319,14 @@ fn error_block(e: &str) -> Vec<Line<'static>> {
         if more {
             lines.push(Line::styled("│ …".to_string(), p.chrome()));
         }
+    }
+    // The gateway's code for a model this key can't use: a retired one, or one
+    // `GET /models` lists that the key isn't allowed.
+    if e.contains("model_not_allowed") {
+        lines.push(Line::styled(
+            "  this API key can't use that model; /model picks another".to_string(),
+            p.chrome(),
+        ));
     }
     lines
 }
@@ -3333,6 +3373,20 @@ mod tests {
     }
 
     #[test]
+    fn error_block_points_a_disallowed_model_at_the_picker() {
+        let e = r#"proto: request failed: HTTP 403 — {"error":{"code":"model_not_allowed"}}"#;
+        let text: String = error_block(e)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("/model picks another"), "{text}");
+        assert!(!error_block("model rate-limited")
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("/model")));
+    }
+
+    #[test]
     fn error_block_gutters_a_long_message() {
         let e = "line one\nline two\nline three\nline four\nline five\nline six\nline seven";
         let lines = error_block(e);
@@ -3364,6 +3418,18 @@ mod tests {
         assert!(matches!(
             classify_slash("/rewind 3"),
             Some(SlashAction::Rewind { steps: 3 })
+        ));
+        assert!(matches!(
+            classify_slash("/model"),
+            Some(SlashAction::Model(None))
+        ));
+        assert!(matches!(
+            classify_slash("/model deepseek"),
+            Some(SlashAction::Model(Some(q))) if q == "deepseek"
+        ));
+        assert!(matches!(
+            classify_slash("/mode"),
+            Some(SlashAction::CycleMode)
         ));
         assert!(matches!(
             classify_slash("/goal ship the release"),
