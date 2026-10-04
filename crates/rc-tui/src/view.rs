@@ -189,6 +189,13 @@ pub(crate) struct ViewState {
     pub queued_messages: usize,
     /// Whether Esc has armed cancellation at the end of the current tool batch.
     pub queued_after_tool: bool,
+    /// The most recently *submitted* prompt (opencode #52537): the double-Esc
+    /// restore arm pulls it back into the composer after a cancel. Queued
+    /// follow-ups are deliberately not tracked — the runtime still owns those.
+    pub last_submitted: Option<String>,
+    /// When the current Esc sequence cancelled a turn; set by
+    /// `cancel_active_turn`, consumed by the restore arm.
+    pub last_cancel_at: Option<Instant>,
     pub pending_ask: Option<PendingAsk>,
     pub composer: String,
     /// Multiline regions displayed as `[pasted N lines]` instead of expanding
@@ -435,6 +442,8 @@ impl ViewState {
             busy: false,
             queued_messages: 0,
             queued_after_tool: false,
+            last_submitted: None,
+            last_cancel_at: None,
             pending_ask: None,
             composer: String::new(),
             paste_markers: Vec::new(),

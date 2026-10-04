@@ -768,6 +768,27 @@ impl App {
                         self.view.last_input = Some(Instant::now());
                         self.refresh_menu();
                     }
+                    EscAction::RestoreSent => {
+                        // opencode #52537: the interrupted prompt comes back to
+                        // the composer instead of forcing a re-type. The
+                        // cancelled turn stays in history (append-only); the
+                        // model sees the earlier attempt stop at a Cancelled
+                        // marker, never as a live instruction.
+                        let prompt = self.view.last_submitted.take();
+                        self.view.last_cancel_at = None;
+                        if let Some(prompt) =
+                            prompt.filter(|p| !p.is_empty() && self.view.composer.is_empty())
+                        {
+                            self.view.composer = prompt;
+                            self.view.transcript.push(Line::styled(
+                                "· restored the interrupted prompt to the input".to_string(),
+                                dim_style(),
+                            ));
+                            self.view.last_input = Some(Instant::now());
+                            self.refresh_menu();
+                            self.jump_to_bottom();
+                        }
+                    }
                     EscAction::Quit => {
                         self.runtime.action(UserAction::Quit);
                         self.quit = true;
@@ -1339,6 +1360,10 @@ impl App {
         if !self.runtime.try_action(UserAction::Submit(text.clone())) {
             return;
         }
+        // opencode #52537: the double-Esc-restore arm reads this to bring the
+        // just-sent prompt back if the turn is cancelled right away.
+        self.view.last_submitted = Some(text.clone());
+        self.view.last_cancel_at = None;
         self.record_prompt(&text);
         self.begin_turn_display();
     }
@@ -1383,6 +1408,7 @@ impl App {
     fn cancel_active_turn(&mut self) {
         self.send_queued_after_tool = false;
         self.view.queued_after_tool = false;
+        self.view.last_cancel_at = Some(Instant::now());
         self.runtime.action(UserAction::Cancel);
     }
 
@@ -1896,7 +1922,12 @@ fn resolve_staged_submit(
 ///   busy + queue  → QueueAfterTool (a second Esc cancels immediately)
 ///   busy          → Cancel the in-flight turn
 ///   browsing hist → RestoreDraft (return to the live draft, not clear it)
-///   draft present → Clear the composer (a second Esc, now empty, quits)
+///   draft present → Clear the composer (a second Esc, now empty, quits or restores)
+///   recent cancel → RestoreSent: pull the interrupted prompt back into the
+///                   composer (opencode #52537 — "double Esc right after
+///                   sending should undo the message and restore it to the
+///                   input"). Bounded to [`DOUBLE_ESC_RESTORE_WINDOW`] so the
+///                   idle-Esc-quits habit stays predictable.
 ///   otherwise     → Quit
 ///
 /// The menu and ask handlers `return` before the keymap reaches `Esc`, so this
@@ -1922,10 +1953,20 @@ fn esc_action(state: &crate::view::ViewState) -> EscAction {
         EscAction::RestoreDraft
     } else if !state.composer.is_empty() {
         EscAction::Clear
+    } else if state
+        .last_cancel_at
+        .is_some_and(|at| at.elapsed() < DOUBLE_ESC_RESTORE_WINDOW)
+    {
+        EscAction::RestoreSent
     } else {
         EscAction::Quit
     }
 }
+
+/// How long after a cancel a second Esc still restores the interrupted prompt
+/// (opencode #52537) instead of quitting. Long enough to cover a turn's
+/// cancel-winddown, short enough that an idle Esc still quits on autopilot.
+const DOUBLE_ESC_RESTORE_WINDOW: Duration = Duration::from_secs(2);
 
 /// The resolved effect of an `Esc` press. See [`esc_action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1934,6 +1975,7 @@ enum EscAction {
     Cancel,
     RestoreDraft,
     Clear,
+    RestoreSent,
     Quit,
 }
 
@@ -3788,6 +3830,32 @@ mod tests {
         // Busy wins over history browsing too.
         s.busy = true;
         assert_eq!(esc_action(&s), EscAction::Cancel);
+    }
+
+    /// opencode #52537: the second Esc within the restore window brings the
+    /// interrupted prompt back; outside the window, and after the restore, an
+    /// idle Esc quits again like it always did.
+    #[test]
+    fn double_esc_after_a_cancel_restores_then_quits() {
+        let mut s = ViewState::new("m".into());
+        // No recent cancel: unchanged behavior.
+        s.last_submitted = Some("just sent".into());
+        assert_eq!(esc_action(&s), EscAction::Quit);
+
+        // Cancel just happened: restore instead of quit, but only while the
+        // window is open.
+        s.last_cancel_at = Some(Instant::now());
+        assert_eq!(esc_action(&s), EscAction::RestoreSent);
+
+        // The restore arm always closes the window itself, but a stale
+        // timestamp must also fail the gate on its own.
+        s.last_cancel_at = Some(Instant::now() - DOUBLE_ESC_RESTORE_WINDOW - Duration::from_secs(1));
+        assert_eq!(esc_action(&s), EscAction::Quit);
+
+        // A draft present outranks the restore (Clear first, as before).
+        s.last_cancel_at = Some(Instant::now());
+        s.composer = "typing again".into();
+        assert_eq!(esc_action(&s), EscAction::Clear);
     }
 
     #[test]
