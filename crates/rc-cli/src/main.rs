@@ -858,7 +858,9 @@ async fn run_headless(
 ) -> Result<()> {
     let started = Instant::now();
     let prompter: Box<dyn Prompter> = if std::io::stdin().is_terminal() {
-        Box::new(StdinPrompter)
+        Box::new(StdinPrompter {
+            cwd: session.cwd.clone(),
+        })
     } else {
         Box::new(NullPrompter)
     };
@@ -2198,11 +2200,14 @@ fn init_tracing() {
 /// A crude stdin prompter (§7.4): `y`=once, `s`=session, `a`=always, `n`=deny.
 /// The blocking `read_line` is fine inside the async fn: this prompter only runs
 /// on a TTY under the multi-thread runtime, so one blocked worker is acceptable.
-struct StdinPrompter;
+struct StdinPrompter {
+    /// The session's working directory, used to scope suggested path grants.
+    cwd: PathBuf,
+}
 #[async_trait::async_trait]
 impl Prompter for StdinPrompter {
     async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse {
-        let suggested = suggested_rule(tool, input);
+        let suggested = suggested_rule(tool, input, &self.cwd);
         eprintln!("━ {tool} requires permission: {reason}");
         eprintln!("  granting rule: {suggested}");
         eprint!("  [y]es once / [s]ession / [a]lways / [n]o: ");
@@ -2220,9 +2225,11 @@ impl Prompter for StdinPrompter {
     }
 }
 
-/// A rough "don't ask again for this" rule: `Bash(<first-token>:*)` for Bash,
-/// the bare tool name for everything else (grants the whole tool for the session).
-fn suggested_rule(tool: &str, input: &Value) -> String {
+/// The rule the prompter offers as the standing grant. Bash keys on the first
+/// *command* token (leading `NAME=value` assignments are transparent —
+/// opencode #52720); path tools scope the grant to the approved file's own
+/// directory (opencode #52715); the bare tool name is the last-resort fallback.
+fn suggested_rule(tool: &str, input: &Value, cwd: &std::path::Path) -> String {
     #[cfg(windows)]
     if tool == "PowerShell" {
         return rc_core::powershell_grant(
@@ -2231,11 +2238,30 @@ fn suggested_rule(tool: &str, input: &Value) -> String {
     }
     if tool == "Bash" {
         if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-            let first = cmd.split_whitespace().next().unwrap_or("");
-            if !first.is_empty() {
+            if let Some(first) = rc_core::suggest_command_name(cmd) {
                 return format!("Bash({first}:*)");
             }
         }
+    }
+    let path = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str);
+    if let Some(path) = path {
+        let candidate = std::path::Path::new(path);
+        let rel: std::path::PathBuf = if candidate.is_absolute() {
+            match candidate.strip_prefix(cwd) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => return tool.to_string(), // outside cwd: no tight spec
+            }
+        } else {
+            candidate.to_path_buf()
+        };
+        let dir = match rel.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => std::path::Path::new("."),
+        };
+        return format!("{tool}({}/*)", dir.display());
     }
     tool.to_string()
 }

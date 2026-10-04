@@ -232,13 +232,66 @@ fn is_rootish_target(t: &str) -> bool {
         || t.starts_with("${HOME}/")
 }
 
+/// A token that is a shell variable assignment for the *next* command:
+/// `NAME=value`, where `NAME` is a portable shell identifier (letters, digits,
+/// underscore, not starting with a digit) and `=` is not inside a word (so
+/// `A=1`, `X_Y="--force ok"` qualify; `./x=1` and `x=y=z`… also qualify —
+/// `x` is the name and `y=z` the value; both are harmless to skip).
+///
+/// Used to see through the POSIX prefix-assignment form `FOO=1 cargo build`,
+/// which is exactly one `cargo build` invocation as far as rules and grants
+/// are concerned (opencode #52720: a `Bash(cargo:*)` standing grant must cover it).
+pub fn is_shell_assignment(tok: &str) -> bool {
+    let Some(eq) = tok.find('=') else {
+        return false;
+    };
+    if eq == 0 {
+        return false;
+    }
+    let name = &tok[..eq];
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The command tokens with leading `NAME=value` assignments removed (up to
+/// the first non-assignment token). `FOO=1 C=2 cargo build` → `cargo build`.
+/// The `env` command is *not* an assignment prefix and never starts one.
+fn strip_assignments(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start < tokens.len() && is_shell_assignment(&tokens[start]) {
+        start += 1;
+    }
+    if start == tokens.len() {
+        // `FOO=1` alone assigns a variable and runs nothing; keep it whole so
+        // rules decide (it is not empty-token-shaped).
+        return tokens;
+    }
+    &tokens[start..]
+}
+
+/// The command name a rule or standing grant should key on: the first token
+/// after any leading `NAME=value` assignments. `FOO=1 cargo build` → `cargo`;
+/// `env FOO=1 x` → `env`. `None` when there is no command word.
+pub fn suggest_command_name(cmd: &str) -> Option<String> {
+    let tokens = shlex::split(cmd.trim())?;
+    let stripped = strip_assignments(&tokens);
+    stripped.first().map(|t| t.to_string())
+}
+
 /// Token-based catastrophic detection: flag-insensitive `rm` with recursive
 /// *and* force targeting a root-ish path, `mkfs*`, `dd of=/dev/…`, recursive
 /// world-writable `chmod` on a root-ish path, and the system-halt family.
 /// Token matching (rather than substring) is the whole point: `rm -rf "/"`,
 /// `rm  -rf  /`, and `rm --recursive --force /` all land here where the old
-/// substring list let each through.
+/// substring list let each through. Leading `NAME=value` assignments
+/// (`FOO=1 rm -rf /`) are stripped first so the floor cannot be dodged by
+/// prefixing a variable.
 fn is_catastrophic_tokens(tokens: &[String]) -> bool {
+    let tokens = strip_assignments(tokens);
     let Some(first) = tokens.first() else {
         return false;
     };
@@ -405,6 +458,10 @@ pub fn is_always_ask(cmd: &str) -> bool {
 /// - `cargo test:*` — the command starts with the tokens `cargo test` (and may
 ///   have more, including none).
 /// - `git status` — exact token match.
+///
+/// Leading `NAME=value` assignments are skipped on the command side
+/// (opencode #52720): the POSIX spellings `FOO=1 cargo build` and
+/// `cargo build` are the same invocation, so `Bash(cargo:*)` matches both.
 pub fn rule_matches(spec: &str, sub: &Sub) -> bool {
     if spec.is_empty() {
         return true;
@@ -417,10 +474,11 @@ pub fn rule_matches(spec: &str, sub: &Sub) -> bool {
     let Some(rule_tokens) = shlex::split(prefix_str) else {
         return false;
     };
+    let tokens = strip_assignments(&sub.tokens);
     if wildcard {
-        sub.tokens.len() >= rule_tokens.len() && sub.tokens[..rule_tokens.len()] == rule_tokens[..]
+        tokens.len() >= rule_tokens.len() && tokens[..rule_tokens.len()] == rule_tokens[..]
     } else {
-        sub.tokens == rule_tokens
+        tokens == rule_tokens
     }
 }
 
@@ -616,6 +674,47 @@ mod tests {
         assert!(matches!(write_redirect("&>both"), Some(Redirect::Attached("both"))));
         assert!(write_redirect("file.txt").is_none());
         assert!(write_redirect("--force").is_none());
+    }
+
+    // ---- leading NAME=value assignments (opencode #52720) ------------------
+
+    #[test]
+    fn assignments_are_transparent_to_rules_and_grants() {
+        // `FOO=1 cargo build` is one `cargo build` as far as a `Bash(cargo:*)`
+        // standing grant is concerned.
+        let s = subs("FOO=1 cargo build");
+        assert!(rule_matches("cargo:*", &s[0]));
+        let s2 = subs("A=1 B=2 git status");
+        assert!(rule_matches("git status", &s2[0]));
+        assert!(rule_matches("git:*", &s2[0]));
+        // The `env` command is a real command, not an assignment prefix.
+        let s3 = subs("env FOO=1 git status");
+        assert!(!rule_matches("git status", &s3[0]));
+        assert!(!rule_matches("git:*", &s3[0]));
+        assert!(rule_matches("env:*", &s3[0]));
+        // A rule that itself contains an assignment still matches the bare
+        // spelling's tokens, not the prefixed form's.
+        let s4 = subs("cargo build");
+        assert!(rule_matches("cargo:*", &s4[0]));
+    }
+
+    #[test]
+    fn catastrophic_floor_ignores_assignment_prefixes() {
+        assert!(is_catastrophic_cmd("FOO=1 rm -rf /"));
+        assert!(is_catastrophic_cmd("A=1 B=2 rm --recursive --force /"));
+        assert!(is_catastrophic_cmd("SC_DANGER=1 reboot"));
+        assert!(is_catastrophic_cmd("X=1 chmod -R 777 /"));
+        // A lone assignment names no command: an ordinary shell line.
+        assert!(!is_catastrophic_cmd("FOO=1"));
+    }
+
+    #[test]
+    fn suggest_command_name_skips_assignments() {
+        assert_eq!(suggest_command_name("FOO=1 cargo build").as_deref(), Some("cargo"));
+        assert_eq!(suggest_command_name("A=1 B=2 git status").as_deref(), Some("git"));
+        assert_eq!(suggest_command_name("env X=1 git").as_deref(), Some("env"));
+        assert_eq!(suggest_command_name("plain cmd").as_deref(), Some("plain"));
+        assert_eq!(suggest_command_name("  "), None, "no command word");
     }
 
     #[test]

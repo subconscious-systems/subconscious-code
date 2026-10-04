@@ -589,12 +589,12 @@ impl App {
             }
             let response = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(AskResponse::Once),
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    Some(AskResponse::Session(suggested_rule(&ask.tool, &ask.input)))
-                }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
-                    Some(AskResponse::Always(suggested_rule(&ask.tool, &ask.input)))
-                }
+                KeyCode::Char('s') | KeyCode::Char('S') => Some(AskResponse::Session(
+                    suggested_rule(&ask.tool, &ask.input, &self.cwd),
+                )),
+                KeyCode::Char('a') | KeyCode::Char('A') => Some(AskResponse::Always(
+                    suggested_rule(&ask.tool, &ask.input, &self.cwd),
+                )),
                 KeyCode::Char('n') | KeyCode::Char('N') => {
                     Some(AskResponse::Deny("declined".into()))
                 }
@@ -2050,7 +2050,16 @@ fn cycle_mode(m: AgentMode) -> AgentMode {
 
 /// A rough "don't ask again for this" rule, matching rc-cli's stdin prompter:
 /// `Bash(<first-token>:*)` for Bash, the bare tool name otherwise.
-fn suggested_rule(tool: &str, input: &Value) -> String {
+/// The rule text the "Always allow" arm offers as a standing session grant.
+///
+/// - Bash keys on the first *command* token, skipping leading `NAME=value`
+///   assignments (opencode #52720): `FOO=1 cargo build` grants `Bash(cargo:*)`,
+///   a rule that actually matches the next `FOO=1 cargo …` too.
+/// - Path tools scope the grant to the approved file's own directory
+///   (opencode #52715): approving one `Write(./config/app.toml)` must not mint
+///   a bare `Write` that silently covers every later path. The bare-tool
+///   fallback remains only for inputs with no usable path.
+fn suggested_rule(tool: &str, input: &Value, cwd: &Path) -> String {
     #[cfg(windows)]
     if tool == "PowerShell" {
         return rc_core::powershell_grant(
@@ -2059,11 +2068,30 @@ fn suggested_rule(tool: &str, input: &Value) -> String {
     }
     if tool == "Bash" {
         if let Some(cmd) = input.get("command").and_then(|val| val.as_str()) {
-            let first = cmd.split_whitespace().next().unwrap_or("");
-            if !first.is_empty() {
+            if let Some(first) = rc_core::suggest_command_name(cmd) {
                 return format!("Bash({first}:*)");
             }
         }
+    }
+    let path = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str);
+    if let Some(path) = path {
+        let candidate = Path::new(path);
+        let rel: std::path::PathBuf = if candidate.is_absolute() {
+            match candidate.strip_prefix(cwd) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => return tool.to_string(), // outside cwd: no tight spec
+            }
+        } else {
+            candidate.to_path_buf()
+        };
+        let dir = match rel.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        return format!("{tool}({}/*)", dir.display());
     }
     tool.to_string()
 }
@@ -2891,13 +2919,66 @@ mod tests {
     }
 
     #[test]
-    fn suggested_rule_for_bash_uses_first_token() {
+    fn suggested_rule_for_bash_uses_first_command_token() {
         assert_eq!(
-            suggested_rule("Bash", &serde_json::json!({"command": "cargo test --lib"})),
+            suggested_rule(
+                "Bash",
+                &serde_json::json!({"command": "cargo test --lib"}),
+                Path::new("/repo")
+            ),
             "Bash(cargo:*)"
         );
+        // Leading NAME=value assignments are transparent: the grant keys on
+        // the real command (opencode #52720) and matches the prefixed spelling.
         assert_eq!(
-            suggested_rule("Edit", &serde_json::json!({"file_path": "/tmp/x"})),
+            suggested_rule(
+                "Bash",
+                &serde_json::json!({"command": "FOO=1 cargo build"}),
+                Path::new("/repo")
+            ),
+            "Bash(cargo:*)"
+        );
+    }
+
+    /// Standing grants for path tools are directory-scoped (opencode #52715):
+    /// approving one file mints a rule for its own directory, never a bare
+    /// `Edit`/`Write` that covers every later path.
+    #[test]
+    fn suggested_path_grants_are_directory_scoped() {
+        assert_eq!(
+            suggested_rule(
+                "Edit",
+                &serde_json::json!({"file_path": "src/app.rs"}),
+                Path::new("/repo")
+            ),
+            "Edit(src/*)"
+        );
+        // A file directly in the cwd scopes to "./*" (`./` prefix is stripped
+        // by the rule matcher, matching what sits in the workspace root).
+        assert_eq!(
+            suggested_rule(
+                "Write",
+                &serde_json::json!({"file_path": "app.toml"}),
+                Path::new("/repo")
+            ),
+            "Write(./*)"
+        );
+        // An absolute path inside the cwd is expressed relatively.
+        assert_eq!(
+            suggested_rule(
+                "Edit",
+                &serde_json::json!({"file_path": "/repo/config/x.toml"}),
+                Path::new("/repo")
+            ),
+            "Edit(config/*)"
+        );
+        // Outside the cwd there is no tight spec — bare tool only.
+        assert_eq!(
+            suggested_rule(
+                "Edit",
+                &serde_json::json!({"file_path": "/tmp/x"}),
+                Path::new("/repo")
+            ),
             "Edit"
         );
     }

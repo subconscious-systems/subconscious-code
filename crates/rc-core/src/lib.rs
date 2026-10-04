@@ -38,8 +38,8 @@ pub use prompt::{AskResponse, NullPrompter, Prompter};
 #[cfg(windows)]
 pub use rc_perm::rules::powershell_grant;
 pub use rc_perm::{
-    resolve_within, resolve_within_loose, AllowAllChecker, BypassChecker, Decision, Mode,
-    PermissionChecker, PermissionEngine,
+    resolve_within, resolve_within_loose, suggest_command_name, AllowAllChecker, BypassChecker,
+    Decision, Mode, PermissionChecker, PermissionEngine,
 };
 pub use rc_proto::FinishReason;
 pub use rc_proto::Usage;
