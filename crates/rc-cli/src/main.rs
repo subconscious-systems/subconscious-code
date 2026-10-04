@@ -38,7 +38,7 @@ use rc_proto::{ChatClient, DlrMode, ProtoError, RetryOpts};
 use rc_tools::{Append, Bash, Edit, Glob, Grep, GrepMany, List, Read, ReadMany, Write};
 use serde_json::Value;
 use std::io::{IsTerminal, Write as IoWrite};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -335,7 +335,8 @@ async fn run(cli: Cli) -> Result<()> {
         .collect();
 
     // Resume an existing session (--continue picks the newest; --resume takes a
-    // path). Only the TUI path persists; a headless `-p` run is ephemeral.
+    // path). Both the TUI and a headless `-p` run save their turns, so a later
+    // `-p --continue` can carry a conversation forward.
     let sessions_dir = sessions_dir()?;
     let resumed = if let Some(path) = cli.resume.clone() {
         let session = rc_session::load(&path).context("--resume: could not load session")?;
@@ -406,9 +407,12 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Headless one-shot: run one turn and print the answer.
     if let Some(prompt) = cli.print.filter(|p| !p.is_empty()) {
+        let session_store =
+            headless_session_store(&session, session_path.as_deref(), &sessions_dir)?;
         return run_headless(
             build_agent(&session, &api_key, &settings)?,
             session,
+            session_store,
             prompt,
             cli.benchmark_report,
             cli.benchmark_trajectory,
@@ -849,9 +853,26 @@ mod session_id_tests {
 /// stdin prompter is used only on a TTY; non-interactive runs deny on Ask (fail
 /// closed). `--dangerously-skip-permissions` uses `BypassChecker`, which never
 /// asks, so the prompter is moot in bypass mode.
+/// The store a headless run saves its turns to: the resumed file when there is
+/// one, otherwise a new session file that is only created with its first turn.
+fn headless_session_store(
+    session: &Session,
+    resumed_path: Option<&Path>,
+    sessions_dir: &Path,
+) -> Result<rc_session::SessionStore> {
+    match resumed_path {
+        Some(path) => rc_session::SessionStore::open_append(path.to_path_buf()),
+        None => rc_session::SessionStore::create_lazy(
+            sessions_dir.join(format!("{}.jsonl", session.id)),
+            session,
+        ),
+    }
+}
+
 async fn run_headless(
     agent: AgentLoop,
     mut session: Session,
+    session_store: rc_session::SessionStore,
     prompt: String,
     benchmark_report: Option<PathBuf>,
     benchmark_trajectory: Option<PathBuf>,
@@ -869,7 +890,8 @@ async fn run_headless(
         benchmark_report.clone(),
         benchmark_trajectory.clone(),
         started,
-    );
+    )
+    .with_session_store(session_store);
     let cancel = CancellationToken::new();
     let pressure_cancel = cancel.clone();
     let _resource_monitor = resource_scope::ResourceMonitor::start(move |snapshot| {
@@ -1584,6 +1606,61 @@ mod benchmark_report_tests {
         assert_eq!(value["wall_time_ms"], 9);
     }
 
+    fn user_turn(content: &str) -> Turn {
+        Turn::User {
+            content: content.into(),
+            ts: std::time::SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn headless_run_saves_a_session_that_continue_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            "fresh".into(),
+            PathBuf::from("/workspace"),
+            "subconscious/glm-5.3-marathon".into(),
+        );
+        let store = headless_session_store(&session, None, dir.path()).unwrap();
+        let sink = HeadlessSink::default().with_session_store(store);
+
+        rc_core::EventSink::on_turn(&sink, &user_turn("remember PELICAN"));
+        rc_core::EventSink::on_turn(&sink, &user_turn("second"));
+
+        let latest = rc_session::latest(dir.path()).expect("--continue finds the run");
+        assert_eq!(latest, dir.path().join("fresh.jsonl"));
+        let saved = rc_session::load(&latest).unwrap();
+        assert_eq!(saved.id, "fresh");
+        assert_eq!(saved.messages.len(), 2);
+    }
+
+    #[test]
+    fn headless_run_without_turns_leaves_no_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new("empty".into(), PathBuf::from("/w"), "m".into());
+        let store = headless_session_store(&session, None, dir.path()).unwrap();
+        drop(HeadlessSink::default().with_session_store(store));
+        assert!(rc_session::latest(dir.path()).is_none());
+        assert!(!dir.path().join("empty.jsonl").exists());
+    }
+
+    #[test]
+    fn resumed_headless_run_appends_to_the_resumed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("elsewhere").join("imported.jsonl");
+        let session = Session::new("resumed".into(), PathBuf::from("/w"), "m".into());
+        let mut first = rc_session::SessionStore::create(path.clone(), &session).unwrap();
+        first.append_turn(&user_turn("turn one")).unwrap();
+        drop(first);
+
+        let store = headless_session_store(&session, Some(&path), dir.path()).unwrap();
+        let sink = HeadlessSink::default().with_session_store(store);
+        rc_core::EventSink::on_turn(&sink, &user_turn("turn two"));
+
+        assert_eq!(rc_session::load(&path).unwrap().messages.len(), 2);
+        assert!(!dir.path().join("resumed.jsonl").exists());
+    }
+
     #[test]
     fn headless_sink_publishes_a_partial_prefix_at_turn_boundaries() {
         let dir = tempfile::tempdir().unwrap();
@@ -1727,6 +1804,7 @@ struct HeadlessSink {
     peak_estimated_tokens: std::sync::atomic::AtomicUsize,
     peak_reported_tokens: std::sync::atomic::AtomicU64,
     checkpoint: Option<HeadlessCheckpoint>,
+    session_store: Option<std::sync::Mutex<rc_session::SessionStore>>,
     progress: Arc<HeadlessProgress>,
     _heartbeat: Option<HeadlessHeartbeat>,
 }
@@ -1765,6 +1843,7 @@ impl Default for HeadlessSink {
             peak_estimated_tokens: std::sync::atomic::AtomicUsize::new(0),
             peak_reported_tokens: std::sync::atomic::AtomicU64::new(0),
             checkpoint: None,
+            session_store: None,
             progress,
             _heartbeat: None,
         }
@@ -1801,10 +1880,17 @@ impl rc_core::model::EventSink for HeadlessSink {
     }
 
     fn on_turn(&self, turn: &Turn) {
-        let Some(checkpoint) = &self.checkpoint else {
-            return;
-        };
-        checkpoint.send(CheckpointCommand::Turn(turn.clone()));
+        if let Some(store) = &self.session_store {
+            // One short append per completed turn; a headless run has no other
+            // work for this thread to block.
+            let mut store = store.lock().unwrap_or_else(|error| error.into_inner());
+            if let Err(error) = store.append_turn(turn) {
+                eprintln!("warning: session not saved: {error:#}");
+            }
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.send(CheckpointCommand::Turn(turn.clone()));
+        }
     }
 }
 
@@ -1829,6 +1915,11 @@ impl HeadlessSink {
             _heartbeat: heartbeat,
             ..Self::default()
         }
+    }
+
+    fn with_session_store(mut self, store: rc_session::SessionStore) -> Self {
+        self.session_store = Some(std::sync::Mutex::new(store));
+        self
     }
 
     fn finalize(&self, session: &Session, outcome: LoopOutcome) -> Result<()> {

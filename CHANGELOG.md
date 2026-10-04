@@ -5,6 +5,13 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+### Changed
+
+- Headless `-p` runs now save their session to `~/.sc/sessions` like the
+  interactive UI, so `marathon -p "next message" --continue` (or
+  `--resume <path>`) continues the conversation. A resumed run appends to the
+  file it resumed. A run that records no turn leaves no file.
+
 ## [0.1.6] - 2026-09-09
 
 ### Changed
