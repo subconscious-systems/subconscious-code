@@ -450,16 +450,24 @@ impl MenuState {
 
 /// Group sessions by their working directory, newest project first.
 ///
-/// `BTreeMap` keyed by path gives a deterministic grouping; the final sort is
-/// by recency, which is the order a picker wants.
+/// `BTreeMap` keyed by the project-identity key gives a deterministic
+/// grouping — and on case-insensitive filesystems (macOS default APFS, NTFS)
+/// `rc_session::project_key` folds case, so `/Repo` and `/repo` are one
+/// project instead of two near-empty ones (opencode #52501). The final sort
+/// is by recency, which is the order a picker wants.
 pub(crate) fn group_projects(sessions: Vec<SessionInfo>) -> Vec<Project> {
-    let mut by_dir: BTreeMap<PathBuf, Vec<SessionInfo>> = BTreeMap::new();
+    // (identity key → (display spelling from the first session, sessions))
+    let mut by_dir: BTreeMap<PathBuf, (PathBuf, Vec<SessionInfo>)> = BTreeMap::new();
     for s in sessions {
-        by_dir.entry(s.cwd.clone()).or_default().push(s);
+        by_dir
+            .entry(rc_session::project_key(&s.cwd))
+            .or_insert_with(|| (s.cwd.clone(), Vec::new()))
+            .1
+            .push(s);
     }
     let mut projects: Vec<Project> = by_dir
         .into_iter()
-        .map(|(dir, mut sessions)| {
+        .map(|(_, (dir, mut sessions))| {
             sessions.sort_by_key(|a| std::cmp::Reverse(a.modified));
             let last = sessions
                 .first()
@@ -537,6 +545,23 @@ mod tests {
     fn project_name_is_the_directory_leaf() {
         let projects = group_projects(vec![info("a", "/home/d/subconscious-code", 1, "x")]);
         assert_eq!(projects[0].name(), "subconscious-code");
+    }
+
+    /// opencode #52501: a case-spelling difference (`/Repo` vs `/repo`) is one
+    /// project on case-insensitive filesystems (macOS default APFS, NTFS),
+    /// not two near-empty groups. On Linux they remain distinct.
+    #[test]
+    fn case_spellings_of_one_project_do_not_split_the_group() {
+        let projects = group_projects(vec![
+            info("a", "/Alpaca/Cases", 100, "one"),
+            info("b", "/alpaca/cases", 300, "two"),
+        ]);
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert_eq!(projects.len(), 1, "one project, one group");
+            assert_eq!(projects[0].sessions.len(), 2);
+        } else {
+            assert_eq!(projects.len(), 2, "Linux paths are case-sensitive");
+        }
     }
 
     /// Selection wraps at both ends, so holding a direction never dead-ends.

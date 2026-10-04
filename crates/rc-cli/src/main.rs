@@ -341,16 +341,23 @@ async fn run(cli: Cli) -> Result<()> {
         let session = rc_session::load(&path).context("--resume: could not load session")?;
         Some((path, session))
     } else if cli.continue_last {
-        match rc_session::latest(&sessions_dir) {
-            Some(path) => {
-                let session = rc_session::load(&path)
+        // Codex #50334: `--continue` resumes *this project's* last session —
+        // a global "newest anywhere" silently jumped to an unrelated project
+        // the moment two shared the session store. Cross-project resume stays
+        // available through `--resume <file>` and the /menu picker.
+        let cwd = std::env::current_dir()?;
+        match rc_session::latest_in_project(&sessions_dir, &cwd) {
+            Some(latest) => {
+                let session = rc_session::load(&latest.path)
                     .context("--continue: could not load the latest session")?;
-                Some((path, session))
+                Some((latest.path, session))
             }
             None => {
                 anyhow::bail!(
-                    "--continue: no prior session found in {}",
-                    sessions_dir.display()
+                    "--continue: no prior session in {} (this directory). \
+                     Other projects' sessions are skipped; use --resume <file> \
+                     or the /menu picker to reach one.",
+                    cwd.display()
                 );
             }
         }

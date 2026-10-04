@@ -491,6 +491,43 @@ pub fn latest(dir: &Path) -> Option<PathBuf> {
         .map(|(p, _)| p)
 }
 
+/// The `--continue` target: the newest session **of this directory** (codex
+/// #50334). A globally-newest pick silently resumed an unrelated project's
+/// conversation the moment two projects shared the session store.
+pub struct LatestIn {
+    pub path: PathBuf,
+}
+
+/// Find the most recently modified session whose recorded working directory is
+/// the same project as `cwd` (newest first). Sessions from other projects are
+/// skipped entirely; the caller's error message should say so.
+pub fn latest_in_project(dir: &Path, cwd: &Path) -> Option<LatestIn> {
+    let wanted = project_key(cwd);
+    for info in list(dir) {
+        if project_key(&info.cwd) == wanted {
+            return Some(LatestIn { path: info.path });
+        }
+        // list() is newest-first: keep scanning for a same-project session.
+    }
+    None
+}
+
+/// Project-identity key for a session's cwd (opencode #52501): the canonicalized
+/// path, ASCII case-folded on case-insensitive filesystems (macOS's default
+/// APFS, Windows NTFS). `/Repo` and `/repo` are one project there, and both
+/// spellings occur because shells and configs disagree about case.
+pub fn project_key(cwd: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        PathBuf::from(canon.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        canon
+    }
+}
+
 /// Does this session file hold at least one turn line beyond the header? Cheap:
 /// stops at the second line rather than parsing the file.
 fn has_turns(path: &Path) -> bool {
@@ -826,6 +863,48 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nope.jsonl");
         assert!(SessionStore::open_append(missing).is_err());
+    }
+
+    /// Codex #50334: `--continue` must scope to the current directory's
+    /// project — a newer session from another project is never the pick.
+    #[test]
+    fn latest_in_project_scopes_to_the_current_directory() {
+        let dir = tempdir().unwrap();
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // An older session in repo-a, then a newer one in repo-b.
+        write_session(&sessions, "in-a-1", &repo_a, "older prompt");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_session(&sessions, "in-b-1", &repo_b, "newer prompt");
+
+        // `--continue` from repo-a picks repo-a's session, never repo-b's
+        // newer one.
+        let pick = latest_in_project(&sessions, &repo_a).expect("repo-a has a session");
+        assert!(pick.path.ends_with("in-a-1.jsonl"), "{:?}", pick.path);
+        let pick_b = latest_in_project(&sessions, &repo_b).expect("repo-b has a session");
+        assert!(pick_b.path.ends_with("in-b-1.jsonl"), "{:?}", pick_b.path);
+        // A directory with no sessions at all yields None.
+        let empty = dir.path().join("empty-sessions");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(latest_in_project(&empty, &repo_a).is_none());
+    }
+
+    /// opencode #52501: project identity folds case on case-insensitive
+    /// filesystems (macOS default APFS, Windows NTFS), stays exact on Linux.
+    #[test]
+    fn project_key_folds_case_on_case_insensitive_filesystems() {
+        let upper = PathBuf::from("/Definitely/A/Repo");
+        let lower = PathBuf::from("/definitely/a/repo");
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert_eq!(project_key(&upper), project_key(&lower));
+        } else {
+            assert_ne!(project_key(&upper), project_key(&lower));
+        }
     }
 
     #[test]
