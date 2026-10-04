@@ -386,10 +386,19 @@ impl App {
                 v.context_tokens_estimated = true;
                 v.cache_hit_rate = None;
             }
-            AgentEvent::Outcome(_) => {
+            AgentEvent::Outcome(o) => {
                 v.flush_text();
                 collapse_unfinished_tool_calls(v, &mut self.live_tools, Instant::now());
                 finish_turn(v);
+                // opencode #52490: outcomes other than a clean Stop used to
+                // vanish from the transcript — a `finish=length` answer with
+                // no text rendered as a silent blank stale panel. Same for the
+                // breaker (RepeatedFailure): the user must see why the turn
+                // ended without action.
+                if let Some(note) = outcome_notice(o) {
+                    v.transcript
+                        .push(Line::styled(format!("· {note}"), dim_style()));
+                }
             }
             AgentEvent::Error(e) => {
                 v.flush_text();
@@ -402,6 +411,13 @@ impl App {
                 v.flush_text();
                 v.transcript
                     .push(Line::styled(format!("· {n}"), dim_style()));
+            }
+            AgentEvent::Compacted => {
+                // codex #50337: the old `Usage`-fed context meter kept showing
+                // the pre-compaction count; reset it until the next usage
+                // arrives with the compacted request's true size.
+                v.context_tokens = None;
+                v.context_tokens_estimated = false;
             }
             AgentEvent::Ready => {
                 v.busy = true;
@@ -2050,6 +2066,28 @@ fn cycle_mode(m: AgentMode) -> AgentMode {
 
 /// A rough "don't ask again for this" rule, matching rc-cli's stdin prompter:
 /// `Bash(<first-token>:*)` for Bash, the bare tool name otherwise.
+/// The transcript line for a non-clean turn outcome (opencode #52490): users
+/// must see why a turn ended without an answer, not a silent blank. `Stop`
+/// (and `Cancelled`, which already renders its own flow) produce nothing.
+fn outcome_notice(outcome: rc_core::LoopOutcome) -> Option<&'static str> {
+    use rc_core::LoopOutcome;
+    match outcome {
+        LoopOutcome::Length => Some("the answer hit the model's output-token limit"),
+        LoopOutcome::ItersExceeded => Some("iteration budget reached before the model finished"),
+        LoopOutcome::NoProgress => Some(
+            "completion limit reached twice with no progress; the turn was stopped",
+        ),
+        LoopOutcome::RepeatedFailure => Some(
+            "identical-failure circuit breaker: the same call kept failing the same way",
+        ),
+        LoopOutcome::Incomplete => {
+            Some("the response ended without a clean completion marker")
+        }
+        LoopOutcome::TimeUp => Some("the turn exceeded its wall-clock budget"),
+        LoopOutcome::Stop | LoopOutcome::Cancelled => None,
+    }
+}
+
 /// The rule text the "Always allow" arm offers as a standing session grant.
 ///
 /// - Bash keys on the first *command* token, skipping leading `NAME=value`

@@ -38,6 +38,11 @@ pub enum LoopOutcome {
     /// Two consecutive completion-limit responses made no visible or tool
     /// progress. Continuing again would only spend another model allowance.
     NoProgress,
+    /// The identical-failure circuit breaker tripped (opencode #52372/#52763):
+    /// the model re-issued the exact same failing call after the harness had
+    /// already refused one plain retry with an explanation. Not a successful
+    /// `Stop` — but everything up to the refusal stayed paired in history.
+    RepeatedFailure,
     /// The provider ended the response without a clean terminal marker (or a
     /// content filter stopped it). This is not a successful `Stop` outcome.
     Incomplete,
@@ -82,6 +87,58 @@ const MAX_LENGTH_RECOVERIES_PER_TURN: u32 = 1;
 /// Repeated unconfirmed mutations are terminal: executing them is unsafe and
 /// retrying forever only grows the malformed-history surface.
 const MAX_UNCONFIRMED_TOOL_RECOVERIES_PER_TURN: u32 = 1;
+/// opencode #52691: some gateways end a response with `finish_reason=tool_calls`
+/// but never assemble a tool call. That is a protocol failure, not a turn
+/// boundary; the model gets the recovery note so it can reissue the call for
+/// real. The budget is small: a gateway that repeats the failure twice in one
+/// turn is broken, and the turn ends `Incomplete` rather than burning requests.
+const EMPTY_TOOL_CALLS_RECOVERY: &str = "[harness recovery] Your previous response ended with \
+finish_reason=tool_calls but carried no tool-call data (a known gateway failure mode). Reissue \
+the intended tool call(s) with complete arguments, or answer in text now.";
+const MAX_EMPTY_TOOL_CALL_RECOVERIES_PER_TURN: u32 = 2;
+
+/// Consecutive identical failures of the *same* call — same tool name, same
+/// argument bytes, same error text — before the circuit breaker refuses to run
+/// it again (opencode #52372: an agent can spend a whole session retrying a
+/// failing `Read` on a binary file; opencode #52763: repetition loops across
+/// providers). Three was opencode's observed in-the-wild threshold between an
+/// honest retry and a stuck loop.
+const IDENTICAL_FAILURE_LIMIT: u32 = 3;
+
+/// Per-turn state for the identical-failure circuit breaker. Keyed by
+/// (tool name, argument bytes). Deliberately per-turn: a fresh user prompt
+/// legitimately retries a call that failed during the previous turn, and the
+/// model *changing* the arguments or the error text changing are both
+/// observable progress that must reset the pattern (opencode #52475: counting
+/// only normalized stdout made fresh-looking retries look identical).
+struct RepeatFailure {
+    failures: u32,
+    last_error: String,
+    /// The breaker has already refused one re-issue of this exact call.
+    refused: bool,
+}
+
+/// The error result the breaker records when it declines to re-run a call.
+fn refused_repeat_message(entry: &RepeatFailure) -> String {
+    let shown = if entry.last_error.len() > 300 {
+        format!("{}…", &entry.last_error[..300])
+    } else {
+        entry.last_error.clone()
+    };
+    format!(
+        "the harness declined to re-run this exact call: it has failed {} time(s) in a row with \
+         the same error (‹{shown}›). Change the arguments or the approach; repeating it unchanged \
+         will not succeed and ends the turn.",
+        entry.failures
+    )
+}
+
+/// The note paired with the terminal outcome once the model re-issues a refused
+/// call: paired into history so both the user and any resumed session see why
+/// the turn stopped.
+const REPEAT_BREAKER_NOTE: &str = "[harness] That exact tool call failed identically three \
+times, was declined a fourth time with an explanation, and was then re-issued unchanged. The turn \
+was stopped so you can take over; nothing was lost — ask the agent to change approach.";
 /// Keep failure diagnostics useful without duplicating an arbitrarily large
 /// generated document or hidden reasoning trace in memory/session storage.
 const PARTIAL_STREAM_FIELD_BYTES: usize = 16 * 1024;
@@ -686,6 +743,12 @@ impl AgentLoop {
         let mut consecutive_investigation_rounds = 0u32;
         let mut length_recoveries_used = 0u32;
         let mut unconfirmed_tool_recoveries_used = 0u32;
+        // opencode #52691: bounded recoveries for finish_reason=tool_calls
+        // with no assembled call.
+        let mut empty_tool_call_recoveries_used = 0u32;
+        // The identical-failure circuit breaker (opencode #52372/#52763).
+        // Scoped to this run() call — one *turn* — on purpose.
+        let mut failing_repeat: HashMap<(String, String), RepeatFailure> = HashMap::new();
         let mut completion_review_used = false;
         let mut tool_work_observed = false;
         loop {
@@ -972,6 +1035,51 @@ impl AgentLoop {
                 continue;
             }
 
+            // opencode #52691: the marker says `tool_calls` but nothing was
+            // assembled. The existing switches all assume the response made
+            // *some* call; without this limb an empty-calls ToolCalls response
+            // would push an empty assistant turn, execute nothing, and request
+            // again — the same input every time, so the model repeats whatever
+            // it repeated: the infinite empty-turn loop. Treat it as a
+            // recoverable protocol failure with a bounded budget instead, and
+            // keep any streamed text in history.
+            if assistant_calls.is_empty()
+                && matches!(finish_reason, FinishReason::ToolCalls)
+            {
+                tracing::warn!(
+                    "finish_reason=tool_calls with no tool-call data; \
+                     asking the model to reissue"
+                );
+                push_turn(
+                    session,
+                    sink,
+                    Turn::Assistant {
+                        text,
+                        reasoning,
+                        calls: assistant_calls.clone(),
+                        usage,
+                        cost: turn_cost,
+                        trace: Some(trace.clone()),
+                    },
+                );
+                if empty_tool_call_recoveries_used >= MAX_EMPTY_TOOL_CALL_RECOVERIES_PER_TURN {
+                    tracing::warn!(
+                        "repeated empty finish_reason=tool_calls; ending the turn"
+                    );
+                    return Ok(LoopOutcome::Incomplete);
+                }
+                empty_tool_call_recoveries_used += 1;
+                push_turn(
+                    session,
+                    sink,
+                    Turn::SystemNote {
+                        kind: crate::turn::NoteKind::Recovery,
+                        text: EMPTY_TOOL_CALLS_RECOVERY.to_string(),
+                    },
+                );
+                continue;
+            }
+
             // §4.2 / project.rs:69: every early exit must still pair any
             // outstanding calls with results. Content-filtered calls are never
             // retried automatically; they retain the terminal Interrupted result.
@@ -1100,9 +1208,75 @@ impl AgentLoop {
                 }
             }
 
+            // opencode #52372/#52763: before the batch runs, turn any call whose
+            // exact (tool, arguments) key has failed IDENTICALLY enough times in
+            // a row into a refused-but-paired result instead of executing it
+            // again (the image `Read` retry loop, output stuck in repetition).
+            // First refusal explains itself; if the model then re-issues the
+            // unchanged call anyway, the turn is over — every call in this batch
+            // still gets its paired result so history stays replayable.
+            let mut repeat_terminal = false;
+            let mut refused_ids: HashSet<String> = HashSet::new();
+            let mut refused_keys: Vec<(String, String)> = Vec::new();
+            let exec_list: Vec<ExecItem> = exec_list
+                .into_iter()
+                .map(|item| match item {
+                    ExecItem::Call(call) => {
+                        let key = (call.name.clone(), call.arguments.to_string());
+                        match failing_repeat.get(&key) {
+                            Some(entry) if entry.failures >= IDENTICAL_FAILURE_LIMIT => {
+                                if !entry.refused {
+                                    refused_keys.push(key);
+                                } else {
+                                    // Refused once, then re-issued unchanged: terminal.
+                                    repeat_terminal = true;
+                                }
+                                refused_ids.insert(call.id.clone());
+                                ExecItem::ParseError {
+                                    call_id: call.id.clone(),
+                                    tool_name: call.name,
+                                    error: refused_repeat_message(entry),
+                                }
+                            }
+                            _ => ExecItem::Call(call),
+                        }
+                    }
+                    other => other,
+                })
+                .collect();
+            for key in &refused_keys {
+                if let Some(entry) = failing_repeat.get_mut(key) {
+                    entry.refused = true;
+                }
+            }
+            if repeat_terminal {
+                tracing::warn!(
+                    "re-issued an already-refused identical failing call; stopping the turn"
+                );
+                // §4.2: every early exit must still pair any outstanding
+                // calls. The re-issued calls were never executed; Interrupted
+                // results keep replay (and the provider's 400 check) intact.
+                synthesize_interrupted(session, &assistant_calls, sink);
+                push_turn(
+                    session,
+                    sink,
+                    Turn::SystemNote {
+                        kind: crate::turn::NoteKind::Recovery,
+                        text: REPEAT_BREAKER_NOTE.to_string(),
+                    },
+                );
+                return Ok(LoopOutcome::RepeatedFailure);
+            }
+
             let investigation_batch = is_investigation_batch(&exec_list, self.tools.as_ref());
             tool_work_observed |= !exec_list.is_empty();
             let batch_checkpoint = Arc::new(Mutex::new(BatchCheckpoint::new(exec_list.len())));
+            // Map call ids back to their (tool, arguments) key for the breaker's
+            // post-batch accounting.
+            let batch_keys: HashMap<&str, (String, String)> = assistant_calls
+                .iter()
+                .map(|c| (c.id.as_str(), (c.name.clone(), c.arguments.to_string())))
+                .collect();
             let results = match await_turn_budget(
                 execute_batch(
                     &exec_list,
@@ -1142,6 +1316,63 @@ impl AgentLoop {
                 }
             };
             for (call_id, tool, result, duration, _artifacts) in results {
+                // opencode #52372/#52763/#52475: identical-failure accounting.
+                // Only *executed* results count — our own refusal messages skip
+                // the bookkeeping (`refused_ids`) so a refusal can never look
+                // like the model making progress or new failure. A success at
+                // any point clears the key for that call.
+                if !refused_ids.contains(&call_id) {
+                    if let Some(key) = batch_keys.get(call_id.as_str()) {
+                        match &result {
+                            ToolResultBody::Error { message, .. }
+                            | ToolResultBody::Denied { reason: message } => match failing_repeat
+                                .get_mut(key)
+                            {
+                                Some(entry) if entry.last_error == *message => {
+                                    entry.failures = entry.failures.saturating_add(1);
+                                }
+                                Some(entry) => {
+                                    // A different failure is new information:
+                                    // the pattern restarts from this failure.
+                                    entry.failures = 1;
+                                    entry.last_error = message.clone();
+                                }
+                                None => {
+                                    failing_repeat.insert(
+                                        key.clone(),
+                                        RepeatFailure {
+                                            failures: 1,
+                                            last_error: message.clone(),
+                                            refused: false,
+                                        },
+                                    );
+                                }
+                            },
+                            ToolResultBody::Interrupted => match failing_repeat.get_mut(key) {
+                                Some(entry) if entry.last_error == "interrupted" => {
+                                    entry.failures = entry.failures.saturating_add(1);
+                                }
+                                Some(entry) => {
+                                    entry.failures = 1;
+                                    entry.last_error = "interrupted".into();
+                                }
+                                None => {
+                                    failing_repeat.insert(
+                                        key.clone(),
+                                        RepeatFailure {
+                                            failures: 1,
+                                            last_error: "interrupted".into(),
+                                            refused: false,
+                                        },
+                                    );
+                                }
+                            },
+                            ToolResultBody::Ok { .. } => {
+                                failing_repeat.remove(key);
+                            }
+                        }
+                    }
+                }
                 push_turn(
                     session,
                     sink,

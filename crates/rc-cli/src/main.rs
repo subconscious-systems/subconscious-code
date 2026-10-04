@@ -1158,6 +1158,7 @@ fn benchmark_outcome_label(outcome: LoopOutcome) -> &'static str {
         LoopOutcome::Length => "length",
         LoopOutcome::ItersExceeded => "iteration_limit",
         LoopOutcome::NoProgress => "no_progress",
+        LoopOutcome::RepeatedFailure => "repeated_failure",
         LoopOutcome::Incomplete => "incomplete",
         LoopOutcome::TimeUp => "time_limit",
         LoopOutcome::Cancelled => "cancelled",
@@ -2158,6 +2159,12 @@ fn print_result(session: &Session, outcome: LoopOutcome) {
             LoopOutcome::NoProgress => {
                 eprintln!(
                     "warning: model reached the completion limit twice without making progress"
+                )
+            }
+            LoopOutcome::RepeatedFailure => {
+                eprintln!(
+                    "warning: the identical-failure circuit breaker stopped the turn \
+                     (the same call kept failing the same way)"
                 )
             }
             LoopOutcome::Incomplete => {
