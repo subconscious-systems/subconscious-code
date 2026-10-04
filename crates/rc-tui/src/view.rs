@@ -283,6 +283,68 @@ pub(crate) struct ViewState {
     /// a fallback for clipboard policies that reject app-initiated copy.
     /// Toggled with Ctrl+O (`/select`).
     pub mouse_capture: bool,
+    /// Transcript mutation counter, bumped by every ViewState method that
+    /// rewrites (not just appends to) completed history. Together with
+    /// `transcript.len()`, it keys the wrap cache so a busy tick that changes
+    /// nothing skips the per-frame rewrap entirely.
+    pub transcript_generation: u64,
+    /// Streaming-parse revision, bumped whenever `current_parsed` is
+    /// recomputed or cleared. Appending deltas alone doesn't always change the
+    /// parsed line count, so length alone can't key the cache.
+    pub stream_generation: u64,
+    /// Last drawn transcript area width, recorded each draw so keyboard paging
+    /// can wrap lines at the same width the viewport does.
+    pub area_width: u16,
+    /// Memoized wrapped/fitted geometry for the last-drawn transcript window.
+    /// See [`WrapCache`].
+    wrap_cache: WrapCache,
+    /// Settled prefix of the parsed in-progress answer, kept across deltas so
+    /// only the trailing open block (everything after the last block
+    /// boundary) is re-parsed per token delta — the streaming buffer is
+    /// otherwise re-parsed cumulatively, O(n²) over a long reply.
+    stream_prefix: Vec<Line<'static>>,
+    /// Byte offset into `current_text` where the settled `stream_prefix` ends
+    /// and the live tail (re-parsed each delta) begins.
+    stream_cut: usize,
+}
+
+/// Key for the transcript wrap cache. Everything that can change the fitted
+/// rows — viewport geometry or any content mutation — is part of the key, so
+/// an unchanged key proves the previous computation is still exact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WrapKey {
+    width: u16,
+    height: usize,
+    /// The logical window start (`scroll_top` or the bottom pin).
+    start: usize,
+    transcript_len: usize,
+    transcript_generation: u64,
+    stream_len: usize,
+    stream_generation: u64,
+    has_stream: bool,
+}
+
+/// The memoized result of `draw_transcript`'s fitting pass: every visible
+/// logical line cloned + responsive-refit + counted is O(visible) per frame at
+/// the busy tick rate — the per-frame rewrap storm. Stored against a
+/// [`WrapKey`], the same window costs nothing until content, width, or scroll
+/// change. Live rows (spinner, animated "Marathoning" label) are exceptions:
+/// they're refreshed in place after a cache hit so motion never freezes.
+#[derive(Clone, Default)]
+struct WrapCache {
+    key: Option<WrapKey>,
+    /// Fitted physical rows for the window, exactly what render consumes.
+    lines: Vec<Line<'static>>,
+    /// `(source logical index, wrapped-row-within-source)` per physical row.
+    physical_sources: Vec<(usize, usize)>,
+    /// Click-target geometry for visible reasoning summaries:
+    /// `(block index, physical row, wrapped height, label width)`.
+    reasoning_rows: Vec<(usize, usize, usize, usize)>,
+    /// Same, for completed tool summaries.
+    tool_rows: Vec<(usize, usize, usize, usize)>,
+    /// How many times the rewrap actually re-ran (test observability).
+    #[cfg(test)]
+    computes: usize,
 }
 
 /// A drag selection, anchored where the button went down and headed wherever
@@ -403,6 +465,12 @@ impl ViewState {
             selection_text: None,
             copy_pending: false,
             copy_notice: None,
+            transcript_generation: 0,
+            stream_generation: 0,
+            area_width: 0,
+            wrap_cache: WrapCache::default(),
+            stream_prefix: Vec::new(),
+            stream_cut: 0,
         }
     }
 
@@ -420,10 +488,81 @@ impl ViewState {
             })
     }
 
-    /// Whether the pre-conversation welcome card is showing right now (the
-    /// logo splash, `cwd`, key hints) rather than the transcript: nothing in
-    /// the transcript, nothing streaming, no turn in flight, no pending ask.
-    fn welcome_card_visible(&self) -> bool {
+    /// Total renderable logical lines, mirroring `draw_transcript`'s notion of
+    /// the trailing lines (cached stream parse, or the one spinner row).
+    pub(crate) fn renderable_line_count(&self) -> usize {
+        let streaming =
+            if !self.current_text.is_empty() || !self.current_reasoning.is_empty() {
+                self.current_parsed.len()
+            } else if self.busy {
+                1
+            } else {
+                0
+            };
+        self.transcript.len() + streaming
+    }
+
+    /// How many physical (wrapped/fitted) rows logical line `index` occupies
+    /// at `width`. Mirrors `draw_transcript`'s responsive refitting so paging
+    /// counts the rows the viewport actually shows.
+    pub(crate) fn renderable_row_count(&self, index: usize, width: u16) -> usize {
+        if width == 0 {
+            return 1;
+        }
+        let tr_len = self.transcript.len();
+        let has_stream = !self.current_text.is_empty() || !self.current_reasoning.is_empty();
+        let lines: Vec<Line<'static>> = if index < tr_len {
+            let line = &self.transcript[index];
+            full_width_turn_divider(line, width)
+                .map(|expanded| vec![expanded])
+                .unwrap_or_else(|| responsive_content_lines(line.clone(), width))
+        } else if has_stream && index < self.renderable_line_count() {
+            responsive_content_lines(
+                self.current_parsed[index - tr_len].clone(),
+                width,
+            )
+        } else {
+            // The live spinner line: single compact row.
+            Vec::new()
+        };
+        if lines.is_empty() {
+            return 1;
+        }
+        lines
+            .into_iter()
+            .map(|line| {
+                Paragraph::new(line)
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+                    .max(1)
+            })
+            .sum()
+    }
+
+    /// The new logical scroll top after paging one screenful of *physical*
+    /// wrapped rows from `from`. Paging by logical lines overshoots whenever
+    /// wrapping makes a logical line occupy several rows, so the walk steps
+    /// one logical line at a time until it has covered `page_rows` rows.
+    pub(crate) fn page_top(&self, from: usize, up: bool, page_rows: usize) -> usize {
+        let total = self.renderable_line_count();
+        let width = self.area_width;
+        let mut top = from.min(total);
+        let mut rows = 0usize;
+        if up {
+            while rows < page_rows && top > 0 {
+                top -= 1;
+                rows += self.renderable_row_count(top, width);
+            }
+        } else {
+            while rows < page_rows && top + 1 < total {
+                top += 1;
+                rows += self.renderable_row_count(top, width);
+            }
+        }
+        top
+    }
+
+    pub(crate) fn welcome_card_visible(&self) -> bool {
         self.transcript.is_empty()
             && self.current_text.is_empty()
             && self.current_reasoning.is_empty()
@@ -534,6 +673,8 @@ impl ViewState {
         // draw rebuilds them from the new transcript layout.
         self.reasoning_hitboxes.clear();
         self.tool_hitboxes.clear();
+        // Content changed under the wrap cache: bump its generation.
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
 
         // Every following retained block, regardless of type, moves with this
         // splice. Keeping one shared index adjustment prevents a thought above
@@ -581,6 +722,8 @@ impl ViewState {
         });
         self.reasoning_hitboxes.clear();
         self.tool_hitboxes.clear();
+        // Content changed under the wrap cache: bump its generation.
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
         removed
     }
 
@@ -596,6 +739,8 @@ impl ViewState {
         self.shift_summary_indices_at_or_after(end, -(len as isize));
         self.reasoning_hitboxes.clear();
         self.tool_hitboxes.clear();
+        // Content changed under the wrap cache: bump its generation.
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
         len
     }
 
@@ -618,6 +763,8 @@ impl ViewState {
         });
         self.reasoning_hitboxes.clear();
         self.tool_hitboxes.clear();
+        // Content changed under the wrap cache: bump its generation.
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
     }
 
     /// Toggle the completed tool summary under an exact mouse coordinate.
@@ -656,6 +803,8 @@ impl ViewState {
         self.tool_blocks[block_index].expanded = expanded;
         self.reasoning_hitboxes.clear();
         self.tool_hitboxes.clear();
+        // Content changed under the wrap cache: bump its generation.
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
         if expanded {
             self.shift_summary_indices_at_or_after(summary_index + 1, body_len as isize);
         } else {
@@ -699,6 +848,7 @@ impl ViewState {
         self.reasoning_hitboxes.clear();
         self.tool_blocks.clear();
         self.tool_hitboxes.clear();
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
     }
 
     /// Move accumulated assistant text and reasoning into the transcript: the
@@ -735,14 +885,14 @@ impl ViewState {
             self.transcript.extend(parse_assistant_output(&text));
         }
         // The in-progress cache is now empty too.
-        self.current_parsed.clear();
-        self.current_dirty = false;
+        self.clear_stream_parse();
     }
 
     /// Rebuild one completed assistant turn from persisted history. Reasoning
     /// stays collapsed and clickable; old JSONL records do not carry its wall
     /// time, so their summary is intentionally untimed.
     pub(crate) fn restore_assistant_turn(&mut self, reasoning: Option<&str>, text: &str) {
+        let before = self.transcript.len();
         if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
             let summary_index = self.transcript.len();
             self.transcript.push(reasoning_summary_line(None, false));
@@ -759,32 +909,71 @@ impl ViewState {
         if !text.is_empty() {
             self.transcript.extend(parse_assistant_output(text));
         }
-    }
-}
-
-/// Build the trailing live lines for an in-progress assistant turn. Reasoning
-/// content is never rendered while it streams: one compact activity row takes
-/// its place, followed by any answer text. The full body remains buffered and
-/// becomes available only through the completed timed row after flush.
-fn parse_live(
-    reasoning: &str,
-    text: &str,
-    reasoning_elapsed: Option<Duration>,
-) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    if !reasoning.is_empty() {
-        out.push(match reasoning_elapsed {
-            Some(elapsed) => reasoning_summary_line(Some(elapsed), false),
-            None => live_reasoning_line(),
-        });
-        if !text.is_empty() {
-            out.push(Line::default());
+        if self.transcript.len() != before {
+            // Length participates in the wrap-cache key; keep the counts honest
+            // for the rare same-length rewrite inside flush paths.
+            self.transcript_generation = self.transcript_generation.wrapping_add(1);
         }
     }
-    if !text.is_empty() {
-        out.extend(parse_assistant_output(text));
+
+    /// Drop the incremental streaming parse (and mark it dirty for the next
+    /// draw). Any reset of the streaming buffers — turn flush, `/clear`,
+    /// turn end — invalidates the settled prefix.
+    pub(crate) fn clear_stream_parse(&mut self) {
+        self.stream_prefix.clear();
+        self.stream_cut = 0;
+        self.current_parsed.clear();
+        self.current_dirty = false;
+        self.stream_generation = self.stream_generation.wrapping_add(1);
     }
-    out
+
+    /// Parse the in-progress answer into [`Self::current_parsed`], reusing the
+    /// settled prefix across deltas.
+    ///
+    /// [`settled_prefix`] finds the furthest byte offset (at or after the
+    /// previously adopted cut) where every markdown construct before it is
+    /// complete — a blank line outside a code fence, or a just-closed fence.
+    /// Everything before it is parsed once and kept; only the trailing open
+    /// block is re-parsed per delta. Without that, each `Text` event re-parses
+    /// the whole growing buffer — O(n²) over a long streaming reply.
+    fn refresh_current_parse(&mut self) {
+        // The reasoning header rows always lead the live tail list — the same
+        // composition `draw_transcript` has always rendered: a content-free
+        // placeholder (or the frozen timed summary once answer text begins),
+        // then a blank, then the answer's parsed lines.
+        let mut head = Vec::new();
+        if !self.current_reasoning.is_empty() {
+            head.push(match self.reasoning_elapsed {
+                Some(elapsed) => reasoning_summary_line(Some(elapsed), false),
+                None => live_reasoning_line(),
+            });
+            if !self.current_text.is_empty() {
+                head.push(Line::default());
+            }
+        }
+        let text = self.current_text.clone();
+        if !text.is_empty() {
+            if let Some(cut) = settled_prefix(&text, self.stream_cut) {
+                if cut > self.stream_cut {
+                    self.stream_prefix = parse_assistant_output(&text[..cut]);
+                    self.stream_cut = cut;
+                }
+            }
+            let tail_cut = self.stream_cut.min(text.len());
+            let tail = if self.stream_prefix.is_empty() {
+                parse_assistant_output(&text[tail_cut..])
+            } else {
+                // Settled prefix exists, so the tail's rows can never be the
+                // answer's first visible line — they all take the plain
+                // continuation gutter.
+                parse_tail_output(&text[tail_cut..])
+            };
+            head.extend(self.stream_prefix.iter().cloned());
+            head.extend(tail);
+        }
+        self.current_parsed = head;
+        self.stream_generation = self.stream_generation.wrapping_add(1);
+    }
 }
 
 /// Parse assistant markdown into a consistent two-cell response gutter. The
@@ -793,6 +982,50 @@ fn parse_live(
 /// all align with the content after the mark. Leading/structural blank rows stay
 /// blank rather than acquiring invisible padding.
 fn parse_assistant_output(text: &str) -> Vec<Line<'static>> {
+    parse_marked_output(text, true)
+}
+
+/// The tail variant of [`parse_assistant_output`], used by the incremental
+/// streaming parse: its rows follow a settled prefix, so none of them is the
+/// answer's first visible row and all get the plain continuation gutter.
+fn parse_tail_output(text: &str) -> Vec<Line<'static>> {
+    parse_marked_output(text, false)
+}
+
+/// The furthest byte offset into `text`, at or after `min`, where everything
+/// before it is a complete block: a blank line outside a code fence, or the
+/// newline after a just-closed fence. Parsing `text[..cut]` once and keeping
+/// it is safe across later appends — no open construct spans the boundary.
+fn settled_prefix(text: &str, min: usize) -> Option<usize> {
+    let mut cut: Option<usize> = None;
+    let mut in_fence = false;
+    let mut fence_char = '`';
+    let mut offset = 0usize;
+    for line in text.split('\n') {
+        let end = offset + line.len();
+        let trimmed = line.trim_start();
+        if in_fence {
+            if trimmed.len() >= 3 && trimmed.chars().all(|c| c == fence_char) {
+                in_fence = false;
+                if offset >= min {
+                    cut = Some((end + 1).min(text.len()));
+                }
+            }
+        } else if trimmed.strip_prefix("```").is_some() {
+            in_fence = true;
+            fence_char = '`';
+        } else if trimmed.strip_prefix("~~~").is_some() {
+            in_fence = true;
+            fence_char = '~';
+        } else if trimmed.is_empty() && offset >= min {
+            cut = Some((end + 1).min(text.len()));
+        }
+        offset = end + 1;
+    }
+    cut.filter(|c| *c > 0)
+}
+
+fn parse_marked_output(text: &str, first_logo: bool) -> Vec<Line<'static>> {
     let mut lines = crate::markdown::parse_blocks(text);
     if lines.is_empty() {
         return lines;
@@ -809,9 +1042,9 @@ fn parse_assistant_output(text: &str) -> Vec<Line<'static>> {
         if line.width() == 0 {
             continue;
         }
-        let gutter = if index == first_visible {
+        let gutter = if index == first_visible && first_logo {
             Span::styled(
-                format!("{} ", theme::DEFAULT_LOGO),
+                format!("{} ", theme::logo_glyph()),
                 theme::palette().accent(),
             )
         } else {
@@ -951,6 +1184,12 @@ fn apply_selection(frame: &mut Frame, state: &mut ViewState) {
         return;
     }
     let area = frame.area();
+    // A zero-width area has no addressable cells; `buf[(col, row)]` would panic
+    // on the first inclusive-range step, so there is nothing to harvest.
+    if area.width == 0 || area.height == 0 {
+        state.selection_text = None;
+        return;
+    }
     let (start, end) = selection.ordered();
     let buf = frame.buffer_mut();
     let mut text = String::new();
@@ -995,6 +1234,13 @@ fn apply_transcript_selection(
     }
     let (start, end) = selection.ordered();
     let width = frame.area().width;
+    // Zero-width areas have no addressable cells; skip both the highlight
+    // (`buf[(col, row)]` would panic on the inclusive column range) and the
+    // harvest.
+    if width == 0 {
+        state.selection_text = None;
+        return;
+    }
     let visible = state.visible_transcript_rows.clone();
     let buf = frame.buffer_mut();
 
@@ -1069,6 +1315,7 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     let h = area.height as usize;
     let w = area.width;
     state.area_height = h;
+    state.area_width = w;
     state.reasoning_hitboxes.clear();
     state.tool_hitboxes.clear();
     state.visible_transcript_rows.clear();
@@ -1085,24 +1332,20 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     }
 
     // Refresh the cached parse of the in-progress turn at most once per token
-    // delta, then reuse it across frames. `current_dirty` is set by each
-    // `Text`/`Reasoning` event; without this guard, parsing ran on the whole
-    // growing buffer every frame (and again in `scroll_indicator`) — O(n) per
-    // frame, the source of jank on long streaming replies. The second arm
-    // (`stream non-empty but cache empty`) catches paths that set the buffers
-    // without marking them dirty (notably render tests) — a non-empty buffer
-    // always parses to ≥1 line, so an empty cache while a buffer exists is
-    // stale. The cache holds the reasoned-then-answered tail ([`parse_live`]).
+    // delta, then reuse it across frames (and memoize the fitted wrap below on
+    // top of that). `current_dirty` is set by each `Text`/`Reasoning` event;
+    // without this guard, parsing ran on the whole growing buffer every frame
+    // (and again in `scroll_indicator`) — O(n) per frame, the source of jank
+    // on long streaming replies. The second arm (`stream non-empty but cache
+    // empty`) catches paths that set the buffers without marking them dirty
+    // (notably render tests) — a non-empty buffer always parses to ≥1 line, so
+    // an empty cache while a buffer exists is stale.
     let has_stream = !state.current_text.is_empty() || !state.current_reasoning.is_empty();
     if state.current_dirty || (has_stream && state.current_parsed.is_empty()) {
-        if !has_stream {
-            state.current_parsed.clear();
+        if has_stream {
+            state.refresh_current_parse();
         } else {
-            state.current_parsed = parse_live(
-                &state.current_reasoning,
-                &state.current_text,
-                state.reasoning_elapsed,
-            );
+            state.clear_stream_parse();
         }
         state.current_dirty = false;
     }
@@ -1148,130 +1391,171 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
         state.scroll_top.min(total.saturating_sub(h))
     };
     let end = (start + h).min(total);
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start);
-    for i in start..end {
-        if i < tr_len {
-            let line = &state.transcript[i];
-            lines.push(full_width_turn_divider(line, w).unwrap_or_else(|| line.clone()));
-        } else if has_stream {
-            let stream_index = i - tr_len;
-            if stream_index == 0
-                && !state.current_reasoning.is_empty()
-                && state.reasoning_elapsed.is_none()
-            {
-                // Replace only the cached content-free placeholder. This tiny
-                // line can animate every frame without re-parsing a growing
-                // markdown answer on every frame.
-                lines.push(animated_live_reasoning_line(
+
+    // Memoize the responsive refit: while busy the loop tick is ~8 ms, and
+    // re-cloning + re-wrapping every visible logical line (plus a
+    // `Paragraph::line_count` per physical row) on every tick is the per-frame
+    // rewrap storm. The cache key covers everything the fitted rows depend on,
+    // so an unchanged key proves the cached rows are still exact.
+    let key = WrapKey {
+        width: w,
+        height: h,
+        start,
+        transcript_len: tr_len,
+        transcript_generation: state.transcript_generation,
+        stream_len,
+        stream_generation: state.stream_generation,
+        has_stream,
+    };
+    // The one stream row that may be the live animated placeholder. It is
+    // excluded from the memoization: on a cache hit it is refreshed in place
+    // below so the motion never freezes at the cached instant.
+    let animated_reasoning =
+        has_stream && !state.current_reasoning.is_empty() && state.reasoning_elapsed.is_none();
+    if state.wrap_cache.key == Some(key) {
+        // Cache hit: only refresh the animated rows.
+        for (offset, (source, row)) in state.wrap_cache.physical_sources.iter().enumerate() {
+            if animated_reasoning && *source == tr_len && *row == 0 {
+                state.wrap_cache.lines[offset] = animated_live_reasoning_line(
                     now,
                     state.reasoning_started.or(state.turn_started),
-                ));
+                );
+            } else if !has_stream && state.busy && *row == 0 && *source >= tr_len {
+                if let Some(line) = live_lines.get(*source - tr_len) {
+                    state.wrap_cache.lines[offset] = line.clone();
+                }
+            }
+        }
+    } else {
+        // Cache miss: rebuild the fitted rows for this window.
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(end - start);
+        for i in start..end {
+            if i < tr_len {
+                let line = &state.transcript[i];
+                lines.push(full_width_turn_divider(line, w).unwrap_or_else(|| line.clone()));
+            } else if has_stream {
+                let stream_index = i - tr_len;
+                if stream_index == 0 && animated_reasoning {
+                    // Replace only the cached content-free placeholder. This tiny
+                    // line can animate every frame without re-parsing a growing
+                    // markdown answer on every frame.
+                    lines.push(animated_live_reasoning_line(
+                        now,
+                        state.reasoning_started.or(state.turn_started),
+                    ));
+                } else {
+                    lines.push(state.current_parsed[stream_index].clone());
+                }
             } else {
-                lines.push(state.current_parsed[stream_index].clone());
+                // The live loader block (thinking/tool). It's the only streaming
+                // content, so its rows follow the transcript directly.
+                lines.push(live_lines[i - tr_len].clone());
             }
-        } else {
-            // The live loader block (thinking/tool). It's the only streaming
-            // content, so its rows follow the transcript directly.
-            lines.push(live_lines[i - tr_len].clone());
         }
-    }
-    // Box-drawn Markdown tables have a useful natural width, but allowing a
-    // wider table to pass through Paragraph's ordinary word wrapper tears the
-    // border apart: each logical row wraps independently, so separators no
-    // longer line up. Keep the full box whenever it fits. On narrower screens,
-    // constrain its columns and wrap text inside each cell while rebuilding the
-    // box at the exact viewport width.
-    // Preserve the originating transcript index when one logical table/prose
-    // row becomes several pre-wrapped physical rows. Hit-testing below needs
-    // that mapping; `start + offset` is no longer valid after responsive
-    // expansion.
-    let mut line_sources: Vec<usize> = (start..end).collect();
-    if w > 0 {
-        let mut fitted = Vec::new();
-        let mut fitted_sources = Vec::new();
-        for (source, line) in line_sources.into_iter().zip(lines) {
-            let rows = responsive_content_lines(line, w);
-            fitted_sources.extend(std::iter::repeat_n(source, rows.len()));
-            fitted.extend(rows);
-        }
-        lines = fitted;
-        line_sources = fitted_sources;
-    }
-    // Capture wrapped-row geometry before `lines` moves into the Paragraph.
-    // Each tuple is (retained block, physical row, wrapped height, label width).
-    let mut reasoning_rows: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut tool_rows: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut physical_sources = Vec::new();
-    let mut source_row_counts: HashMap<usize, usize> = HashMap::new();
-    if w > 0 {
-        let mut physical_row = 0usize;
-        for (offset, line) in lines.iter().enumerate() {
-            let row_count = Paragraph::new(line.clone())
-                .wrap(Wrap { trim: false })
-                .line_count(w)
-                .max(1);
-            let global_index = line_sources[offset];
-            let source_row = source_row_counts.entry(global_index).or_default();
-            physical_sources.extend(
-                (*source_row..source_row.saturating_add(row_count)).map(|row| (global_index, row)),
-            );
-            *source_row = source_row.saturating_add(row_count);
-            if global_index < tr_len {
-                if let Some(block_index) = state
-                    .reasoning_blocks
-                    .iter()
-                    .position(|block| block.summary_index == global_index)
-                {
-                    reasoning_rows.push((block_index, physical_row, row_count, line.width()));
-                }
-                if let Some(block_index) = state
-                    .tool_blocks
-                    .iter()
-                    .position(|block| block.summary_index == global_index)
-                {
-                    tool_rows.push((block_index, physical_row, row_count, line.width()));
-                }
+        // Box-drawn Markdown tables have a useful natural width, but allowing a
+        // wider table to pass through Paragraph's ordinary word wrapper tears the
+        // border apart: each logical row wraps independently, so separators no
+        // longer line up. Keep the full box whenever it fits. On narrower screens,
+        // constrain its columns and wrap text inside each cell while rebuilding
+        // the box at the exact viewport width.
+        // Preserve the originating transcript index when one logical table/prose
+        // row becomes several pre-wrapped physical rows. Hit-testing below needs
+        // that mapping; `start + offset` is no longer valid after responsive
+        // expansion.
+        let mut line_sources: Vec<usize> = (start..end).collect();
+        let mut physical_sources = Vec::new();
+        let mut reasoning_rows: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut tool_rows: Vec<(usize, usize, usize, usize)> = Vec::new();
+        if w > 0 {
+            let mut fitted = Vec::new();
+            let mut fitted_sources = Vec::new();
+            for (source, line) in line_sources.into_iter().zip(lines) {
+                let rows = responsive_content_lines(line, w);
+                fitted_sources.extend(std::iter::repeat_n(source, rows.len()));
+                fitted.extend(rows);
             }
-            physical_row = physical_row.saturating_add(row_count);
+            lines = fitted;
+            line_sources = fitted_sources;
         }
+        // Capture wrapped-row geometry before `lines` moves into the Paragraph.
+        // Each tuple is (retained block, physical row, wrapped height, label width).
+        if w > 0 {
+            let mut physical_row = 0usize;
+            let mut source_row_counts: HashMap<usize, usize> = HashMap::new();
+            for (offset, line) in lines.iter().enumerate() {
+                let row_count = Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(w)
+                    .max(1);
+                let global_index = line_sources[offset];
+                let source_row = source_row_counts.entry(global_index).or_default();
+                physical_sources.extend(
+                    (*source_row..source_row.saturating_add(row_count))
+                        .map(|row| (global_index, row)),
+                );
+                *source_row = source_row.saturating_add(row_count);
+                if global_index < tr_len {
+                    if let Some(block_index) = state
+                        .reasoning_blocks
+                        .iter()
+                        .position(|block| block.summary_index == global_index)
+                    {
+                        reasoning_rows.push((block_index, physical_row, row_count, line.width()));
+                    }
+                    if let Some(block_index) = state
+                        .tool_blocks
+                        .iter()
+                        .position(|block| block.summary_index == global_index)
+                    {
+                        tool_rows.push((block_index, physical_row, row_count, line.width()));
+                    }
+                }
+                physical_row = physical_row.saturating_add(row_count);
+            }
+        }
+        state.wrap_cache = WrapCache {
+            key: Some(key),
+            lines,
+            physical_sources,
+            reasoning_rows,
+            tool_rows,
+            #[cfg(test)]
+            computes: state.wrap_cache.computes.saturating_add(1),
+        };
     }
-    // Blank the area first. `Paragraph` only writes the cells its (wrapped)
-    // text covers, and ratatui double-buffers — it diffs against the previous
-    // frame rather than clearing — so a cell the new frame doesn't touch keeps
-    // last frame's glyph. When a long dim tool-preview line wraps to N rows and
-    // a one-line scroll changes the layout, the tail of the previous word
-    // isn't overwritten and stays put: "portions of some words scrolling, the
-    // rest stuck." Clearing gives each frame a clean slate.
-    frame.render_widget(Clear, area);
+
+    // The area is intentionally NOT blanked with `Clear` first: ratatui's
+    // `Terminal::draw` resets the current buffer every frame and flushes a
+    // diff against the previous one, so untouched cells are already blank —
+    // a blanket `Clear` only rewrites the whole area per frame and defeats
+    // the cell diffing. (The old "stuck word tails" concern predates the
+    // per-frame buffer reset.)
+    let lines: Vec<Line<'static>> = state.wrap_cache.lines.clone();
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     // Wrapping can make the slice taller than the area: a long line spans
     // several visual rows, so `h` logical lines can occupy more than `h` visual
     // rows. `Paragraph` renders top-down and clips the bottom, so without help
     // the *newest* line — the last in the slice, right above the composer — is
-    // the one that gets cut off. When following, scroll the excess rows off the
-    // top so the content's bottom pins to the area's bottom. `line_count` runs
-    // ratatui's own `WordWrapper`, so the count matches the render exactly.
-    // When held (scrolled up), leave the slice top-aligned — the user put
-    // `scroll_top` at the top on purpose.
-    let wrapped_rows = paragraph.line_count(w);
-    let scroll_y = if state.follow {
-        wrapped_rows.saturating_sub(h).min(u16::MAX as usize) as u16
-    } else {
-        0
-    };
+    // the one that gets cut off. Scroll the excess rows off the top so the
+    // content's bottom pins to the area's bottom, in *both* modes: when held
+    // the same overflow otherwise clipped the bottom rows the user paged to
+    // see. The row total comes from the cached per-line counts — identical to
+    // what `line_count` computes, without re-running it per tick.
+    let wrapped_rows = state.wrap_cache.physical_sources.len();
+    let scroll_y = wrapped_rows.saturating_sub(h).min(u16::MAX as usize) as u16;
     state.visible_transcript_rows.extend(
-        physical_sources
+        state
+            .wrap_cache
+            .physical_sources
             .iter()
             .skip(scroll_y as usize)
             .take(h)
             .enumerate()
-            .map(
-                |(offset, (source_index, source_row))| VisibleTranscriptRow {
-                    screen_row: area.y.saturating_add(offset as u16),
-                    source_index: *source_index,
-                    source_row: *source_row,
-                },
-            ),
+            .map(|(offset, (source_index, source_row))| VisibleTranscriptRow {
+                screen_row: area.y.saturating_add(offset as u16),
+                source_index: *source_index,
+                source_row: *source_row,
+            }),
     );
     // Reconstruct each logical line's physical wrapped rows using the same
     // `Paragraph` + `Wrap` configuration as the real render. This makes the
@@ -1280,7 +1564,9 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
     if w > 0 && h > 0 {
         let viewport_start = scroll_y as usize;
         let viewport_end = viewport_start.saturating_add(h);
-        for (block_index, physical_row, row_count, label_width) in reasoning_rows {
+        for (block_index, physical_row, row_count, label_width) in
+            state.wrap_cache.reasoning_rows.clone()
+        {
             let line_end = physical_row.saturating_add(row_count);
             let clipped_start = physical_row.max(viewport_start);
             let clipped_end = line_end.min(viewport_end);
@@ -1296,7 +1582,9 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
                 });
             }
         }
-        for (block_index, physical_row, row_count, label_width) in tool_rows {
+        for (block_index, physical_row, row_count, label_width) in
+            state.wrap_cache.tool_rows.clone()
+        {
             let line_end = physical_row.saturating_add(row_count);
             let clipped_start = physical_row.max(viewport_start);
             let clipped_end = line_end.min(viewport_end);
@@ -1373,7 +1661,7 @@ fn responsive_content_lines(line: Line<'static>, width: u16) -> Vec<Line<'static
 fn assistant_gutter_len(line: &Line<'static>) -> usize {
     line.spans.first().is_some_and(|span| {
         let content = span.content.as_ref();
-        content == "  " || (content.ends_with(' ') && content.trim_end() == theme::DEFAULT_LOGO)
+        content == "  " || (content.ends_with(' ') && content.trim_end() == theme::logo_glyph())
     }) as usize
 }
 
@@ -2027,15 +2315,24 @@ fn right_hint(state: &ViewState) -> Vec<Span<'static>> {
     }
 }
 
+/// Display width of `s` in terminal cells — CJK and other wide characters
+/// count as two, unlike `chars().count()`. Routed through `Span::width`
+/// (ratatui's unicode-width) so no new dependency is needed.
+fn text_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
 /// Build a one-line `Line` with `left` content packed to the left and `right`
 /// content pinned to the right edge of `width`, filled with spaces between.
 /// If the two sides together are wider than `width`, the filler collapses to a
 /// single space and the right side wraps off the 1-row area — a graceful
 /// degradation on narrow terminals rather than a broken layout.
 fn right_align(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> Line<'static> {
+    // Cell widths, not char counts: wide glyphs (CJK) must not push the
+    // right content off the edge — or shrink the gap twice as far.
     let w = width as usize;
-    let left_chars: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let right_chars: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let left_chars: usize = left.iter().map(|s| s.width()).sum();
+    let right_chars: usize = right.iter().map(|s| s.width()).sum();
     let gap = w
         .saturating_sub(left_chars)
         .saturating_sub(right_chars)
@@ -2249,8 +2546,9 @@ fn composer_rows(composer: &str, width: u16) -> usize {
 
 /// The one-cell `logo.svg` reduction used when loading animation is disabled.
 /// The same tiny mark prefixes assistant output; user prompts stay neutral.
+/// Honors a custom glyph from `~/.sc/logo.txt` when one is configured.
 fn logo_glyph() -> &'static str {
-    theme::DEFAULT_LOGO
+    theme::logo_glyph()
 }
 
 /// One-cell phases of the six-petal mark. Cycling these clockwise-ordered
@@ -2543,7 +2841,7 @@ fn draw_menu_overlay(frame: &mut Frame, menu: &MenuState, area: Rect, now: Insta
 /// The page's heading line.
 fn menu_heading(menu: &MenuState) -> String {
     match &menu.page {
-        MenuPage::Root => format!("{} Subconscious Code", theme::DEFAULT_LOGO),
+        MenuPage::Root => format!("{} Subconscious Code", logo_glyph()),
         MenuPage::Projects => format!("projects ({})", menu.projects.len()),
         MenuPage::Sessions(dir) => match menu.project(dir) {
             Some(proj) => format!(
@@ -2584,24 +2882,12 @@ fn menu_row_line(menu: &MenuState, row: &Row, selected: bool, now: Instant) -> L
         Row::Goto(MenuPage::Settings) => "Settings".to_string(),
         Row::Goto(_) => "…".to_string(),
         Row::ChangeApiKey => {
-            // Never show the key itself — only where the active one came from,
-            // so the user can tell whether a save will take effect. Env wins, so
-            // a set env var is reported even when a key file also exists.
-            let env_set = std::env::var(&menu.settings.api_key_env)
-                .ok()
-                .filter(|s| !s.is_empty())
-                .is_some();
-            let source = if env_set {
-                format!("(set via ${})", menu.settings.api_key_env)
-            } else if rc_config::key_file_path()
-                .map(|p| p.exists())
-                .unwrap_or(false)
-            {
-                "(saved, ~/.sc/key)".to_string()
-            } else {
-                "(unset)".to_string()
-            };
-            format!("{:<20} {}", "Change API key", source)
+            // Never show the key itself — only where the active one came
+            // from, so the user can tell whether a save will take effect. The
+            // provenance string is resolved once per open/refresh/save
+            // (MenuState::resolve_api_key_source); resolving here again would
+            // repeat the env lookup + key-file stat per row per frame.
+            format!("{:<20} {}", "Change API key", menu.api_key_source)
         }
         Row::Close => "Close".to_string(),
         Row::Project(dir) => match menu.project(dir) {
@@ -2673,11 +2959,25 @@ fn plural(n: usize, word: &str) -> String {
 }
 
 /// Shorten to `max` display cells with an ellipsis, on a char boundary.
+/// Wide glyphs occupy two cells, so the cut is measured in cells (via
+/// [`text_width`]), not chars — a row of CJK content ellipsizes at roughly
+/// half the characters, instead of overflowing the column.
 fn ellipsize(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if text_width(s) <= max {
         return s.to_string();
     }
-    let keep: String = s.chars().take(max.saturating_sub(1)).collect();
+    // Reserve one cell for the ellipsis, then take whole glyphs while they fit.
+    let budget = max.saturating_sub(1);
+    let mut keep = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cell = Span::raw(ch.to_string()).width().max(1);
+        if used + cell > budget {
+            break;
+        }
+        keep.push(ch);
+        used += cell;
+    }
     format!("{keep}…")
 }
 
@@ -2738,7 +3038,7 @@ mod tests {
             modified: now - Duration::from_secs(age),
             first_prompt: Some(prompt.into()),
         };
-        MenuState {
+        let mut menu = MenuState {
             page,
             selected: 0,
             projects: group_projects(vec![
@@ -2756,7 +3056,10 @@ mod tests {
             editing_api_key: false,
             status: None,
             pending_outcome: None,
-        }
+            api_key_source: String::new(),
+        };
+        menu.resolve_api_key_source();
+        menu
     }
 
     fn menu_screen(page: crate::menu::MenuPage) -> String {

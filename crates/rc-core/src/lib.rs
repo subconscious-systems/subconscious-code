@@ -28,7 +28,7 @@ pub mod windows_process;
 
 pub use agent::{AgentLoop, LoopError, LoopOutcome};
 pub use context::{ContextAssembler, LegacyAssembler};
-pub use cost::{Cost, Pricing};
+pub use cost::{Cost, Pricing, RawCost};
 pub use model::{
     ChatModel, EventSink, FinalizedToolCall, Model, ModelError, ModelRequest, ModelResponse,
     NullSink,
@@ -43,7 +43,7 @@ pub use rc_perm::{
 };
 pub use rc_proto::FinishReason;
 pub use rc_proto::Usage;
-pub use registry::ToolRegistry;
+pub use registry::{DuplicateToolNameError, ToolRegistry};
 pub use state::ReadRegistry;
 pub use state::{
     BgShell, ChangeJournal, ChangeRecord, SharedChangeJournal, SharedShellState, ShellState,

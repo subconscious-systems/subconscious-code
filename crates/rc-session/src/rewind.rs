@@ -22,17 +22,58 @@ pub struct RewindReport {
     /// Files restored (to prior contents) or removed (agent-created), in
     /// application order.
     pub restored: Vec<PathBuf>,
+    /// Files whose restore failed (unwritable path, unreadable snapshot, …).
+    /// The journal record is consumed regardless — the atomic restore leaves
+    /// these files at their current contents rather than truncating them, so
+    /// a later manual retry still has the data to work from.
+    pub failed: Vec<PathBuf>,
     /// The number of turns of changes that were rolled back.
     pub turns: usize,
 }
 
+/// Overwrite `path` with `bytes` atomically: write a sibling temp file in the
+/// same directory, sync it, then `rename` over the target. A crash mid-write
+/// can no longer lose both the old and the new contents: `path` either keeps
+/// its previous bytes or holds the complete restored bytes.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let tmp = dir.join(format!(
+        ".{name}.sc-rewind-{}",
+        std::process::id()
+    ));
+    let attempt = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        let _ = file.sync_all();
+        std::fs::rename(&tmp, path)
+    })();
+    if attempt.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    attempt
+}
+
 /// Restore a list of change records (already popped from the journal, most
 /// recent first). For each: write back the prior contents, or delete the file
-/// if `prior` is `None` (the agent created it). Errors per-file are collected
-/// rather than aborting the whole rewind — a partial rewind is better than
-/// none, and a missing file (already deleted out of band) is not an error.
-pub(crate) fn restore_files(records: &[rc_core::state::ChangeRecord]) -> Vec<PathBuf> {
+/// if `prior` is `None` (the agent created it). Returns the paths that were
+/// restored and the ones that failed — a partial rewind is better than none,
+/// and a missing file (already deleted out of band) is not an error. Failed
+/// restores leave the file untouched (the write is atomic), so its current
+/// contents survive intact.
+pub(crate) fn restore_files(
+    records: &[rc_core::state::ChangeRecord],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut restored = Vec::new();
+    let mut failed = Vec::new();
     for r in records {
         match &r.prior {
             Some(snapshot) => {
@@ -41,10 +82,12 @@ pub(crate) fn restore_files(records: &[rc_core::state::ChangeRecord]) -> Vec<Pat
                 }
                 if snapshot
                     .read()
-                    .and_then(|bytes| std::fs::write(&r.path, bytes))
+                    .and_then(|bytes| atomic_write(&r.path, &bytes))
                     .is_ok()
                 {
                     restored.push(r.path.clone());
+                } else {
+                    failed.push(r.path.clone());
                 }
             }
             None => {
@@ -52,20 +95,31 @@ pub(crate) fn restore_files(records: &[rc_core::state::ChangeRecord]) -> Vec<Pat
                 // state. A missing file is a no-op (already gone).
                 if std::fs::remove_file(&r.path).is_ok() || !r.path.exists() {
                     restored.push(r.path.clone());
+                } else {
+                    failed.push(r.path.clone());
                 }
             }
         }
     }
-    restored
+    (restored, failed)
 }
 
 /// Roll back the last `n` turns of agent file changes for `session`, restoring
 /// files from the change journal. Returns what was restored. Does not mutate
 /// the conversation transcript.
 pub fn rewind_session(session: &mut Session, n: usize) -> Result<RewindReport> {
+    rewind_shared(&session.change_journal, n)
+}
+
+/// [`rewind_session`] on a shared journal handle: an async caller (the rc-rt
+/// driver) can clone the handle and run the blocking file restores on a
+/// `spawn_blocking` worker instead of its own task.
+pub fn rewind_shared(
+    journal: &rc_core::state::SharedChangeJournal,
+    n: usize,
+) -> Result<RewindReport> {
     let records: Vec<rc_core::state::ChangeRecord> = {
-        let mut journal = session
-            .change_journal
+        let mut journal = journal
             .lock()
             .map_err(|_| anyhow::anyhow!("change journal poisoned"))?;
         journal.rewind(n)
@@ -73,11 +127,16 @@ pub fn rewind_session(session: &mut Session, n: usize) -> Result<RewindReport> {
     if records.is_empty() {
         return Ok(RewindReport {
             restored: Vec::new(),
+            failed: Vec::new(),
             turns: n,
         });
     }
-    let restored = restore_files(&records);
-    Ok(RewindReport { restored, turns: n })
+    let (restored, failed) = restore_files(&records);
+    Ok(RewindReport {
+        restored,
+        failed,
+        turns: n,
+    })
 }
 
 #[cfg(test)]
@@ -206,9 +265,47 @@ mod tests {
             },
         ];
         fs::write(&path, "edited").unwrap();
-        let restored = restore_files(&records);
+        let (restored, failed) = restore_files(&records);
         assert_eq!(restored, vec![path.clone(), path.clone()]);
+        assert!(failed.is_empty());
         assert!(!path.exists());
         let _ = ChangeJournal::new();
+    }
+
+    #[test]
+    fn a_failed_restore_leaves_previous_contents_intact_and_is_reported() {
+        // The restore target lives in a directory we make read-only after
+        // the file exists, so the pre-restore write of the temp file fails.
+        // The old in-place `fs::write` would have truncated the file before
+        // failing; the atomic restore must leave its contents untouched.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("guarded.txt");
+        fs::write(&path, "current contents").unwrap();
+        let records = vec![ChangeRecord {
+            path: path.clone(),
+            prior: Some(rc_core::state::FileSnapshot::inline(
+                b"older contents".to_vec(),
+            )),
+            turn: 1,
+        }];
+
+        let original = fs::metadata(dir.path()).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_readonly(true);
+        fs::set_permissions(dir.path(), locked).unwrap();
+        let (restored, failed) = restore_files(&records);
+        // Restore the directory's real permissions (never via `set_readonly(false)`,
+        // which would leave the directory world-writable on Unix).
+        fs::set_permissions(dir.path(), original).unwrap();
+
+        assert!(restored.is_empty(), "nothing was restored: {restored:?}");
+        assert_eq!(failed, vec![path.clone()], "the failure is reported");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "current contents",
+            "previous contents survive the failed restore intact"
+        );
+        // No temp-file litter from the aborted atomic write.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

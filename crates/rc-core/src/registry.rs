@@ -36,8 +36,40 @@ fn def_key(d: &ToolDefinition) -> BlockId {
     }
 }
 
+/// A duplicate tool name in a [`ToolRegistry`] build. Two tools answering the
+/// same name silently first-wins on `get` while both appear (differently
+/// described) to the model — the registry refuses to build instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateToolNameError {
+    pub name: String,
+}
+
+impl std::fmt::Display for DuplicateToolNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "duplicate tool name: {}", self.name)
+    }
+}
+
+impl std::error::Error for DuplicateToolNameError {}
+
 impl ToolRegistry {
-    pub fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
+    /// Checked build: detect duplicate tool names before the registry is used.
+    ///
+    /// Duplicate names previously resolved silently first-wins for `get` —
+    /// while the wire `tools` array exposed both definitions — which is
+    /// exactly the state a caller can't diagnose later. This returns an error
+    /// naming the collision instead.
+    pub fn try_new(
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<Self, DuplicateToolNameError> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for tool in &tools {
+            if !seen.insert(tool.name()) {
+                return Err(DuplicateToolNameError {
+                    name: tool.name().to_string(),
+                });
+            }
+        }
         let mut defs: Vec<ToolDefinition> = tools
             .iter()
             .map(|t| ToolDefinition {
@@ -66,7 +98,19 @@ impl ToolRegistry {
         }
         canonical_representative(&mut defs, def_key);
 
-        Self { tools, defs }
+        Ok(Self { tools, defs })
+    }
+
+    /// Build a registry, **panicking on duplicate tool names** (see
+    /// [`Self::try_new`]). Kept infallible for the fixed build-time tool sets
+    /// the composition roots register; callers assembling tools dynamically
+    /// (MCP servers, plugins) should use [`Self::try_new`] and surface the
+    /// error instead of aborting.
+    pub fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
+        match Self::try_new(tools) {
+            Ok(registry) => registry,
+            Err(error) => panic!("{error}: refusing to silently shadow a tool"),
+        }
     }
 
     /// The wire tool definitions, ready for the request's `tools` array, in
@@ -83,7 +127,10 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::{Tool, ToolCtx, ToolError, ToolOutcome};
+    use async_trait::async_trait;
     use rc_proto::wire::{FunctionDefinition, ToolDefinition, ToolType};
+    use serde_json::{json, Value};
 
     fn def(name: &str, desc: &str) -> ToolDefinition {
         ToolDefinition {
@@ -97,6 +144,59 @@ mod tests {
                 }),
             },
         }
+    }
+
+    /// The smallest possible `Tool` stub: name, empty schema, no-op call.
+    struct Stub(&'static str);
+
+    #[async_trait]
+    impl Tool for Stub {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::ok("stub".into()))
+        }
+    }
+
+    /// A duplicate name must fail the checked build instead of silently
+    /// first-wins on `get` (with both descriptions on the wire).
+    #[test]
+    fn try_new_reports_duplicate_tool_names() {
+        let error = match ToolRegistry::try_new(vec![
+            Arc::new(Stub("Echo")) as Arc<dyn Tool>,
+            Arc::new(Stub("Echo")),
+        ]) {
+            Ok(_) => panic!("two tools named Echo must not build"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name, "Echo");
+        assert!(error.to_string().contains("duplicate tool name"));
+    }
+
+    #[test]
+    fn try_new_accepts_a_distinct_tool_set() {
+        let registry =
+            ToolRegistry::try_new(vec![Arc::new(Stub("Echo")) as Arc<dyn Tool>]).unwrap();
+        assert!(registry.get("Echo").is_some());
+        assert_eq!(registry.definitions().len(), 1);
+    }
+
+    /// The infallible constructor enforces the same invariant at build time —
+    /// a hardcoded composition root with a duplicate is a programming error.
+    #[test]
+    #[should_panic(expected = "duplicate tool name: Echo")]
+    fn new_panics_on_duplicate_tool_names() {
+        let _ = ToolRegistry::new(vec![
+            Arc::new(Stub("Echo")) as Arc<dyn Tool>,
+            Arc::new(Stub("Echo")),
+        ]);
     }
 
     /// Two sessions registering the same tool set in different orders must

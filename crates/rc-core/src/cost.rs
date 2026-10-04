@@ -10,6 +10,11 @@
 //! it's the kind of thing someone "optimizes" back into floats later, and once
 //! they do, reproducibility of the accounting quietly breaks. The `as_usd()`
 //! accessor is for *display only*; every accumulation stays in integers.
+//!
+//! Division by one million is a *rendering* step, not part of the monoid: it
+//! happens **once** per displayed value. Summing already-divided per-turn
+//! [`Cost`]s accumulates truncation error turn by turn — exact accounting
+//! accumulates [`RawCost`] and divides once on the session total.
 
 use rc_algebra::traits::Monoid;
 use rc_proto::Usage;
@@ -59,6 +64,54 @@ impl Monoid for Cost {
     }
 }
 
+/// The exact cost accumulator: the undivided sum of
+/// token·(µUSD-per-million) products, held as `u128`.
+///
+/// This is the true homomorphic image of the usage monoid under a
+/// [`Pricing`]. [`Cost`] — micro-USD after a **single** division by one
+/// million — cannot represent it per turn: each per-turn division truncates
+/// a remainder strictly below 1 µUSD, and summing truncated turns drifts from
+/// the truncated sum of the raw totals whenever the prices don't divide the
+/// token counts evenly. Accumulate [`RawCost`] and call [`RawCost::to_cost`]
+/// **once**, on the session total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RawCost(u128);
+
+impl RawCost {
+    /// The identity element of the raw-cost monoid.
+    pub const ZERO: Self = Self(0);
+
+    /// Build from the undivided `token·µUSD-per-million` total.
+    pub const fn from_raw(raw: u128) -> Self {
+        Self(raw)
+    }
+
+    /// The undivided `token·µUSD-per-million` total.
+    pub const fn as_raw(&self) -> u128 {
+        self.0
+    }
+
+    /// Divide by one million **once** for the micro-USD display/session total.
+    pub fn to_cost(&self) -> Cost {
+        Cost::from_micro_usd((self.0 / PER_MILLION).min(u64::MAX as u128) as u64)
+    }
+
+    /// Accumulate `other` into `self` (saturating). The monoid `op` — exact,
+    /// no division, no truncation.
+    pub fn add(&mut self, other: &Self) {
+        self.0 = self.0.saturating_add(other.0);
+    }
+}
+
+impl Monoid for RawCost {
+    fn id() -> Self {
+        Self::ZERO
+    }
+    fn op(&mut self, other: &Self) {
+        self.add(other);
+    }
+}
+
 /// Token prices in integer micro-USD per *million* tokens. Integer per-million
 /// pricing keeps `cost_of` a pure integer computation (u128 intermediate, then
 /// truncated to micro-USD), so the running total is reproducible across shard
@@ -91,11 +144,22 @@ impl Pricing {
     /// `prompt_tokens` includes the cached subset; the cached fraction is
     /// billed at `cached` and the remainder at `prompt`, so cache hits reduce
     /// cost exactly as they reduce billed tokens. The computation is pure
-    /// integer arithmetic (u128 intermediate) and is a homomorphism: summing
-    /// `cost_of(u_i)` over a session equals `cost_of` of the summed usage, so
-    /// the running total is independent of how/when the per-turn costs are
-    /// combined.
+    /// integer arithmetic (u128 intermediate).
+    ///
+    /// **This per-turn value truncates**: the raw product is divided by one
+    /// million per call, so each turn can lose a sub-µUSD remainder. Summing
+    /// `cost_of` over turns therefore does *not* equal `cost_of` of the summed
+    /// usage (the old doc claim, which only held for round numbers). For a
+    /// session total, accumulate [`Pricing::cost_of_raw`] exactly and divide
+    /// once with [`RawCost::to_cost`] — *that* is the homomorphism.
     pub fn cost_of(&self, usage: &Usage) -> Cost {
+        self.cost_of_raw(usage).to_cost()
+    }
+
+    /// The exact, undivided cost of a single response's [`Usage`]: the sum of
+    /// token·(µUSD-per-million) products as a [`RawCost`], before any division.
+    /// Accumulate these and call [`RawCost::to_cost`] once on the total.
+    pub fn cost_of_raw(&self, usage: &Usage) -> RawCost {
         let cached = usage.cached_tokens().unwrap_or(0).min(usage.prompt_tokens);
         let prompt_billable = usage.prompt_tokens.saturating_sub(cached);
 
@@ -103,9 +167,7 @@ impl Pricing {
         total += prompt_billable as u128 * self.prompt as u128;
         total += cached as u128 * self.cached as u128;
         total += usage.completion_tokens as u128 * self.completion as u128;
-        // Prices are per-million tokens; convert token·micro-USD into micro-USD.
-        let micro_usd = (total / PER_MILLION).min(u64::MAX as u128) as u64;
-        Cost::from_micro_usd(micro_usd)
+        RawCost::from_raw(total)
     }
 }
 
@@ -153,8 +215,9 @@ mod tests {
 
     #[test]
     fn cost_is_a_monoid_homomorphism() {
-        // The invariant: summing cost_of over the parts equals cost_of of the
-        // summed usage (plus, not floats, so order-independent).
+        // The invariant, now stated exactly: summing cost_of_raw over the parts
+        // equals cost_of_raw of the summed usage (plus, not floats, so
+        // order-independent). Dividing once on the total gives the session cost.
         let p = Pricing {
             prompt: 3_000_000,
             cached: 300_000,
@@ -167,10 +230,49 @@ mod tests {
         summed_usage.add(&u2);
         let whole = p.cost_of(&summed_usage);
 
-        let mut parts = Cost::ZERO;
-        parts.add(&p.cost_of(&u1));
-        parts.add(&p.cost_of(&u2));
-        assert_eq!(parts.as_micro_usd(), whole.as_micro_usd());
+        let mut parts = RawCost::ZERO;
+        parts.add(&p.cost_of_raw(&u1));
+        parts.add(&p.cost_of_raw(&u2));
+        assert_eq!(parts.as_raw(), p.cost_of_raw(&summed_usage).as_raw());
+        assert_eq!(parts.to_cost(), whole);
+    }
+
+    /// The review's non-round-numbers case: with a price that doesn't divide
+    /// the token counts evenly, each per-turn division truncates a sub-µUSD
+    /// remainder and the sum of per-turn `Cost`s drifts below the exact
+    /// total. The raw u128 accumulator keeps the remainder and divides once.
+    #[test]
+    fn non_round_numbers_accumulate_exactly_then_divide_once() {
+        // $3.333333/M prompt, no cached/completion billing.
+        let p = Pricing {
+            prompt: 3_333_333,
+            cached: 0,
+            completion: 0,
+        };
+        let u = usage(500_000, 0, None);
+
+        // Per turn: 500_000 × 3_333_333 = 1_666_666_500_000 raw; dividing
+        // per turn truncates 500_000 raw below one µUSD each time.
+        let per_turn = p.cost_of(&u); // 1_666_666 µUSD
+        let mut truncated_sum = Cost::ZERO;
+        truncated_sum.add(&per_turn);
+        truncated_sum.add(&per_turn);
+        let mut raw = RawCost::ZERO;
+        raw.add(&p.cost_of_raw(&u));
+        raw.add(&p.cost_of_raw(&u));
+        let exact = raw.to_cost(); // divides once on the accumulated total
+
+        // Raw accumulation is exact against the summed usage…
+        let mut summed = u.clone();
+        summed.add(&u);
+        assert_eq!(raw.as_raw(), p.cost_of_raw(&summed).as_raw());
+        // …so the once-divided total is one µUSD above the twice-truncated sum.
+        assert_eq!(
+            exact.as_micro_usd() - truncated_sum.as_micro_usd(),
+            1,
+            "per-turn truncation must lose the remainder the raw path keeps"
+        );
+        assert_eq!(exact, p.cost_of(&summed));
     }
 
     #[test]

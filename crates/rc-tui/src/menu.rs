@@ -117,13 +117,18 @@ pub(crate) struct MenuState {
     /// key, which requires a rebuilt client. `app` takes this after each
     /// commit and leaves the TUI with it.
     pub pending_outcome: Option<Outcome>,
+    /// Resolved provenance of the active API key ("(set via $…)", "(saved,
+    /// ~/.sc/key)", "(unset)"), computed once per open/refresh/commit. The
+    /// root page renders it from here so a per-frame redraw doesn't repeat
+    /// the env-var lookup and key-file `stat` per row.
+    pub api_key_source: String,
 }
 
 impl MenuState {
     /// Open the menu, reading the session listing from `sessions_dir` and
     /// resolving settings against `project_dir`.
     pub fn new(sessions_dir: &Path, project_dir: &Path) -> Self {
-        Self {
+        let mut menu = Self {
             page: MenuPage::Root,
             selected: 0,
             projects: group_projects(rc_session::list(sessions_dir)),
@@ -132,7 +137,30 @@ impl MenuState {
             editing_api_key: false,
             status: None,
             pending_outcome: None,
-        }
+            api_key_source: String::new(),
+        };
+        menu.resolve_api_key_source();
+        menu
+    }
+
+    /// Resolve where the active API key would come from. Env wins, so a set
+    /// env var is reported even when a key file also exists. Originally done
+    /// per row per frame; cached at open/refresh/save instead.
+    pub fn resolve_api_key_source(&mut self) {
+        let env_set = std::env::var(&self.settings.api_key_env)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
+        self.api_key_source = if env_set {
+            format!("(set via ${})", self.settings.api_key_env)
+        } else if rc_config::key_file_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+        {
+            "(saved, ~/.sc/key)".to_string()
+        } else {
+            "(unset)".to_string()
+        };
     }
 
     /// The current page's rows, in display order.
@@ -214,6 +242,7 @@ impl MenuState {
     pub fn refresh(&mut self, sessions_dir: &Path, project_dir: &Path) {
         self.projects = group_projects(rc_session::list(sessions_dir));
         self.settings = Settings::load(project_dir);
+        self.resolve_api_key_source();
         let n = self.rows().len();
         self.selected = self.selected.min(n.saturating_sub(1));
         self.status = Some("refreshed".into());
@@ -366,6 +395,7 @@ impl MenuState {
                 self.editing = None;
                 self.editing_api_key = false;
                 self.settings = Settings::load(project_dir);
+                self.resolve_api_key_source();
                 // The env var is still what a *fresh* `marathon` resolves first, so
                 // a saved key that differs from it reverts on the next launch.
                 // Reloading now is honest about both halves.
@@ -744,7 +774,7 @@ mod tests {
     /// Build a menu without touching the real `~/.sc` — `MenuState::new` reads
     /// the disk, which a unit test must not depend on.
     fn state_with(sessions: Vec<SessionInfo>) -> MenuState {
-        MenuState {
+        let mut m = MenuState {
             page: MenuPage::Root,
             selected: 0,
             projects: group_projects(sessions),
@@ -753,6 +783,9 @@ mod tests {
             editing_api_key: false,
             status: None,
             pending_outcome: None,
-        }
+            api_key_source: String::new(),
+        };
+        m.resolve_api_key_source();
+        m
     }
 }

@@ -3,8 +3,12 @@
 //! Defense-in-depth *behind* the permission engine: an already-approved Bash
 //! command is confined at the kernel level so it can't write outside the
 //! workspace roots or (by default) open network sockets. **Linux only** —
-//! Landlock (filesystem) + seccomp-BPF (network). On other platforms the crate
-//! compiles to a documented no-op, so the Bash call site never branches on OS.
+//! Landlock (filesystem) + seccomp-BPF (network). On any other platform
+//! [`Sandbox::prepare`] fails: `--sandbox` was *asked for*, so the call site
+//! refuses to run the command unsandboxed instead of pretending to confine it.
+//! (macOS Seatbelt was the original deliberate no-op here — the 2026-09
+//! review flagged that as a fail-open promise break; it now fails loudly
+//! unless/until a `sandbox-exec` backend lands.)
 //!
 //! Opt-in: see `ToolCtx::sandbox` / the `--sandbox` CLI flag. Off by default so
 //! `cargo`/`npm`/`git` (which need network + writes outside the workspace) keep
@@ -71,8 +75,12 @@ impl Sandbox {
         self.allow_net
     }
 
-    /// Build all state that must be allocated before fork. On non-Linux this is
-    /// a no-op — the returned [`PreparedSandbox`] installs nothing.
+    /// Build all state that must be allocated before fork. On non-Linux this
+    /// returns `Err` — there is no kernel confinement to apply, and the caller
+    /// (`--sandbox` was *asked for*) refuses to run the command unsandboxed
+    /// rather than silently proceeding with no confinement. The opt-in flag
+    /// therefore means the same thing on every platform: if confinement can't
+    /// be enforced, the command doesn't run.
     ///
     /// **Fail-closed:** if the kernel supports neither Landlock nor seccomp
     /// (or `--sandbox` is on with `--sandbox-net` on a Landlock-less kernel,
@@ -86,12 +94,16 @@ impl Sandbox {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            // Confinement is Linux-only; on other platforms the prepared
-            // sandbox installs nothing (a no-op closure). The opt-in flag is
-            // still honored in the sense that `prepare` succeeds, but no kernel
-            // confinement is applied.
+            // Confinement is Linux-only (Landlock + seccomp). macOS's
+            // sandbox-exec/Seatbelt port is a follow-up; until it exists,
+            // asking for `--sandbox` on a non-Linux platform is an error, not
+            // a silent no-op (matching how the Windows tool refuses).
             let _ = (&self.roots, self.allow_net);
-            Ok(PreparedSandbox(()))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel sandboxing is only implemented on Linux (Landlock + seccomp); \
+                 refusing to run the command unsandboxed",
+            ))
         }
     }
 }
@@ -200,5 +212,19 @@ mod tests {
         // Non-network syscalls must not be in the deny list.
         assert!(!NETWORK_SYSCALLS.contains(&"write"));
         assert!(!NETWORK_SYSCALLS.contains(&"read"));
+    }
+
+    /// `--sandbox` must mean confinement or refusal — never a silent no-op.
+    /// On non-Linux there is no backend, so `prepare` fails and the Bash call
+    /// site refuses to run unsandboxed.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn prepare_fails_closed_off_linux() {
+        let s = Sandbox::new(vec![PathBuf::from("/repo")], false);
+        let err = s.prepare().expect_err("non-Linux prepare must fail");
+        assert!(
+            err.to_string().contains("refusing"),
+            "error must say what happens to the command: {err}"
+        );
     }
 }

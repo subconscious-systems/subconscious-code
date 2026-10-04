@@ -22,6 +22,8 @@ mod view;
 
 use std::io::Stdout;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -37,6 +39,58 @@ use rc_rt::Runtime;
 pub use menu::Outcome;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Whether this process currently owns the alternate screen + raw mode. The
+/// first setup flips it on; the first restore flips it off, which makes every
+/// later call (guard Drop, explicit restore before shutdown, the panic hook)
+/// a no-op instead of a double restore.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Restore the terminal to its pre-TUI state: raw mode off, primary screen,
+/// cursor visible. Idempotent; errors are swallowed — restore is best-effort
+/// on every path it runs from.
+fn restore_terminal() {
+    if !TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        out,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        crossterm::cursor::Show
+    );
+}
+
+/// RAII ownership of the terminal setup: any exit from [`run`] — normal
+/// return, an early `?` error, a panic that unwinds this thread — drops the
+/// guard and restores the terminal.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// Install the panic hook exactly once per process: the terminal is restored
+/// *first*, so the panic message doesn't vanish with the alternate screen,
+/// then the previously installed hook (the default, or the host's own) still
+/// prints it. Registered only on the real-terminal path — the crate's
+/// TestBackend tests never call [`run`], so they cannot clobber or observe
+/// this hook.
+fn install_panic_hook() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            previous(info);
+        }));
+    });
+}
 
 /// Launch the TUI against `runtime`. Blocks the calling thread — run it on a
 /// `tokio::task::spawn_blocking` thread so the rc-rt driver/pump keep running.
@@ -73,7 +127,16 @@ pub fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = app::run(
+    // Setup complete: from here to restore, this process owns the terminal.
+    TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
+    install_panic_hook();
+    let _guard = TerminalGuard;
+
+    // `?` then `Ok(..)` rather than a direct `return app::run(..)`: the guard
+    // must stay alive until after the app loop has finished restoring the
+    // terminal, and this shape keeps both the error and the success path
+    // under it without handing clippy a `let_and_return`.
+    let outcome = app::run(
         &mut terminal,
         runtime,
         model_name,
@@ -81,16 +144,6 @@ pub fn run(
         initial_mode,
         history,
         mouse,
-    );
-
-    // Restore the terminal whatever happened above.
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    );
-    let _ = terminal.show_cursor();
-    result
+    )?;
+    Ok(outcome)
 }

@@ -160,31 +160,16 @@ pub fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").to_string()
 }
 
-/// Conservative catastrophic-command deny-list (M2 safety floor). Over-refuses
-/// rather than under-refuses; M3 replaces this with real command parsing + prompts.
+/// Destructive-command safety floor. One implementation, used everywhere:
+/// this is the exact check the permission engine (rc-perm) runs, so a
+/// bypass-spelling (`rm -rf "/"`, long flags, `$HOME`) can't slip past the
+/// tool layer while the engine catches it — or vice versa. Kept at the tool
+/// layer as a guard independent of which `PermissionChecker` the agent
+/// loop was built with (e.g. `BypassChecker` still consults the floor, and
+/// scripted-loop tests don't).
 pub fn dangerous_command(cmd: &str) -> Option<&'static str> {
-    const CATACLYSMIC: &[&str] = &[
-        "rm -rf /",
-        "rm -rf ~",
-        "rm -rf /*",
-        "rm -fr /",
-        "rm -fr ~",
-        "rm -fr /*",
-        "rm -rf $HOME",
-        "rm -rf $PWD",
-        "mkfs",
-        "dd of=/dev/",
-        "chmod -R 777 /",
-        ":(){:|:&};:",
-        "shutdown",
-        "reboot",
-        "halt -p",
-        "init 0",
-    ];
-    for p in CATACLYSMIC {
-        if cmd.contains(p) {
-            return Some("command refused by the M2 safety floor (destructive); M3 adds the real permission engine");
-        }
+    if rc_perm::is_catastrophic_cmd(cmd) {
+        return Some("command refused by the destructive-command safety floor");
     }
     let trimmed = cmd.trim_start();
     if trimmed.starts_with("sudo ") || trimmed == "sudo" || trimmed.starts_with("sudo\t") {

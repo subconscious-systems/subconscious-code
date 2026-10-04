@@ -381,10 +381,26 @@ fn looks_like_implicit_length(response: &ModelResponse, configured_max: Option<u
     }
 }
 
-fn is_investigation_batch(items: &[ExecItem]) -> bool {
+/// Whether a batch counts as pure investigation for the research nudge —
+/// greedily reading many turns in a row without consolidating.
+///
+/// **Conservative by construction**: a batch is investigation only when every
+/// item is a call to a *registered* tool that declares
+/// [`Concurrency::Parallel`] and is not one of the named file mutators. The
+/// old name-based check treated every tool not named Write/Append/Edit as a
+/// read, so Bash (which can trivially mutate via `>`/`sed -i`) and any
+/// unregistered or plugin tool miscounted as investigation. Undercounting is
+/// safe (the nudge fires less often); overcounting would praise a mutating
+/// batch as investigation.
+fn is_investigation_batch(items: &[ExecItem], tools: &ToolRegistry) -> bool {
     !items.is_empty()
         && items.iter().all(|item| match item {
-            ExecItem::Call(call) => !matches!(call.name.as_str(), "Write" | "Append" | "Edit"),
+            ExecItem::Call(call) => {
+                !matches!(call.name.as_str(), "Write" | "Append" | "Edit")
+                    && tools
+                        .get(&call.name)
+                        .is_some_and(|tool| tool.concurrency() == Concurrency::Parallel)
+            }
             ExecItem::ParseError { .. } => false,
         })
 }
@@ -432,7 +448,8 @@ fn is_retryable(e: &ModelError) -> bool {
         | ProtoError::InvalidSessionId
         | ProtoError::Dlr(_)
         | ProtoError::Gzip(_)
-        | ProtoError::Io(_) => false,
+        | ProtoError::Io(_)
+        | ProtoError::LineOverflow { .. } => false,
     }
 }
 
@@ -753,6 +770,30 @@ impl AgentLoop {
                 }
                 TurnWait::TimeUp => {
                     turn_cancel.cancel();
+                    // Persist the cut request like the neighboring
+                    // Cancelled/Err paths: the turn budget expired with a
+                    // request in flight, and before this the attempt left no
+                    // trace in the transcript (the "lack of errors" blind
+                    // spot). Recorded as a non-retryable error carrying the
+                    // trace and any partial output; the projection skips
+                    // `Turn::Error` on the next request, so the prefix stays
+                    // valid.
+                    let trace = request_sink.finish("time_up", "time_up", 0, false);
+                    let partial = request_sink.partial_response();
+                    push_turn(
+                        session,
+                        sink,
+                        Turn::Error {
+                            message: Arc::<str>::from(
+                                "turn timed out before the model request completed",
+                            ),
+                            retryable: Some(false),
+                            retries: None,
+                            trace: Some(trace),
+                            partial,
+                            ts: SystemTime::now(),
+                        },
+                    );
                     return Ok(LoopOutcome::TimeUp);
                 }
             };
@@ -1059,7 +1100,7 @@ impl AgentLoop {
                 }
             }
 
-            let investigation_batch = is_investigation_batch(&exec_list);
+            let investigation_batch = is_investigation_batch(&exec_list, self.tools.as_ref());
             tool_work_observed |= !exec_list.is_empty();
             let batch_checkpoint = Arc::new(Mutex::new(BatchCheckpoint::new(exec_list.len())));
             let results = match await_turn_budget(
@@ -1464,11 +1505,15 @@ async fn execute_batch(
 
     // Permission denials, parse failures, and unknown tools are terminal before
     // execution starts. Publish them too; executed entries were already sent
-    // above.
-    for (i, r) in &results {
-        if !emitted.contains(i) {
-            emit_tool_completion(sink, r);
-            mark_batch_emitted(&checkpoint, *i);
+    // above. Iterate the precomputed `order` (the batch's own order) rather
+    // than the results HashMap, whose iteration order is arbitrary — the
+    // `on_tool_end` callbacks must fire in the order the caller issued them.
+    for &i in &order {
+        if let Some(r) = results.get(&i) {
+            if !emitted.contains(&i) {
+                emit_tool_completion(sink, r);
+                mark_batch_emitted(&checkpoint, i);
+            }
         }
     }
 
@@ -1683,4 +1728,133 @@ fn cap_tool_result(mut completed: ToolExecResult, cap: usize) -> ToolExecResult 
         completed.2 = completed.2.truncate_body(cap);
     }
     completed
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    //! Unit coverage for the conservative `is_investigation_batch` bound.
+    use super::*;
+    use crate::tool::{Tool, ToolCtx, ToolError, ToolOutcome};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    /// A stub tool with a configurable concurrency class.
+    struct Stub {
+        name: &'static str,
+        concurrency: Concurrency,
+    }
+
+    #[async_trait]
+    impl Tool for Stub {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "stub tool"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn concurrency(&self) -> Concurrency {
+            self.concurrency
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::ok("stub".into()))
+        }
+    }
+
+    fn call(name: &str) -> ExecItem {
+        ExecItem::Call(ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        })
+    }
+
+    fn registry(tools: Vec<Arc<dyn Tool>>) -> ToolRegistry {
+        ToolRegistry::new(tools)
+    }
+
+    #[test]
+    fn registered_parallel_reads_count_as_investigation() {
+        let reg = registry(vec![
+            Arc::new(Stub {
+                name: "Read",
+                concurrency: Concurrency::Parallel,
+            }) as Arc<dyn Tool>,
+            Arc::new(Stub {
+                name: "Grep",
+                concurrency: Concurrency::Parallel,
+            }),
+        ]);
+        let items = vec![call("Read"), call("Grep")];
+        assert!(is_investigation_batch(&items, &reg));
+    }
+
+    #[test]
+    fn bash_and_other_barriers_do_not_count() {
+        // Even a pure-`ls` Bash batch is conservatively excluded: Bash is
+        // Exclusive (it can mutate via redirection), so it must not reset the
+        // research-nudge counter. The old name-based check counted it.
+        let reg = registry(vec![
+            Arc::new(Stub {
+                name: "Read",
+                concurrency: Concurrency::Parallel,
+            }) as Arc<dyn Tool>,
+            Arc::new(Stub {
+                name: "Bash",
+                concurrency: Concurrency::Exclusive,
+            }),
+        ]);
+        let items = vec![call("Bash")];
+        assert!(
+            !is_investigation_batch(&items, &reg),
+            "Bash must not count as investigation"
+        );
+        // Mixed batch: one read + one barrier is not pure investigation.
+        let items = vec![call("Read"), call("Bash")];
+        assert!(!is_investigation_batch(&items, &reg));
+    }
+
+    #[test]
+    fn serial_writes_and_unregistered_tools_do_not_count() {
+        let reg = registry(vec![
+            Arc::new(Stub {
+                name: "Read",
+                concurrency: Concurrency::Parallel,
+            }) as Arc<dyn Tool>,
+            Arc::new(Stub {
+                name: "Edit",
+                concurrency: Concurrency::SerialWrite,
+            }),
+        ]);
+        // The named mutators are excluded even if one declared Parallel.
+        let items = vec![call("Read"), call("Edit")];
+        assert!(!is_investigation_batch(&items, &reg));
+        // Anything unregistered (plugin/MCP name the registry doesn't know,
+        // or a hallucinated tool name) is excluded, not assumed read-only.
+        let items = vec![call("Read"), call("SomeNewPlugin")];
+        assert!(
+            !is_investigation_batch(&items, &reg),
+            "unknown tools must not count as investigation"
+        );
+    }
+
+    #[test]
+    fn empty_batches_and_parse_errors_are_not_investigation() {
+        let reg = registry(vec![Arc::new(Stub {
+            name: "Read",
+            concurrency: Concurrency::Parallel,
+        }) as Arc<dyn Tool>]);
+        assert!(!is_investigation_batch(&[], &reg));
+        let items = vec![
+            call("Read"),
+            ExecItem::ParseError {
+                call_id: "p".into(),
+                tool_name: "Read".into(),
+                error: "bad json".into(),
+            },
+        ];
+        assert!(!is_investigation_batch(&items, &reg));
+    }
 }

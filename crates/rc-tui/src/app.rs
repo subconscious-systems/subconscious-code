@@ -166,7 +166,10 @@ pub(crate) fn run(
         // doesn't matter when there's nothing to display.
         let tick = app.next_tick();
         if event::poll(tick)? {
-            match event::read()? {
+            // Only events that actually mutated state earn a redraw. Filtered
+            // Release keys and unhandled mouse reports used to force a full
+            // repaint per event; now an idle screen stays I/O-quiet.
+            let handled = match event::read()? {
                 // Keyboard drives the composer and the keymap. Only Press events
                 // count — crossterm also emits Release on some terminals, and
                 // acting on both would double every keystroke.
@@ -181,11 +184,16 @@ pub(crate) fn run(
                 // independent of the composer/menu/ask state, so it routes
                 // straight to the scroll math without touching handle_key.
                 Event::Mouse(ev) => app.handle_mouse(ev),
-                _ => {}
-            }
-            redraw = true;
+                _ => false,
+            };
+            redraw = handled;
         }
     }
+    // Restore the terminal *before* the shutdown join: a stuck tool can hold
+    // `shutdown_blocking` for its full grace period, and the user should see
+    // the primary screen (and their shell prompt) while the runtime drains,
+    // not a frozen alt screen.
+    crate::restore_terminal();
     app.runtime.shutdown_blocking(Duration::from_secs(5));
     Ok(app.outcome)
 }
@@ -427,11 +435,11 @@ impl App {
     /// here touches the composer or the runtime — selecting a session records
     /// an [`Outcome`](crate::menu::Outcome) and quits, because switching
     /// sessions has to be done by the host.
-    fn handle_menu_key(&mut self, key: KeyEvent) {
+    fn handle_menu_key(&mut self, key: KeyEvent) -> bool {
         let sessions_dir = sessions_dir_for_menu();
         let cwd = self.cwd.clone();
         let Some(menu) = self.view.menu_overlay.as_mut() else {
-            return;
+            return false;
         };
 
         // Editing a field: a minimal line editor.
@@ -454,12 +462,13 @@ impl App {
                 KeyCode::Backspace => {
                     buf.pop();
                 }
-                KeyCode::Char(c) => buf.push(c),
+                KeyCode::Char(c) => {
+                    menu_edit_insert(key.modifiers, c, buf);
+                }
                 _ => {}
             }
-            return;
+            return true;
         }
-
         match key.code {
             KeyCode::Up => menu.move_selection(-1),
             KeyCode::Down => menu.move_selection(1),
@@ -490,9 +499,13 @@ impl App {
             // above), so this can't swallow a `d` typed into a model name.
             KeyCode::Char('d') => menu.remove_current_model(&cwd),
             KeyCode::Char('q') => self.view.menu_overlay = None,
-            KeyCode::Enter => self.activate_menu_row(),
-            _ => {}
+            KeyCode::Enter => {
+                self.activate_menu_row();
+                return true;
+            }
+            _ => return false,
         }
+        true
     }
 
     /// Act on the selected menu row.
@@ -526,16 +539,19 @@ impl App {
         self.quit = true;
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    /// Map a key to its local effect. Returns whether any renderable state
+    /// mutated — the poll loop redraws only then, so filtered Release keys
+    /// can't force repaints.
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
         // Typing ends a selection: the highlight would otherwise sit over text
         // that has scrolled or changed underneath it. The copy already
         // happened on mouse-up, so nothing is lost.
-        self.clear_selection();
+        let mut changed = self.clear_selection();
         // Ctrl+C always quits, even mid-ask / mid-turn.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.runtime.action(UserAction::Quit);
             self.quit = true;
-            return;
+            return true;
         }
 
         // If a terminal emitted an unbracketed multiline paste, the character
@@ -545,13 +561,12 @@ impl App {
         // ordinary draft for the next turn.
         let paste_continuation = key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter);
-        self.resolve_pending_submit(paste_continuation);
+        changed |= self.resolve_pending_submit(paste_continuation);
 
         // `/menu` is modal: while it's open it consumes every key, so nothing
         // reaches the composer behind it.
         if self.view.menu_overlay.is_some() {
-            self.handle_menu_key(key);
-            return;
+            return changed | self.handle_menu_key(key);
         }
 
         // While an ask is open, only the answer keys are live; Enter is a no-op.
@@ -570,7 +585,7 @@ impl App {
                     EscAction::Cancel => self.cancel_active_turn(),
                     _ => self.view.pending_ask = Some(ask),
                 }
-                return;
+                return true;
             }
             let response = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(AskResponse::Once),
@@ -586,14 +601,28 @@ impl App {
                 _ => None,
             };
             match response {
-                Some(r) => self.runtime.action(UserAction::PermissionAnswer {
-                    id: ask.id,
-                    response: r,
-                }),
-                None => self.view.pending_ask = Some(ask), // ignored key: keep the ask open
+                Some(r) => {
+                    self.runtime.action(UserAction::PermissionAnswer {
+                        id: ask.id,
+                        response: r,
+                    });
+                    true
+                }
+                None => {
+                    // ignored key: keep the ask open, nothing changed.
+                    self.view.pending_ask = Some(ask);
+                    changed
+                }
             }
-            return;
+        } else {
+            self.handle_composer_key(key, changed)
         }
+    }
+
+    /// The non-modal keymap: the completion menu, then the composer and
+    /// scrollback table. `changed` carries mutations that already happened
+    /// before the menu (selection cleared, a staged submit resolved).
+    fn handle_composer_key(&mut self, key: KeyEvent, mut changed: bool) -> bool {
 
         // While a completion menu is open, arrow/Tab/Esc drive the menu; other
         // keys fall through to the composer (so typing keeps filtering it).
@@ -609,7 +638,7 @@ impl App {
                         self.view.composer = new;
                     }
                     self.refresh_menu();
-                    return;
+                    return true;
                 }
                 KeyCode::Enter => {
                     // Accept the selected candidate. For slash commands, the
@@ -628,15 +657,16 @@ impl App {
                     if menu.completion.kind == complete::MenuKind::Slash {
                         // Fall through to the composer's Enter handler below, which
                         // will submit the now-complete slash command.
+                        changed = true;
                     } else {
                         // File mention: menu dismissed; do not reopen on the
                         // completed mention. The next Enter submits.
-                        return;
+                        return true;
                     }
                 }
                 KeyCode::Esc => {
                     // Dismiss the menu without accepting; key consumed.
-                    return;
+                    return true;
                 }
                 KeyCode::Up => {
                     let selected = menu.selected.saturating_sub(1);
@@ -644,7 +674,7 @@ impl App {
                         completion: menu.completion,
                         selected,
                     });
-                    return;
+                    return true;
                 }
                 KeyCode::Down => {
                     let max = menu.completion.candidates.len().saturating_sub(1);
@@ -653,15 +683,15 @@ impl App {
                         completion: menu.completion,
                         selected,
                     });
-                    return;
+                    return true;
                 }
                 _ => {
                     // Fall through to composer editing; recompute menu below.
-                    self.view.menu = None;
+                    // Closing the menu is itself a visible change.
+                    changed = true;
                 }
             }
         }
-
         match key.code {
             KeyCode::Enter => {
                 if self.view.busy {
@@ -672,7 +702,7 @@ impl App {
                         ));
                         self.jump_to_bottom();
                     }
-                    return;
+                    return changed;
                 }
                 if !self.view.composer.is_empty() {
                     let text = std::mem::take(&mut self.view.composer);
@@ -701,32 +731,36 @@ impl App {
                     self.jump_to_bottom();
                 }
             }
-            KeyCode::Esc => match esc_action(&self.view) {
+            KeyCode::Esc => {
                 // Esc is overloaded by state, and the ordering matters: a
                 // drafted prompt must never be lost to a stray Esc. See
                 // [`esc_action`] for the decision table.
-                EscAction::QueueAfterTool => self.arm_queued_after_tool(),
-                EscAction::Cancel => self.cancel_active_turn(),
-                EscAction::RestoreDraft => {
-                    // Browsing history → return to the live draft, not clear it.
-                    self.view.history_pos = None;
-                    self.view.clear_paste_markers();
-                    self.view.composer = std::mem::take(&mut self.view.history_draft);
-                    self.view.last_input = Some(Instant::now());
-                    self.refresh_menu();
+                match esc_action(&self.view) {
+                    EscAction::QueueAfterTool => self.arm_queued_after_tool(),
+                    EscAction::Cancel => self.cancel_active_turn(),
+                    EscAction::RestoreDraft => {
+                        // Browsing history → return to the live draft, not clear it.
+                        self.view.history_pos = None;
+                        self.view.clear_paste_markers();
+                        self.view.composer = std::mem::take(&mut self.view.history_draft);
+                        self.view.last_input = Some(Instant::now());
+                        self.refresh_menu();
+                    }
+                    EscAction::Clear => {
+                        self.view.composer.clear();
+                        self.view.clear_paste_markers();
+                        self.view.last_input = Some(Instant::now());
+                        self.refresh_menu();
+                    }
+                    EscAction::Quit => {
+                        self.runtime.action(UserAction::Quit);
+                        self.quit = true;
+                    }
                 }
-                EscAction::Clear => {
-                    self.view.composer.clear();
-                    self.view.clear_paste_markers();
-                    self.view.last_input = Some(Instant::now());
-                    self.refresh_menu();
-                }
-                EscAction::Quit => {
-                    self.runtime.action(UserAction::Quit);
-                    self.quit = true;
-                }
-            },
-            KeyCode::Tab if self.view.busy => self.queue_composer(),
+            }
+            KeyCode::Tab if self.view.busy => {
+                self.queue_composer();
+            }
             KeyCode::BackTab => {
                 // Shift+Tab: cycle the permission mode
                 // (Default -> AcceptEdits -> Plan -> Ask -> Auto -> Default).
@@ -738,30 +772,46 @@ impl App {
             // completion menu is open (handled above); with the menu closed they
             // scroll the transcript. New content arriving while scrolled up just
             // grows the buffer below the held view — the status bar reports it.
-            KeyCode::PageUp => self.scroll_page_up(),
-            KeyCode::PageDown => self.scroll_page_down(),
+            KeyCode::PageUp => {
+                self.scroll_page_up();
+            }
+            KeyCode::PageDown => {
+                self.scroll_page_down();
+            }
             // Alt+↑/↓ recall prompt history. Up/Down alone scroll the
             // transcript (the documented, verified scrollback behavior), so
             // history gets a distinct, non-conflicting modifier.
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.history_prev(),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => self.history_next(),
-            KeyCode::Up => self.scroll_line_up(),
-            KeyCode::Down => self.scroll_line_down(),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.history_prev();
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.history_next();
+            }
+            KeyCode::Up => {
+                self.scroll_line_up();
+            }
+            KeyCode::Down => {
+                self.scroll_line_down();
+            }
             KeyCode::Home => {
                 self.view.follow = false;
                 self.view.scroll_top = 0;
             }
-            KeyCode::End => self.jump_to_bottom(),
+            KeyCode::End => {
+                self.jump_to_bottom();
+            }
             // Emacs-style line editing (caret stays at the end, so the `@`/`/`
             // completion engine's caret-at-end invariant still holds). Without
             // these arms Ctrl+letter would fall through to `Char(c)` and insert
             // the raw letter — a latent bug once raw mode passes them through.
-            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => match c {
-                'w' | 'W' => self.delete_word(),
-                'o' | 'O' => self.toggle_mouse_capture(),
-                'u' | 'U' => self.clear_composer_line(),
-                _ => {} // other Ctrl+letter combos: ignore, don't insert
-            },
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match c {
+                    'w' | 'W' => self.delete_word(),
+                    'o' | 'O' => self.toggle_mouse_capture(),
+                    'u' | 'U' => self.clear_composer_line(),
+                    _ => {} // other Ctrl+letter combos: ignore, don't insert
+                }
+            }
             // Cmd+Backspace is the macOS "delete to start of line" gesture. Only
             // terminals that report the Super modifier (kitty protocol: Ghostty,
             // WezTerm, kitty; iTerm2 when configured) deliver it — Terminal.app
@@ -771,10 +821,12 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::SUPER | KeyModifiers::META) =>
             {
-                self.clear_composer_line()
+                self.clear_composer_line();
             }
             // Alt+Backspace (mac) and Ctrl+W (emacs) both delete the last word.
-            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => self.delete_word(),
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.delete_word();
+            }
             KeyCode::Char(c) => {
                 self.view.composer.push(c);
                 self.view.last_input = Some(Instant::now());
@@ -786,23 +838,26 @@ impl App {
                 self.view.last_input = Some(Instant::now());
                 self.refresh_menu();
             }
-            _ => {}
+            _ => return changed,
         }
+        // Every arm reached here mutated renderable state.
+        true
     }
 
     /// Native bracketed paste is deliberately separate from key handling:
     /// newlines stay inside the composer and cannot trigger Enter's submit arm.
-    fn handle_paste(&mut self, text: &str) {
+    /// Returns whether any state mutated (so the loop can skip a redraw).
+    fn handle_paste(&mut self, text: &str) -> bool {
         // A native paste can also be the continuation of a staged first line
         // if the terminal only partially preserved bracketed-paste framing.
-        self.resolve_pending_submit(true);
+        let changed = self.resolve_pending_submit(true);
 
         // Modal editors own their input (notably the API-key field). A menu
         // with no editor cannot accept the payload, so close it and preserve
         // the text in the composer instead of dropping it behind the overlay.
         if let Some(menu) = self.view.menu_overlay.as_mut() {
             if menu.paste(text) {
-                return;
+                return true;
             }
             self.view.menu_overlay = None;
             self.view.transcript.push(Line::styled(
@@ -817,27 +872,36 @@ impl App {
             ));
         }
         if self.view.append_paste(text) == 0 {
-            return;
+            return changed;
         }
         self.view.history_pos = None;
         self.view.last_input = Some(Instant::now());
         self.refresh_menu();
+        true
     }
 
     /// Resolve the tiny pre-submit debounce. `continuation` means the caller
     /// is handling input that can belong to the same unbracketed paste; within
     /// the rescue window the staged line is restored with its newline. Any
     /// other input (or elapsed window) dispatches the staged prompt normally.
-    fn resolve_pending_submit(&mut self, continuation: bool) {
-        let Some(prompt) = resolve_staged_submit(
+    /// Returns whether any state changed — a dispatched submit, or the staged
+    /// line folded back into the composer.
+    fn resolve_pending_submit(&mut self, continuation: bool) -> bool {
+        let had_staged = self.pending_submit.is_some();
+        match resolve_staged_submit(
             &mut self.pending_submit,
             &mut self.view.composer,
             Instant::now(),
             continuation,
-        ) else {
-            return;
-        };
-        self.submit_prompt(prompt);
+        ) {
+            Some(prompt) => {
+                self.submit_prompt(prompt);
+                true
+            }
+            // No prompt came out: either nothing was staged (no change), or a
+            // paste continuation was folded back into the composer (a change).
+            None => had_staged,
+        }
     }
 
     fn flush_pending_submit_if_due(&mut self) -> bool {
@@ -932,12 +996,16 @@ impl App {
         }
     }
 
+    /// PgUp pages by one screen of *physical* wrapped rows, not logical lines:
+    /// with wrapping a logical line occupies several visual rows, and paging by
+    /// lines would overshoot. The walk uses the same per-line wrapped row
+    /// count the draw computes.
     fn scroll_page_up(&mut self) {
         let total = self.total_lines();
         let h = self.view.area_height.max(1);
         let top = self.current_top(total);
         self.view.follow = false;
-        self.view.scroll_top = top.saturating_sub(h);
+        self.view.scroll_top = self.view.page_top(top, true, h);
     }
 
     fn scroll_page_down(&mut self) {
@@ -946,10 +1014,12 @@ impl App {
         }
         let total = self.total_lines();
         let h = self.view.area_height.max(1);
-        let new_top = self.view.scroll_top + h;
+        let top = self.current_top(total);
+        let new_top = self.view.page_top(top, false, h);
         if new_top + h >= total {
             self.jump_to_bottom();
         } else {
+            self.view.follow = false;
             self.view.scroll_top = new_top;
         }
     }
@@ -958,7 +1028,10 @@ impl App {
     /// re-pins to follow, reaching the top holds at line 0. Single-pass (one
     /// `total_lines` computation) so a fast trackpad swipe doesn't re-parse the
     /// streaming markdown once per line.
-    fn handle_mouse(&mut self, ev: MouseEvent) {
+    ///
+    /// Returns whether any state changed, so filtered mouse reports (position
+    /// tracking, button events we ignore) don't force repaints.
+    fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
         match ev.kind {
             MouseEventKind::ScrollUp => {
                 let transcript_selection = self.view.transcript_selection.is_some();
@@ -969,6 +1042,7 @@ impl App {
                 if transcript_selection && self.view.selection_dragging {
                     self.extend_transcript_selection_to_viewport_edge(true);
                 }
+                true
             }
             MouseEventKind::ScrollDown => {
                 let transcript_selection = self.view.transcript_selection.is_some();
@@ -979,6 +1053,7 @@ impl App {
                 if transcript_selection && self.view.selection_dragging {
                     self.extend_transcript_selection_to_viewport_edge(false);
                 }
+                true
             }
             // A press no longer acts immediately: not until the button comes
             // up do we know whether this was a click (toggle a block) or a
@@ -998,17 +1073,25 @@ impl App {
                         head: (ev.column, ev.row),
                     });
                 }
+                true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(point) = self.view.transcript_point_at(ev.column, ev.row) {
                     if let Some(sel) = self.view.transcript_selection.as_mut() {
+                        if sel.head == point {
+                            return false;
+                        }
                         sel.head = point;
-                        return;
+                        return true;
                     }
                 }
                 if let Some(sel) = self.view.selection.as_mut() {
+                    if sel.head == (ev.column, ev.row) {
+                        return false;
+                    }
                     sel.head = (ev.column, ev.row);
                 }
+                true
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(point) = self.view.transcript_point_at(ev.column, ev.row) {
@@ -1031,8 +1114,9 @@ impl App {
                     self.clear_selection();
                     self.toggle_expandable_at(ev.column, ev.row);
                 }
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -1058,12 +1142,17 @@ impl App {
         }
     }
 
-    /// Drop any selection and the text harvested for it.
-    fn clear_selection(&mut self) {
+    /// Drop any selection and the text harvested for it. Returns whether
+    /// anything was actually dropped (a redraw is only earned when so).
+    fn clear_selection(&mut self) -> bool {
+        let had = self.view.selection.is_some()
+            || self.view.transcript_selection.is_some()
+            || self.view.selection_dragging;
         self.view.selection = None;
         self.view.transcript_selection = None;
         self.view.selection_dragging = false;
         self.view.selection_text = None;
+        had
     }
 
     /// Copy a finished drag to the clipboard. Called right after a draw,
@@ -1796,6 +1885,18 @@ fn resolve_staged_submit(
 ///
 /// The menu and ask handlers `return` before the keymap reaches `Esc`, so this
 /// only fires on a bare Esc with neither overlay open.
+/// Insert `c` into a modal text field (`menu.editing`). The `ALT` modifier is
+/// *not* treated as a shortcut: AltGr (Windows/Linux) composes characters with
+/// it, and macOS Option composes specials — e.g. `@` on a German layout arrives
+/// as `ALT`+`@` — so refusing it would make `@` impossible to type (codex
+/// #50255). `CONTROL`/`SUPER`/`META` are shortcuts and never insert text.
+fn menu_edit_insert(modifiers: KeyModifiers, c: char, buf: &mut String) {
+    if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) {
+        return;
+    }
+    buf.push(c);
+}
+
 fn esc_action(state: &crate::view::ViewState) -> EscAction {
     if state.busy && state.queued_messages > 0 && !state.queued_after_tool {
         EscAction::QueueAfterTool
@@ -1866,9 +1967,9 @@ fn reset_turn(v: &mut crate::view::ViewState) {
     v.stream_chars = 0;
     v.stream_started = None;
     // Drop any stale in-progress parse so a fresh turn starts clean (also
-    // covers `/clear`, which clears `current_text` but not the cache).
-    v.current_parsed.clear();
-    v.current_dirty = false;
+    // covers `/clear`, which clears `current_text` but not the cache). This
+    // also invalidates the incremental settled-prefix parse.
+    v.clear_stream_parse();
     v.current_reasoning.clear();
     v.reasoning_started = None;
     v.reasoning_elapsed = None;
@@ -2467,6 +2568,11 @@ fn osc52_sequence(text: &str, tmux: bool) -> String {
     }
 }
 
+/// How long a clipboard helper may run before it is considered stuck. The
+/// copy path runs on the UI thread, so an unbounded `wait()` freezes the whole
+/// TUI behind a hung `pbcopy`/`xclip`/tmux.
+const CLIPBOARD_WAIT: Duration = Duration::from_secs(2);
+
 fn copy_with_command(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -2482,13 +2588,29 @@ fn copy_with_command(program: &str, args: &[&str], text: &str) -> std::io::Resul
         .take()
         .ok_or_else(|| std::io::Error::other("clipboard command has no stdin"))?
         .write_all(text.as_bytes())?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
+    // `wait()` could block forever; poll instead and kill the helper once it
+    // outlives the bound so a wedged clipboard can never hang the render loop.
+    let deadline = Instant::now() + CLIPBOARD_WAIT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(std::io::Error::other(format!(
             "clipboard command exited with {status}"
-        )))
+        ))),
+        None => Err(std::io::Error::other(format!(
+            "clipboard command still running after {} ms; killed",
+            CLIPBOARD_WAIT.as_millis()
+        ))),
     }
 }
 

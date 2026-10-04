@@ -102,13 +102,29 @@ pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<Drive
                 }
             }
             DriverCmd::Rewind { steps } => {
-                match rc_session::rewind::rewind_session(&mut session, steps) {
-                    Ok(report) => {
-                        let text = format!(
+                // Rewind is blocking file IO (temp-file writes, renames, and
+                // the journal rewrite); run it on a blocking worker instead of
+                // stalling this driver task. Only the shared journal handle
+                // crosses over, so this side of the await holds no `Session`
+                // borrow.
+                let journal = session.change_journal.clone();
+                let rewound = tokio::task::spawn_blocking(move || {
+                    rc_session::rewind::rewind_shared(&journal, steps)
+                })
+                .await;
+                match rewound {
+                    Ok(Ok(report)) => {
+                        let mut text = format!(
                             "Rewound {} turn(s) of file changes; restored {} file(s).",
                             report.turns,
                             report.restored.len()
                         );
+                        if !report.failed.is_empty() {
+                            text.push_str(&format!(
+                                " {} file(s) could not be restored.",
+                                report.failed.len()
+                            ));
+                        }
                         events.send(AgentEvent::Notice(text.clone()));
                         // Mark the rewind in the transcript so a resumed session
                         // and the model see it. The transcript is append-only,
@@ -123,8 +139,13 @@ pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<Drive
                             }
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         events.send(AgentEvent::Error(format!("rewind failed: {e}")));
+                    }
+                    Err(e) => {
+                        events.send(AgentEvent::Error(format!(
+                            "rewind worker task failed: {e}"
+                        )));
                     }
                 }
                 events.send(AgentEvent::Idle);

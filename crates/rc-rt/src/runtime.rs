@@ -66,7 +66,7 @@ impl Runtime {
         let (feedback_tx, feedback_rx) = mpsc::channel(4);
 
         let pending = std::sync::Arc::new(PendingAsks::new());
-        let store = store.map(SessionWriter::new);
+        let store = store.map(|store| SessionWriter::new(events_tx.clone(), store));
         let sink = std::sync::Arc::new(RuntimeSink::new(events_tx.clone(), store.clone()))
             as std::sync::Arc<dyn EventSink>;
         let prompter = RuntimePrompter::new(events_tx.clone(), pending.clone());
@@ -108,7 +108,9 @@ impl Runtime {
         let rx = self
             .events_rx
             .lock()
-            .expect("runtime event receiver lock poisoned")
+            // The receiver is taken exactly once, so poisoning can only mean
+            // a prior `subscribe` panicked midway — the payload is intact.
+            .unwrap_or_else(|error| error.into_inner())
             .take()
             .expect("Runtime::subscribe may only be called once");
         EventStream { rx }

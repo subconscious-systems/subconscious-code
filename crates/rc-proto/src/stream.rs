@@ -373,24 +373,63 @@ pub fn repair(input: &str) -> String {
 
 /// Incremental Server-Sent Events decoder. Feed bytes as they arrive; complete
 /// `data:` lines yield parsed chunks. `data: [DONE]` sets [`SseDecoder::is_done`].
-#[derive(Default)]
+///
+/// The buffer is **bounded**: a single line larger than [`SSE_MAX_LINE_BYTES`]
+/// (without a terminating newline) aborts with
+/// [`ProtoError::LineOverflow`] instead of growing without limit — a
+/// misbehaving or hostile endpoint must not be able to OOM the client by
+/// streaming one endless "data:" frame.
 pub struct SseDecoder {
     buf: BytesMut,
     done: bool,
+    /// Cap on the current (unterminated) line, in bytes.
+    max_line: usize,
 }
+
+/// Default SSE line cap: 4 MiB. Real chunks are single-digit KB; 4 MiB leaves
+/// room for a pathologically large single delta without inviting OOM.
+pub const SSE_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 impl SseDecoder {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            buf: BytesMut::new(),
+            done: false,
+            max_line: SSE_MAX_LINE_BYTES,
+        }
+    }
+
+    /// Test seam: a decoder with an artificially small line cap, so the
+    /// overflow path can be exercised with a few bytes instead of 4 MiB.
+    #[doc(hidden)]
+    pub fn with_max_line_len(max_line: usize) -> Self {
+        Self {
+            max_line,
+            ..Self::new()
+        }
     }
 
     pub fn is_done(&self) -> bool {
         self.done
     }
 
-    /// Feed a chunk of bytes; return any complete `data:` lines parsed.
+    /// Feed a chunk of bytes; return any complete `data:` lines parsed. If the
+    /// unterminated tail of the buffer already exceeds the line cap, the
+    /// buffer is dropped and an overflow error is returned — keep-feeding an
+    /// unbounded line is refused rather than buffered.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Result<ChatCompletionChunk, ProtoError>> {
         self.buf.extend_from_slice(bytes);
+        // Bounded either by the bytes after the last newline (no newline yet
+        // in the buffer at all) or the whole buffer (still no newline).
+        let tail_len = match memchr::memrchr(b'\n', &self.buf) {
+            Some(nl) => self.buf.len() - nl - 1,
+            None => self.buf.len(),
+        };
+        if tail_len > self.max_line {
+            let max = self.max_line;
+            self.buf.clear();
+            return vec![Err(ProtoError::LineOverflow { max })];
+        }
         self.drain_lines()
     }
 
@@ -441,6 +480,12 @@ impl SseDecoder {
         // Deep-debug only (RUST_LOG=rc_proto=trace): the raw SSE data payload.
         tracing::trace!("data: {rest_str}");
         vec![serde_json::from_str::<ChatCompletionChunk>(rest_str).map_err(ProtoError::Json)]
+    }
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -778,6 +823,66 @@ mod tests {
         let out4 = dec.feed(b"data: [DONE]\n\n");
         assert!(out4.is_empty());
         assert!(dec.is_done(), "[DONE] sets done");
+    }
+
+    // ---- bounded SSE line buffer (the unbounded-buffer review finding) -----
+
+    /// The review's case: one endless `data:` line with no newline. The
+    /// decoder must refuse to buffer it past the cap and return the distinct
+    /// overflow error rather than keeping (and growing) the bytes.
+    #[test]
+    fn sse_decoder_refuses_unbounded_lines_instead_of_ooming() {
+        let mut dec = SseDecoder::with_max_line_len(64);
+        // Under the cap with a newline: parses normally.
+        assert_eq!(dec.feed(b"data: {\"choices\":[]}\n\n").len(), 1);
+        // One over-cap line in small increments: cross the cap piecewise so
+        // no single feed is large (the "many small strings" shape) and assert
+        // the error, not an ever-growing buffer.
+        let mut fed = 0usize;
+        let mut overflow_at = None;
+        for piece in std::iter::repeat_n(&b"xxxxxxxxxxxxxxxxx"[..], 20) {
+            let out = dec.feed(piece);
+            fed += piece.len();
+            if let [single] = out.as_slice() {
+                assert!(
+                    matches!(single, Err(ProtoError::LineOverflow { max: 64 })),
+                    "expected LineOverflow at {fed} bytes, got {single:?}"
+                );
+                overflow_at = Some(fed);
+                break;
+            }
+            assert!(
+                out.is_empty(),
+                "partial line must not parse: {out:?} (fed {fed})"
+            );
+        }
+        assert!(
+            overflow_at.is_some(),
+            "a >{{64}}-byte line with no newline must overflow (fed {fed})"
+        );
+        // The buffer was dropped at the cap: memory does not keep growing.
+        assert!(dec.finish().is_empty(), "nothing left buffered after overflow");
+    }
+
+    /// A line that stays under the cap — even split across feeds with no
+    /// newline for a while — still parses fine at the newline.
+    #[test]
+    fn sse_decoder_under_the_cap_still_parses() {
+        let mut dec = SseDecoder::with_max_line_len(256);
+        let line = br#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}"#;
+        // Feed in small pieces with no newlines until the final delimiter.
+        let (rest, last) = line.split_at(line.len() - 8);
+        for piece in rest.chunks(3) {
+            let out = dec.feed(piece);
+            assert!(out.is_empty(), "partial line must not parse: {out:?}");
+        }
+        // The completing feed carries the line terminator: without it the
+        // buffer still holds an unterminated (partial) line and parses nothing.
+        let mut completion = last.to_vec();
+        completion.extend_from_slice(b"\n\n");
+        let out = dec.feed(&completion);
+        assert_eq!(out.len(), 1, "the completed line must parse: {out:?}");
+        out[0].as_ref().expect("valid chunk parses");
     }
 
     #[test]
