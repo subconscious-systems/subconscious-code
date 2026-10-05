@@ -71,6 +71,17 @@ struct Cli {
     #[arg(long, value_name = "PATH", requires = "print")]
     benchmark_trajectory: Option<PathBuf>,
 
+    /// After the first stop that follows tool work, inject one completion-audit
+    /// note and let the agent continue. Off by default, as interactive users
+    /// run it; also settable via SC_COMPLETION_REVIEW=1.
+    #[arg(
+        long,
+        env = "SC_COMPLETION_REVIEW",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    completion_review: bool,
+
     /// Override the model for this invocation.
     #[arg(long, env = "SC_MODEL")]
     model: Option<String>,
@@ -199,7 +210,7 @@ async fn run(cli: Cli) -> Result<()> {
         return update::run(*json).await;
     }
 
-    let benchmark_mode = cli.benchmark_report.is_some() || cli.benchmark_trajectory.is_some();
+    let completion_review = cli.completion_review;
     let mut settings = Settings::load(&std::env::current_dir()?);
     let model_override = cli.model.clone();
     let base_url_override = cli.base_url.clone();
@@ -436,7 +447,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .with_max_tokens(max_tokens)
                 .with_temperature(temperature)
                 .with_reasoning_effort(reasoning_effort.clone())
-                .with_completion_review(benchmark_mode)
+                .with_completion_review(completion_review)
                 .with_sandbox(sandbox))
         };
 
@@ -1953,6 +1964,43 @@ mod benchmark_report_tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn benchmark_outputs_do_not_turn_on_completion_review() {
+        let cli = Cli::try_parse_from([
+            "marathon",
+            "--print",
+            "task",
+            "--benchmark-report",
+            "report.json",
+            "--benchmark-trajectory",
+            "trajectory.json",
+        ])
+        .unwrap();
+        assert!(!cli.completion_review);
+    }
+
+    #[test]
+    fn completion_review_flag_turns_on_review() {
+        let cli =
+            Cli::try_parse_from(["marathon", "--print", "task", "--completion-review"]).unwrap();
+        assert!(cli.completion_review);
+    }
+
+    #[test]
+    fn completion_review_combines_with_benchmark_outputs() {
+        let cli = Cli::try_parse_from([
+            "marathon",
+            "--print",
+            "task",
+            "--benchmark-report",
+            "report.json",
+            "--completion-review",
+        ])
+        .unwrap();
+        assert!(cli.completion_review);
+        assert!(cli.benchmark_report.is_some());
     }
 
     #[test]

@@ -333,6 +333,10 @@ SC_API_KEY="your-api-key" marathon \
   -p "fix the task"
 ```
 
+Neither output changes how the agent runs. `--completion-review` (or
+`SC_COMPLETION_REVIEW=1`) adds one completion-audit note after the first stop
+that follows tool work. It is off by default.
+
 The report contains timing, token, cost, retry, tool, and build-provenance
 fields without prompt or tool-result content. The trajectory is an explicit
 transcript artifact and may contain sensitive task data; review it before
