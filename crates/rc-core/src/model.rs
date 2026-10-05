@@ -157,6 +157,11 @@ pub struct NullSink;
 impl EventSink for NullSink {}
 
 /// The model abstraction (§13 MockModel for tests).
+// clippy 1.99+ fires `double_must_use` on `async_trait`'s desugared wrapper
+// (its own `#[must_use]` on a fn returning a `Future`, which is already
+// must_use). The attribute is macro-generated, not ours — the allow lives on
+// the trait so the generated code is covered.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Model: Send + Sync {
     async fn complete(
