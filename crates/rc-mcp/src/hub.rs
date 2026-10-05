@@ -19,6 +19,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Lines of a stdio server's stderr kept for `/mcp` and error messages.
 const STDERR_TAIL_LINES: usize = 20;
+/// After a failed start, how long to wait for the server's last stderr lines.
+/// A server that exits at once usually explains why on stderr, and the
+/// closed pipe can reach the client before those lines are read.
+const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Where one server stands. `tools` lists the wire names it contributed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,10 +261,16 @@ fn client_config() -> ClientConfig {
 
 async fn connect_one(config: ServerConfig) -> (ServerHandle, Vec<rmcp::model::Tool>) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::default();
+    let stderr_reader: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
     let transport_label = config.transport.describe();
     let attempt = tokio::time::timeout(
         config.startup_timeout,
-        start(&config.name, &config.transport, stderr_tail.clone()),
+        start(
+            &config.name,
+            &config.transport,
+            &stderr_tail,
+            &stderr_reader,
+        ),
     )
     .await;
     let outcome = match attempt {
@@ -278,6 +288,13 @@ async fn connect_one(config: ServerConfig) -> (ServerHandle, Vec<rmcp::model::To
             tools,
         ),
         Err(error) => {
+            let reader = stderr_reader
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(reader) = reader {
+                let _ = tokio::time::timeout(STDERR_SETTLE, reader).await;
+            }
             let error = match stderr_tail.lock().unwrap_or_else(|e| e.into_inner()).back() {
                 Some(line) => format!("{error} (stderr: {line})"),
                 None => error,
@@ -301,7 +318,8 @@ async fn connect_one(config: ServerConfig) -> (ServerHandle, Vec<rmcp::model::To
 async fn start(
     name: &str,
     transport: &Transport,
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_tail: &Arc<Mutex<VecDeque<String>>>,
+    stderr_reader: &Mutex<Option<tokio::task::JoinHandle<()>>>,
 ) -> Result<(Service, Vec<rmcp::model::Tool>), String> {
     let service = match transport {
         Transport::Stdio {
@@ -323,7 +341,8 @@ async fn start(
                 .spawn()
                 .map_err(|e| format!("could not start `{}`: {e}", transport_command(transport)))?;
             if let Some(stderr) = stderr {
-                drain_stderr(name.to_string(), stderr, stderr_tail);
+                let reader = drain_stderr(name.to_string(), stderr, stderr_tail.clone());
+                *stderr_reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(reader);
             }
             client_config()
                 .serve(child)
@@ -374,7 +393,7 @@ fn drain_stderr(
     name: String,
     stderr: tokio::process::ChildStderr,
     tail: Arc<Mutex<VecDeque<String>>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -385,5 +404,5 @@ fn drain_stderr(
             }
             tail.push_back(line);
         }
-    });
+    })
 }
