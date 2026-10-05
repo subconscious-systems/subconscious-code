@@ -606,10 +606,10 @@ impl App {
             let response = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(AskResponse::Once),
                 KeyCode::Char('s') | KeyCode::Char('S') => Some(AskResponse::Session(
-                    suggested_rule(&ask.tool, &ask.input, &self.cwd),
+                    rc_core::suggested_rule(&ask.tool, &ask.input, &self.cwd),
                 )),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(AskResponse::Always(
-                    suggested_rule(&ask.tool, &ask.input, &self.cwd),
+                    rc_core::suggested_rule(&ask.tool, &ask.input, &self.cwd),
                 )),
                 KeyCode::Char('n') | KeyCode::Char('N') => {
                     Some(AskResponse::Deny("declined".into()))
@@ -639,7 +639,6 @@ impl App {
     /// scrollback table. `changed` carries mutations that already happened
     /// before the menu (selection cleared, a staged submit resolved).
     fn handle_composer_key(&mut self, key: KeyEvent, mut changed: bool) -> bool {
-
         // While a completion menu is open, arrow/Tab/Esc drive the menu; other
         // keys fall through to the composer (so typing keeps filtering it).
         if let Some(menu) = self.view.menu.take() {
@@ -2119,64 +2118,16 @@ fn outcome_notice(outcome: rc_core::LoopOutcome) -> Option<&'static str> {
     match outcome {
         LoopOutcome::Length => Some("the answer hit the model's output-token limit"),
         LoopOutcome::ItersExceeded => Some("iteration budget reached before the model finished"),
-        LoopOutcome::NoProgress => Some(
-            "completion limit reached twice with no progress; the turn was stopped",
-        ),
-        LoopOutcome::RepeatedFailure => Some(
-            "identical-failure circuit breaker: the same call kept failing the same way",
-        ),
-        LoopOutcome::Incomplete => {
-            Some("the response ended without a clean completion marker")
+        LoopOutcome::NoProgress => {
+            Some("completion limit reached twice with no progress; the turn was stopped")
         }
+        LoopOutcome::RepeatedFailure => {
+            Some("identical-failure circuit breaker: the same call kept failing the same way")
+        }
+        LoopOutcome::Incomplete => Some("the response ended without a clean completion marker"),
         LoopOutcome::TimeUp => Some("the turn exceeded its wall-clock budget"),
         LoopOutcome::Stop | LoopOutcome::Cancelled => None,
     }
-}
-
-/// The rule text the "Always allow" arm offers as a standing session grant.
-///
-/// - Bash keys on the first *command* token, skipping leading `NAME=value`
-///   assignments (opencode #52720): `FOO=1 cargo build` grants `Bash(cargo:*)`,
-///   a rule that actually matches the next `FOO=1 cargo …` too.
-/// - Path tools scope the grant to the approved file's own directory
-///   (opencode #52715): approving one `Write(./config/app.toml)` must not mint
-///   a bare `Write` that silently covers every later path. The bare-tool
-///   fallback remains only for inputs with no usable path.
-fn suggested_rule(tool: &str, input: &Value, cwd: &Path) -> String {
-    #[cfg(windows)]
-    if tool == "PowerShell" {
-        return rc_core::powershell_grant(
-            input.get("command").and_then(Value::as_str).unwrap_or(""),
-        );
-    }
-    if tool == "Bash" {
-        if let Some(cmd) = input.get("command").and_then(|val| val.as_str()) {
-            if let Some(first) = rc_core::suggest_command_name(cmd) {
-                return format!("Bash({first}:*)");
-            }
-        }
-    }
-    let path = input
-        .get("file_path")
-        .or_else(|| input.get("path"))
-        .and_then(Value::as_str);
-    if let Some(path) = path {
-        let candidate = Path::new(path);
-        let rel: std::path::PathBuf = if candidate.is_absolute() {
-            match candidate.strip_prefix(cwd) {
-                Ok(rel) => rel.to_path_buf(),
-                Err(_) => return tool.to_string(), // outside cwd: no tight spec
-            }
-        } else {
-            candidate.to_path_buf()
-        };
-        let dir = match rel.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir,
-            _ => Path::new("."),
-        };
-        return format!("{tool}({}/*)", dir.display());
-    }
-    tool.to_string()
 }
 
 /// One-line summary of a tool call's arguments for the transcript.
@@ -3023,6 +2974,7 @@ mod tests {
 
     #[test]
     fn suggested_rule_for_bash_uses_first_command_token() {
+        use rc_core::suggested_rule;
         assert_eq!(
             suggested_rule(
                 "Bash",
@@ -3048,6 +3000,7 @@ mod tests {
     /// `Edit`/`Write` that covers every later path.
     #[test]
     fn suggested_path_grants_are_directory_scoped() {
+        use rc_core::suggested_rule;
         assert_eq!(
             suggested_rule(
                 "Edit",
@@ -3075,14 +3028,16 @@ mod tests {
             ),
             "Edit(config/*)"
         );
-        // Outside the cwd there is no tight spec — bare tool only.
+        // Outside the cwd the grant is the exact approved file — the tightest
+        // possible spec (opencode #52715: the old bare `Edit` fallback was a
+        // global standing grant).
         assert_eq!(
             suggested_rule(
                 "Edit",
                 &serde_json::json!({"file_path": "/tmp/x"}),
                 Path::new("/repo")
             ),
-            "Edit"
+            "Edit(/tmp/x)"
         );
     }
 
@@ -3882,7 +3837,8 @@ mod tests {
 
         // The restore arm always closes the window itself, but a stale
         // timestamp must also fail the gate on its own.
-        s.last_cancel_at = Some(Instant::now() - DOUBLE_ESC_RESTORE_WINDOW - Duration::from_secs(1));
+        s.last_cancel_at =
+            Some(Instant::now() - DOUBLE_ESC_RESTORE_WINDOW - Duration::from_secs(1));
         assert_eq!(esc_action(&s), EscAction::Quit);
 
         // A draft present outranks the restore (Clear first, as before).

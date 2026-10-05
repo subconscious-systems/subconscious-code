@@ -175,6 +175,61 @@ fn is_mutating(tool: &str) -> bool {
     )
 }
 
+/// The standing-grant rule offered after an approval ("Always allow", the CLI's
+/// `a`/`s` answers). One implementation for every host (this used to be
+/// duplicated between the TUI and the CLI prompter).
+///
+/// Scoping rules:
+/// - **Bash** keys on the first *command* token — leading `NAME=value`
+///   assignments are transparent (opencode #52720), so approving
+///   `FOO=1 cargo build` mints `Bash(cargo:*)`, which matches the prefixed
+///   spelling and the plain one.
+/// - **Path tools** grant the approved file's own directory when it sits inside
+///   the cwd (`Edit src/app.rs` → `Edit(src/*)`), never the whole tool.
+/// - A path **outside the cwd** grants the exact file only. The previous
+///   fallback was the bare tool name — a *global* standing grant — which is
+///   precisely the widening opencode reports in #52715 (their case: an
+///   external-directory save ballooned into a repo-above-home grant).
+/// - No path at all → the bare tool name (the loosest fallback, unchanged: for
+///   non-path tools there is nothing tighter to scope on).
+pub fn suggested_rule(tool: &str, input: &Value, cwd: &Path) -> String {
+    #[cfg(windows)]
+    if tool == "PowerShell" {
+        return powershell_grant(input.get("command").and_then(Value::as_str).unwrap_or(""));
+    }
+    if tool == "Bash" {
+        if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+            if let Some(first) = crate::bash::suggest_command_name(cmd) {
+                return format!("Bash({first}:*)");
+            }
+        }
+    }
+    let path = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str);
+    if let Some(path) = path {
+        let candidate = Path::new(path);
+        let rel: PathBuf = if candidate.is_absolute() {
+            match candidate.strip_prefix(cwd) {
+                Ok(rel) => rel.to_path_buf(),
+                // Outside the cwd: the grant is the exact approved file — the
+                // tightest possible spec (opencode #52715), and never a bare
+                // tool, which would approve every future path.
+                Err(_) => return format!("{tool}({})", candidate.display()),
+            }
+        } else {
+            candidate.to_path_buf()
+        };
+        let dir = match rel.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        return format!("{tool}({}/*)", dir.display());
+    }
+    tool.to_string()
+}
+
 /// macOS (default APFS) and Windows (NTFS) resolve `.ENV` to `.env`, so path
 /// rules fold case there or a deny on `.env` is bypassed by asking for `.ENV`.
 /// Linux filesystems are case-sensitive and rules stay case-sensitive.
@@ -1152,8 +1207,7 @@ mod tests {
                 "auto must refuse {cmd:?}: {d:?}"
             );
             // And the BypassChecker, which leans on the same floor.
-            let b = BypassChecker
-                .check("Bash", &json!({"command": cmd}), &cwd(), &roots(), &[]);
+            let b = BypassChecker.check("Bash", &json!({"command": cmd}), &cwd(), &roots(), &[]);
             assert!(
                 matches!(b, Decision::Deny(_)),
                 "bypass must refuse {cmd:?}: {b:?}"
@@ -1165,10 +1219,7 @@ mod tests {
     /// aliases resolve to `.env` before the glob runs.
     #[test]
     fn deny_rules_match_the_canonicalized_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "rc-perm-canon-{}",
-            std::process::id() as u64
-        ));
+        let dir = std::env::temp_dir().join(format!("rc-perm-canon-{}", std::process::id() as u64));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
         let e = eng(Mode::AcceptEdits, &["Edit(./.env)"], &[], &[]);
@@ -1254,7 +1305,10 @@ mod tests {
             &roots(),
             &["Edit(src/*)".to_string()],
         );
-        assert!(matches!(d3, Decision::Deny(_)), "plan beats edit grant: {d3:?}");
+        assert!(
+            matches!(d3, Decision::Deny(_)),
+            "plan beats edit grant: {d3:?}"
+        );
     }
 
     /// An unbuildable deny glob must fail *closed* — a typo'd deny rule is a
@@ -1278,13 +1332,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn path_rules_fold_case_on_case_insensitive_filesystems() {
         let e = eng(Mode::Default, &["Read(./.env)"], &[], &[]);
-        let d = e.check(
-            "Read",
-            &json!({"file_path": ".ENV"}),
-            &cwd(),
-            &roots(),
-            &[],
-        );
+        let d = e.check("Read", &json!({"file_path": ".ENV"}), &cwd(), &roots(), &[]);
         assert!(matches!(d, Decision::Deny(_)), "case alias: {d:?}");
     }
 
@@ -1384,5 +1432,175 @@ mod tests {
             matches!(d, Decision::Allow),
             "substring floor is gone: {d:?}"
         );
+    }
+}
+
+// ---- standing-grant scoping (opencode #52715/#52720) ------------------------
+
+#[cfg(test)]
+mod suggested_rule_tests {
+    use super::*;
+
+    #[test]
+    fn bash_grants_key_on_the_real_command() {
+        // opencode #52720: leading NAME=value assignments are transparent in
+        // both directions — the grant covers the prefixed spelling and the
+        // plain one.
+        assert_eq!(
+            suggested_rule(
+                "Bash",
+                &serde_json::json!({"command": "cargo test"}),
+                Path::new("/repo")
+            ),
+            "Bash(cargo:*)"
+        );
+        assert_eq!(
+            suggested_rule(
+                "Bash",
+                &serde_json::json!({"command": "FOO=1 cargo test"}),
+                Path::new("/repo")
+            ),
+            "Bash(cargo:*)"
+        );
+    }
+
+    #[test]
+    fn path_grants_scope_to_the_approved_directory() {
+        assert_eq!(
+            suggested_rule(
+                "Edit",
+                &serde_json::json!({"file_path": "src/app.rs"}),
+                Path::new("/repo")
+            ),
+            "Edit(src/*)"
+        );
+        assert_eq!(
+            suggested_rule(
+                "Write",
+                &serde_json::json!({"file_path": "/repo/config/x.toml"}),
+                Path::new("/repo")
+            ),
+            "Write(config/*)"
+        );
+    }
+
+    #[test]
+    fn outside_cwd_grants_are_the_exact_approved_file() {
+        // opencode #52715: the old fallback here was the bare tool name — a
+        // global standing grant, the exact widening the upstream issue
+        // reports. The tightest possible spec is the approved file itself.
+        assert_eq!(
+            suggested_rule(
+                "Edit",
+                &serde_json::json!({"file_path": "/tmp/x"}),
+                Path::new("/repo")
+            ),
+            "Edit(/tmp/x)"
+        );
+        // No path at all (non-path tools): unchanged loosest fallback.
+        assert_eq!(
+            suggested_rule(
+                "Fetch",
+                &serde_json::json!({"url": "https://example.invalid"}),
+                Path::new("/repo")
+            ),
+            "Fetch"
+        );
+    }
+
+    /// #52715 in behavior terms: a minted outside-cwd grant approves the one
+    /// file the user saw and nothing else — not its neighbors, not the tool.
+    #[test]
+    fn an_outside_cwd_session_grant_is_exact_wide() {
+        let eng = |mode: Mode, deny: &[&str]| {
+            PermissionEngine::new(
+                mode,
+                deny.iter().map(|s| s.to_string()).collect(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let engine = eng(Mode::Default, &[]);
+        let grants = vec!["Edit(/tmp/approved.txt)".to_string()];
+        let cwd = Path::new("/repo");
+        let roots = vec![PathBuf::from("/repo")];
+        let approved = engine.check(
+            "Edit",
+            &serde_json::json!({"file_path": "/tmp/approved.txt"}),
+            cwd,
+            &roots,
+            &grants,
+        );
+        assert!(
+            matches!(approved, Decision::Allow),
+            "the approved file itself: {approved:?}"
+        );
+        let neighbor = engine.check(
+            "Edit",
+            &serde_json::json!({"file_path": "/tmp/neighbor.txt"}),
+            cwd,
+            &roots,
+            &grants,
+        );
+        assert!(
+            matches!(neighbor, Decision::Ask(_)),
+            "a sibling file must not ride along on the grant: {neighbor:?}"
+        );
+    }
+
+    /// codex #50302/#50279: with the skip-permissions mode on, every tool and
+    /// path — including ones the engine has never heard of, like MCP-delivered
+    /// tools — flows without a prompt. The only survivors are the hard floors:
+    /// deny rules and the catastrophic-command check.
+    #[test]
+    fn auto_mode_skips_every_prompt_except_the_hard_floors() {
+        let eng = |deny: &[&str]| {
+            PermissionEngine::new(
+                Mode::Auto,
+                deny.iter().map(|s| s.to_string()).collect(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let engine = eng(&[]);
+        let cwd = Path::new("/repo");
+        let roots = vec![PathBuf::from("/repo")];
+        for (tool, input) in [
+            ("Read", serde_json::json!({"file_path": "/etc/hosts"})),
+            ("Edit", serde_json::json!({"file_path": "src/x.rs"})),
+            (
+                "mcp__github__create_issue",
+                serde_json::json!({"title": "hello"}),
+            ),
+            ("Bash", serde_json::json!({"command": "cargo build"})),
+            (
+                "Bash",
+                serde_json::json!({"command": "FOO=1 cargo build -- --force"}),
+            ),
+        ] {
+            let d = engine.check(tool, &input, cwd, &roots, &[]);
+            assert!(
+                matches!(d, Decision::Allow),
+                "auto must not stop on {tool} {input}: {d:?}"
+            );
+        }
+        // The floors survive full access.
+        let boom = engine.check(
+            "Bash",
+            &serde_json::json!({"command": "rm -rf /"}),
+            cwd,
+            &roots,
+            &[],
+        );
+        assert!(matches!(boom, Decision::Deny(_)));
+        let denied = eng(&["Read(./.env)"]);
+        let d = denied.check(
+            "Read",
+            &serde_json::json!({"file_path": ".env"}),
+            cwd,
+            &roots,
+            &[],
+        );
+        assert!(matches!(d, Decision::Deny(_)), "deny rules outrank auto");
     }
 }
