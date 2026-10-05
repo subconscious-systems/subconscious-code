@@ -9,9 +9,13 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 - MCP server support. Configure servers in the `mcpServers` settings block
   (the Claude Code shape) or with `--mcp-config`; stdio and streamable HTTP
-  servers are supported. Their tools appear as `mcp__<server>__<tool>`, follow
-  the permission rules, and work in headless `-p` runs. `/mcp` lists each
-  server's state and tools. See `docs/CONFIGURATION.md`.
+  servers are supported. Their tools appear as `mcp__<server>__<tool>` and
+  follow the permission rules; a headless `-p` run needs an allow rule such
+  as `mcp__<server>`. Project-level servers start only for trusted projects
+  (`--trust-project-mcp` or `trustedMcpProjects`). Servers get a minimal
+  environment, run outside the `Bash` sandbox, and are stopped with their
+  whole process tree at exit. `/mcp` lists each server's state and tools.
+  See `docs/CONFIGURATION.md`.
 
 ### Changed
 

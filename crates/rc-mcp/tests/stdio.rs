@@ -22,6 +22,8 @@ fn fixture(name: &str, env: &[(&str, &str)]) -> ServerConfig {
                 .collect::<BTreeMap<_, _>>(),
             cwd: None,
         },
+        display: format!("stdio: fixture {name}"),
+        secrets: Vec::new(),
         startup_timeout: Duration::from_secs(20),
         tool_timeout: Duration::from_secs(5),
     }
@@ -57,7 +59,7 @@ fn text(outcome: ToolOutcome) -> (bool, String) {
 
 #[tokio::test]
 async fn tools_are_listed_namespaced_and_callable() {
-    let hub = McpHub::connect(vec![fixture("fx", &[])], Vec::new()).await;
+    let hub = McpHub::connect(vec![fixture("fx", &[])], Vec::new(), Vec::new()).await;
     let mut names: Vec<String> = hub.tools().iter().map(|t| t.name().to_string()).collect();
     names.sort();
     assert_eq!(
@@ -65,7 +67,9 @@ async fn tools_are_listed_namespaced_and_callable() {
         [
             "mcp__fx__crash",
             "mcp__fx__echo",
+            "mcp__fx__env",
             "mcp__fx__fail",
+            "mcp__fx__family",
             "mcp__fx__sleep"
         ]
     );
@@ -90,7 +94,7 @@ async fn tools_are_listed_namespaced_and_callable() {
 
 #[tokio::test]
 async fn a_crashed_server_reports_errors_instead_of_failing_the_session() {
-    let hub = McpHub::connect(vec![fixture("fx", &[])], Vec::new()).await;
+    let hub = McpHub::connect(vec![fixture("fx", &[])], Vec::new(), Vec::new()).await;
     let (ok, _) = text(
         tool(&hub, "mcp__fx__crash")
             .call(json!({}), &ctx())
@@ -132,11 +136,14 @@ async fn a_server_that_cannot_start_is_reported_and_others_still_work() {
                     env: BTreeMap::new(),
                     cwd: None,
                 },
+                display: "stdio: rc-mcp-no-such-binary".into(),
+                secrets: Vec::new(),
                 startup_timeout: Duration::from_secs(5),
                 tool_timeout: Duration::from_secs(5),
             },
         ],
         vec![("typo".into(), "unknown field `comand`".into())],
+        Vec::new(),
     )
     .await;
 
@@ -145,7 +152,7 @@ async fn a_server_that_cannot_start_is_reported_and_others_still_work() {
         names.iter().all(|n| n.starts_with("mcp__good__")),
         "{names:?}"
     );
-    assert_eq!(names.len(), 4);
+    assert_eq!(names.len(), 6);
 
     let status = hub.status();
     let by_name = |n: &str| status.iter().find(|s| s.name == n).unwrap().state.clone();
@@ -165,7 +172,7 @@ async fn a_server_that_cannot_start_is_reported_and_others_still_work() {
 async fn slow_calls_time_out_and_cancellation_interrupts() {
     let mut config = fixture("fx", &[]);
     config.tool_timeout = Duration::from_millis(300);
-    let hub = McpHub::connect(vec![config], Vec::new()).await;
+    let hub = McpHub::connect(vec![config], Vec::new(), Vec::new()).await;
     let sleep = tool(&hub, "mcp__fx__sleep");
 
     let (ok, body) = text(sleep.call(json!({"ms": 3000}), &ctx()).await.unwrap());
@@ -176,4 +183,124 @@ async fn slow_calls_time_out_and_cancellation_interrupts() {
     cancelled.cancel.cancel();
     let outcome = sleep.call(json!({"ms": 3000}), &cancelled).await.unwrap();
     assert!(matches!(outcome, ToolOutcome::Interrupted), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn servers_get_only_the_allowlisted_environment() {
+    std::env::set_var("RC_MCP_TEST_PARENT_SECRET", "must-not-leak");
+    let hub = McpHub::connect(
+        vec![fixture("fx", &[("FIXTURE_CONFIGURED", "yes")])],
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    let (ok, names) = text(
+        tool(&hub, "mcp__fx__env")
+            .call(json!({}), &ctx())
+            .await
+            .unwrap(),
+    );
+    assert!(ok, "{names}");
+    let names: Vec<&str> = names.lines().collect();
+    assert!(!names.contains(&"RC_MCP_TEST_PARENT_SECRET"), "{names:?}");
+    assert!(names.contains(&"FIXTURE_CONFIGURED"), "{names:?}");
+    assert!(
+        names.iter().any(|n| n.eq_ignore_ascii_case("PATH")),
+        "{names:?}"
+    );
+    #[cfg(windows)]
+    assert!(
+        names.iter().any(|n| n.eq_ignore_ascii_case("SystemRoot")),
+        "{names:?}"
+    );
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn substituted_secrets_never_appear_in_status_or_problems() {
+    let mut config = fixture(
+        "leaky",
+        &[
+            ("FIXTURE_EXIT_EARLY", "1"),
+            ("FIXTURE_STDERR", "auth failed for tok-9f8e7d6c"),
+        ],
+    );
+    config.display = "stdio: fixture --token ${API_TOKEN}".into();
+    config.secrets = vec!["tok-9f8e7d6c".into()];
+    let hub = McpHub::connect(vec![config], Vec::new(), Vec::new()).await;
+    let shown = format!(
+        "{}\n{}",
+        hub.report_lines().join("\n"),
+        hub.problems().join("\n")
+    );
+    assert!(!shown.contains("tok-9f8e7d6c"), "{shown}");
+    assert!(shown.contains("${API_TOKEN}"), "{shown}");
+    assert!(shown.contains("auth failed for ***"), "{shown}");
+}
+
+#[tokio::test]
+async fn untrusted_servers_are_listed_but_not_started() {
+    let hub = McpHub::connect(
+        Vec::new(),
+        Vec::new(),
+        vec![("project-srv".into(), "project server not trusted".into())],
+    )
+    .await;
+    assert!(hub.tools().is_empty());
+    assert!(matches!(hub.status()[0].state, ServerState::Skipped { .. }));
+    assert!(hub
+        .report_lines()
+        .join("\n")
+        .contains("project-srv  not started"));
+}
+
+#[tokio::test]
+async fn shutdown_kills_the_server_and_its_children() {
+    let hub = McpHub::connect(vec![fixture("fx", &[])], Vec::new(), Vec::new()).await;
+    let (ok, pids) = text(
+        tool(&hub, "mcp__fx__family")
+            .call(json!({}), &ctx())
+            .await
+            .unwrap(),
+    );
+    assert!(ok, "{pids}");
+    let pids: Vec<u32> = pids
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect();
+    assert!(
+        pids.iter().all(|&pid| alive(pid)),
+        "{pids:?} should be running"
+    );
+
+    hub.shutdown().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pids.iter().any(|&pid| alive(pid)) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        pids.iter().all(|&pid| !alive(pid)),
+        "{pids:?} survived shutdown"
+    );
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    // A killed grandchild stays a zombie until init reaps it; `ps` shows `Z`.
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let stat = String::from_utf8_lossy(&out.stdout);
+    out.status.success() && !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+}
+
+#[cfg(windows)]
+fn alive(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .expect("tasklist");
+    String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
 }

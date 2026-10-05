@@ -144,10 +144,10 @@ impl Tool for McpTool {
                     self.server.mark_closed();
                     return Ok(ToolOutcome::error(self.server.unavailable_reason()));
                 }
-                Ok(ToolOutcome::error(format!(
+                Ok(ToolOutcome::error(self.server.scrub(&format!(
                     "MCP tool `{}` on server `{}` failed: {error}",
                     self.remote_name, self.server.name
-                )))
+                ))))
             }
             Ok(Ok(result)) => {
                 let text = render_result(&result);

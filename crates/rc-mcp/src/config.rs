@@ -28,6 +28,12 @@ pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct ServerConfig {
     pub name: String,
     pub transport: Transport,
+    /// The transport as written in the config, before `${VAR}` expansion, so
+    /// `/mcp` and error messages never show a substituted secret.
+    pub display: String,
+    /// Every value substituted for a `${VAR}`. Server errors and stderr are
+    /// scrubbed of these before they are shown or logged.
+    pub secrets: Vec<String>,
     pub startup_timeout: Duration,
     pub tool_timeout: Duration,
 }
@@ -117,7 +123,12 @@ fn parse_server(
     if raw.disabled {
         return Ok(None);
     }
-    let expand = |s: &str| expand_vars(s, lookup);
+    let secrets = std::cell::RefCell::new(Vec::new());
+    let expand = |s: &str| -> Result<String, String> {
+        let (expanded, substituted) = expand_vars_tracked(s, lookup)?;
+        secrets.borrow_mut().extend(substituted);
+        Ok(expanded)
+    };
     let kind = match (raw.kind.as_deref(), &raw.command, &raw.url) {
         (Some(kind), _, _) => kind.to_ascii_lowercase(),
         (None, Some(_), None) => "stdio".into(),
@@ -149,9 +160,12 @@ fn parse_server(
             if raw.command.is_some() || !raw.args.is_empty() || !raw.env.is_empty() {
                 return Err("an http server takes `url`, not `command`/`args`/`env`".into());
             }
-            let url = expand(raw.url.as_deref().ok_or("an http server needs a `url`")?)?;
+            let written = raw.url.as_deref().ok_or("an http server needs a `url`")?;
+            let url = expand(written)?;
             if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err(format!("`url` must start with http:// or https://, got {url:?}"));
+                return Err(format!(
+                    "`url` must start with http:// or https://, got {written:?}"
+                ));
             }
             Transport::Http {
                 url,
@@ -170,9 +184,28 @@ fn parse_server(
         }
         other => return Err(format!("unknown transport {other:?} (use stdio or http)")),
     };
+    let display = match &transport {
+        Transport::Stdio { .. } => {
+            let mut line = format!("stdio: {}", raw.command.as_deref().unwrap_or_default());
+            for arg in &raw.args {
+                line.push(' ');
+                line.push_str(arg);
+            }
+            line
+        }
+        Transport::Http { .. } => format!("http: {}", raw.url.as_deref().unwrap_or_default()),
+    };
+    let mut secrets = secrets.into_inner();
+    // Short values (a port, `1`) would scrub unrelated text; they are also not
+    // credentials worth hiding.
+    secrets.retain(|value| value.len() >= MIN_SECRET_LEN);
+    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    secrets.dedup();
     Ok(Some(ServerConfig {
         name: name.to_string(),
         transport,
+        display,
+        secrets,
         startup_timeout: raw
             .startup_timeout_ms
             .map(Duration::from_millis)
@@ -207,6 +240,15 @@ fn validate_name(name: &str) -> Result<(), String> {
 /// An unset variable without a default is an error, so a missing secret fails
 /// the server loudly instead of sending an empty credential.
 pub fn expand_vars(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    expand_vars_tracked(input, lookup).map(|(expanded, _)| expanded)
+}
+
+/// [`expand_vars`], also returning each value taken from the environment.
+fn expand_vars_tracked(
+    input: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    let mut substituted = Vec::new();
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("${") {
@@ -221,14 +263,31 @@ pub fn expand_vars(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Resu
             None => (expr, None),
         };
         match (lookup(var).filter(|v| !v.is_empty()), default) {
-            (Some(value), _) => out.push_str(&value),
+            (Some(value), _) => {
+                out.push_str(&value);
+                substituted.push(value);
+            }
             (None, Some(default)) => out.push_str(default),
             (None, None) => return Err(format!("environment variable {var} is not set")),
         }
         rest = &after[end + 1..];
     }
     out.push_str(rest);
-    Ok(out)
+    Ok((out, substituted))
+}
+
+/// Substituted values shorter than this are not scrubbed from messages.
+const MIN_SECRET_LEN: usize = 4;
+
+/// Replace every secret in `text` with `***`.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if !secret.is_empty() {
+            out = out.replace(secret.as_str(), "***");
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -239,6 +298,7 @@ mod tests {
     fn env(name: &str) -> Option<String> {
         match name {
             "TOKEN" => Some("t0k".into()),
+            "TOKEN_LONG" => Some("s3cret-value".into()),
             "EMPTY" => Some(String::new()),
             _ => None,
         }
@@ -314,6 +374,32 @@ mod tests {
             ]
         );
         assert!(errors.iter().any(|(_, e)| e.contains("UNSET_SECRET")));
+    }
+
+    #[test]
+    fn display_is_unexpanded_and_secrets_are_tracked() {
+        let (servers, _) = parse(json!({
+            "web": {"url": "https://e.com/mcp?key=${TOKEN_LONG}", "headers": {"A": "Bearer ${TOKEN_LONG}"}},
+            "cli": {"command": "srv", "args": ["--key", "${TOKEN_LONG}"]},
+        }));
+        let web = servers.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.display, "http: https://e.com/mcp?key=${TOKEN_LONG}");
+        assert_eq!(web.secrets, ["s3cret-value"]);
+        let cli = servers.iter().find(|s| s.name == "cli").unwrap();
+        assert_eq!(cli.display, "stdio: srv --key ${TOKEN_LONG}");
+        assert_eq!(
+            redact(
+                "GET https://e.com/mcp?key=s3cret-value failed",
+                &web.secrets
+            ),
+            "GET https://e.com/mcp?key=*** failed"
+        );
+    }
+
+    #[test]
+    fn short_substitutions_are_not_treated_as_secrets() {
+        let (servers, _) = parse(json!({"s": {"command": "x", "args": ["${TOKEN}"]}}));
+        assert!(servers[0].secrets.is_empty());
     }
 
     #[test]

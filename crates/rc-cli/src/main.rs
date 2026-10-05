@@ -133,6 +133,12 @@ struct Cli {
     #[arg(long = "strict-mcp-config", requires = "mcp_config")]
     strict_mcp_config: bool,
 
+    /// Start the MCP servers in this project's `.sc/settings.json`. Without
+    /// it, project servers start only if `trustedMcpProjects` in
+    /// ~/.sc/settings.json lists this directory.
+    #[arg(long = "trust-project-mcp")]
+    trust_project_mcp: bool,
+
     /// Verify the endpoint before trusting it: config, non-streaming, streaming,
     /// and tool-call support. Exits non-zero if a check fails. Run as
     /// `marathon doctor` (see [`Command::Doctor`).
@@ -298,11 +304,13 @@ async fn run(cli: Cli) -> Result<()> {
     let caps = settings.context;
     // MCP servers connect before the registry is built so the tool set is
     // fixed for the whole session (see rc-mcp).
-    let mcp_hub = mcp::connect(mcp::collect(
-        &settings.mcp_servers,
-        &cli.mcp_config,
-        cli.strict_mcp_config,
-    )?)
+    let mcp_hub = mcp::connect(mcp::collect(mcp::Sources {
+        user: &settings.mcp_servers,
+        project: &settings.project_mcp_servers,
+        project_trusted: settings.project_mcp_trusted || cli.trust_project_mcp,
+        mcp_configs: &cli.mcp_config,
+        strict: cli.strict_mcp_config,
+    })?)
     .await;
     let mcp_report: rc_tui::McpReport = {
         let hub = mcp_hub.clone();
@@ -435,7 +443,7 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(prompt) = cli.print.filter(|p| !p.is_empty()) {
         let session_store =
             headless_session_store(&session, session_path.as_deref(), &sessions_dir)?;
-        return run_headless(
+        let result = run_headless(
             build_agent(&session, &api_key, &settings)?,
             session,
             session_store,
@@ -444,6 +452,8 @@ async fn run(cli: Cli) -> Result<()> {
             cli.benchmark_trajectory,
         )
         .await;
+        mcp_hub.shutdown().await;
+        return result;
     }
 
     // Interactive TUI (M4) with persistence (M5), in a loop so `/menu` can
@@ -455,7 +465,7 @@ async fn run(cli: Cli) -> Result<()> {
         // Kept for the reload path, which needs them after `session` has moved
         // into the TUI.
         let session_id = session.id.clone();
-        let next = run_tui(
+        let next = match run_tui(
             Arc::new(build_agent(&session, &api_key, &settings)?),
             session,
             model_name,
@@ -467,8 +477,18 @@ async fn run(cli: Cli) -> Result<()> {
                 mcp_report: mcp_report.clone(),
             },
         )
-        .await?;
-        let Some(next) = next else { return Ok(()) };
+        .await
+        {
+            Ok(next) => next,
+            Err(error) => {
+                mcp_hub.shutdown().await;
+                return Err(error);
+            }
+        };
+        let Some(next) = next else {
+            mcp_hub.shutdown().await;
+            return Ok(());
+        };
         // A reload re-enters the *same* session, so it restores that session's
         // own mode exactly as a resume does.
         let reload_settings = matches!(&next, rc_tui::Outcome::Reload);

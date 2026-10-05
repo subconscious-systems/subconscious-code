@@ -5,6 +5,8 @@
 //! - `fail`         returns an `isError` result
 //! - `crash`        exits the process mid-call
 //! - `sleep {ms}`   answers after a delay
+//! - `env`          lists the variable names it was started with
+//! - `family`       starts a long-lived grandchild and returns `<pid> <grandchild pid>`
 //!
 //! `FIXTURE_STDERR` is written to stderr at startup, and `FIXTURE_EXIT_EARLY=1`
 //! exits before initializing, so tests can check startup failures.
@@ -13,6 +15,10 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--sleep") {
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        return;
+    }
     if let Ok(text) = std::env::var("FIXTURE_STDERR") {
         eprintln!("{text}");
     }
@@ -42,6 +48,8 @@ fn main() {
                  "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
                 {"name": "fail", "description": "Always reports an error.", "inputSchema": {"type": "object"}},
                 {"name": "crash", "description": "Exits the server.", "inputSchema": {}},
+                {"name": "env", "description": "Lists environment variable names.", "inputSchema": {"type": "object"}},
+                {"name": "family", "description": "Starts a grandchild.", "inputSchema": {"type": "object"}},
                 {"name": "sleep", "description": "Waits, then answers.",
                  "inputSchema": {"type": "object", "properties": {"ms": {"type": "integer"}}}},
             ]}),
@@ -57,6 +65,30 @@ fn main() {
                     "crash" => {
                         eprintln!("fixture crashing on purpose");
                         std::process::exit(7);
+                    }
+                    "env" => {
+                        let mut names: Vec<String> = std::env::vars_os()
+                            .map(|(k, _)| k.to_string_lossy().into_owned())
+                            .collect();
+                        names.sort();
+                        json!({"content": [{"type": "text", "text": names.join("\n")}]})
+                    }
+                    "family" => {
+                        let exe = std::env::current_exe().expect("fixture path");
+                        let mut grandchild = std::process::Command::new(exe)
+                            .arg("--sleep")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .expect("spawn grandchild");
+                        let grandchild_pid = grandchild.id();
+                        // Reaped here if it ever exits; the test kills it.
+                        std::thread::spawn(move || {
+                            let _ = grandchild.wait();
+                        });
+                        json!({"content": [{"type": "text",
+                            "text": format!("{} {grandchild_pid}", std::process::id())}]})
                     }
                     "sleep" => {
                         let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);

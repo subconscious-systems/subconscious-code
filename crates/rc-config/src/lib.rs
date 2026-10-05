@@ -127,12 +127,19 @@ pub struct Settings {
     /// copies on release while captured; Ctrl+O releases the mouse when native
     /// terminal selection is preferred.
     pub mouse: bool,
-    /// MCP servers from the `mcpServers` block, keyed by server name. Layers
-    /// merge per name: a project entry replaces a user entry of the same name,
-    /// and `null` removes an inherited one. Values stay raw JSON here; rc-mcp
-    /// parses and validates them, so a bad entry fails that one server rather
-    /// than the whole settings load.
+    /// MCP servers from the user-level `mcpServers` block, keyed by name.
+    /// Values stay raw JSON; rc-mcp parses and validates them, so a bad entry
+    /// fails that one server rather than the whole settings load.
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
+    /// The project-level `mcpServers` block. A checked-out repository chooses
+    /// these, so they start only after the user trusts the project (see
+    /// [`Settings::project_mcp_trusted`]); until then they are never parsed
+    /// or `${VAR}`-expanded. `null` entries remove a user-level server.
+    pub project_mcp_servers: BTreeMap<String, serde_json::Value>,
+    /// Whether the user-level `trustedMcpProjects` list names this project.
+    /// A project file cannot trust itself: the list is read from user settings
+    /// only.
+    pub project_mcp_trusted: bool,
 }
 
 /// The `permissions` block (§7.1/§10.2). Rule strings are parsed by rc-perm.
@@ -233,6 +240,10 @@ struct SettingsFile {
     /// be pasted in unchanged.
     #[serde(rename = "mcpServers", alias = "mcp_servers")]
     mcp_servers: Option<BTreeMap<String, serde_json::Value>>,
+    /// Project directories whose `mcpServers` may start. Honored only in the
+    /// user settings file.
+    #[serde(rename = "trustedMcpProjects", alias = "trusted_mcp_projects")]
+    trusted_mcp_projects: Option<Vec<String>>,
 }
 
 /// The `ui` block: terminal-interaction preferences.
@@ -349,13 +360,18 @@ impl Settings {
         // native selection whenever that is preferable.
         let mut mouse = true;
         let mut mcp_servers: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut project_mcp_servers: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut trusted_mcp_projects: Vec<String> = Vec::new();
+        let user_path = user_settings_path();
 
         // Later layers override earlier ones. User before project so a
         // committed project file beats a user global — matches §10.1 (project
         // is higher precedence than user).
         let layers: Vec<Option<PathBuf>> =
-            vec![user_settings_path(), project_settings_path(project_dir)];
+            vec![user_path.clone(), project_settings_path(project_dir)];
         for path in layers.into_iter().flatten() {
+            // Launched from `~`, the project file is the user file itself.
+            let user_layer = user_path.as_deref() == Some(path.as_path());
             match read_settings(&path) {
                 Ok(file) => {
                     if let Some(warning) = scan_for_secret(&path) {
@@ -429,7 +445,16 @@ impl Settings {
                         context = c;
                     }
                     if let Some(servers) = file.mcp_servers {
-                        merge_mcp_servers(&mut mcp_servers, servers);
+                        if user_layer {
+                            merge_mcp_servers(&mut mcp_servers, servers);
+                        } else {
+                            project_mcp_servers = servers;
+                        }
+                    }
+                    if user_layer {
+                        if let Some(trusted) = file.trusted_mcp_projects {
+                            trusted_mcp_projects = trusted;
+                        }
                     }
                 }
                 Err(e) => report.warnings.push(e),
@@ -639,6 +664,9 @@ impl Settings {
             dlr_repair_margin_pct,
             mouse,
             mcp_servers,
+            project_mcp_trusted: project_mcp_servers.is_empty()
+                || is_trusted_project(project_dir, &trusted_mcp_projects),
+            project_mcp_servers,
         }
     }
 
@@ -700,6 +728,24 @@ fn merge_mcp_servers(
             into.insert(name, value);
         }
     }
+}
+
+/// Whether `project` is in the user's `trustedMcpProjects` list, comparing
+/// canonical paths so `~/repo`, `./repo` and symlinks agree.
+fn is_trusted_project(project: &Path, trusted: &[String]) -> bool {
+    let Ok(project) = std::fs::canonicalize(project) else {
+        return false;
+    };
+    trusted.iter().any(|entry| {
+        let entry = match entry.strip_prefix("~/") {
+            Some(rest) => match user_dir().as_deref().and_then(Path::parent) {
+                Some(home) => home.join(rest),
+                None => return false,
+            },
+            None => PathBuf::from(entry),
+        };
+        std::fs::canonicalize(entry).is_ok_and(|entry| entry == project)
+    })
 }
 
 /// Parse a bool env var: `1`/`true`/`yes`/on (case-insensitive) → true, `0`/`false`/`no`/off → false.
@@ -872,6 +918,18 @@ mod tests {
             serde_json::from_str(r#"{"mcp_servers": {"fs": {"command": "fs-server"}}}"#).unwrap();
         assert_eq!(camel.mcp_servers, snake.mcp_servers);
         assert_eq!(camel.mcp_servers.unwrap()["fs"]["command"], "fs-server");
+    }
+
+    #[test]
+    fn project_mcp_trust_comes_from_the_user_list_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("repo");
+        std::fs::create_dir(&project).unwrap();
+        let listed = vec![project.display().to_string()];
+        assert!(is_trusted_project(&project, &listed));
+        assert!(is_trusted_project(&project.join("."), &listed));
+        assert!(!is_trusted_project(&project, &[]));
+        assert!(!is_trusted_project(&dir.path().join("other"), &listed));
     }
 
     #[test]

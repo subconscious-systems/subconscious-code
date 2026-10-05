@@ -10,7 +10,7 @@ rc-core = { path = "../rc-core" }
 # The official Rust MCP SDK. TLS comes from the workspace's existing rustls +
 # ring stack (`reqwest-tls-no-provider`), so no second crypto provider and no
 # C toolchain enter the build.
-rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+rmcp = { version = "3.5", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 http = "1"
 which = "8"
 serde.workspace = true
@@ -19,6 +19,9 @@ tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 blake3.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

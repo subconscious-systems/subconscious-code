@@ -11,8 +11,9 @@
 
 pub mod config;
 mod hub;
+mod process;
 mod tool;
 
-pub use config::{env_lookup, parse_servers, ServerConfig, Transport};
-pub use hub::{McpHub, ServerState, ServerStatus};
+pub use config::{env_lookup, parse_servers, redact, ServerConfig, Transport};
+pub use hub::{McpHub, ServerState, ServerStatus, Skipped};
 pub use tool::tool_wire_name;
