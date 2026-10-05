@@ -701,6 +701,15 @@ impl AgentLoop {
         prompter: &dyn Prompter,
         cancel: CancellationToken,
     ) -> Result<LoopOutcome, LoopError> {
+        // opencode #52452: a crash or kill between an assistant tool-call turn
+        // and its results leaves unpaired `tool_calls` in the loaded history.
+        // OpenAI-compatible gateways reject the very next request then
+        // ("'messages' … must end with tool messages responding to tool_calls"),
+        // so resuming `-c` out of a crashed session would be stuck forever.
+        // Repair before anything else: synthesize `Interrupted` results for
+        // every unanswered call so the replayed request stays valid. A cheap,
+        // idempotent scan over intact history.
+        repair_unpaired_tool_calls(session, sink);
         push_turn(
             session,
             sink,
@@ -1043,9 +1052,7 @@ impl AgentLoop {
             // it repeated: the infinite empty-turn loop. Treat it as a
             // recoverable protocol failure with a bounded budget instead, and
             // keep any streamed text in history.
-            if assistant_calls.is_empty()
-                && matches!(finish_reason, FinishReason::ToolCalls)
-            {
+            if assistant_calls.is_empty() && matches!(finish_reason, FinishReason::ToolCalls) {
                 tracing::warn!(
                     "finish_reason=tool_calls with no tool-call data; \
                      asking the model to reissue"
@@ -1063,9 +1070,7 @@ impl AgentLoop {
                     },
                 );
                 if empty_tool_call_recoveries_used >= MAX_EMPTY_TOOL_CALL_RECOVERIES_PER_TURN {
-                    tracing::warn!(
-                        "repeated empty finish_reason=tool_calls; ending the turn"
-                    );
+                    tracing::warn!("repeated empty finish_reason=tool_calls; ending the turn");
                     return Ok(LoopOutcome::Incomplete);
                 }
                 empty_tool_call_recoveries_used += 1;
@@ -1325,29 +1330,29 @@ impl AgentLoop {
                     if let Some(key) = batch_keys.get(call_id.as_str()) {
                         match &result {
                             ToolResultBody::Error { message, .. }
-                            | ToolResultBody::Denied { reason: message } => match failing_repeat
-                                .get_mut(key)
-                            {
-                                Some(entry) if entry.last_error == *message => {
-                                    entry.failures = entry.failures.saturating_add(1);
+                            | ToolResultBody::Denied { reason: message } => {
+                                match failing_repeat.get_mut(key) {
+                                    Some(entry) if entry.last_error == *message => {
+                                        entry.failures = entry.failures.saturating_add(1);
+                                    }
+                                    Some(entry) => {
+                                        // A different failure is new information:
+                                        // the pattern restarts from this failure.
+                                        entry.failures = 1;
+                                        entry.last_error = message.clone();
+                                    }
+                                    None => {
+                                        failing_repeat.insert(
+                                            key.clone(),
+                                            RepeatFailure {
+                                                failures: 1,
+                                                last_error: message.clone(),
+                                                refused: false,
+                                            },
+                                        );
+                                    }
                                 }
-                                Some(entry) => {
-                                    // A different failure is new information:
-                                    // the pattern restarts from this failure.
-                                    entry.failures = 1;
-                                    entry.last_error = message.clone();
-                                }
-                                None => {
-                                    failing_repeat.insert(
-                                        key.clone(),
-                                        RepeatFailure {
-                                            failures: 1,
-                                            last_error: message.clone(),
-                                            refused: false,
-                                        },
-                                    );
-                                }
-                            },
+                            }
                             ToolResultBody::Interrupted => match failing_repeat.get_mut(key) {
                                 Some(entry) if entry.last_error == "interrupted" => {
                                     entry.failures = entry.failures.saturating_add(1);
@@ -1490,6 +1495,85 @@ fn synthesize_retryable_unconfirmed(
             },
         );
     }
+}
+
+/// The transcript note emitted after a resume-time repair, so both the model
+/// and a resumed UI understand why tool calls carry `interrupted` results.
+const RESUME_REPAIR_NOTE: &str = "This session resumed after the previous process died mid-turn; \
+     tool calls that never received results were answered with `interrupted` so the \
+     conversation remains valid. Re-issue any of them if they were load-bearing.";
+
+/// opencode #52452: synthesize [`ToolResultBody::Interrupted`] results for
+/// every assistant tool call that no longer has an answer, so map-replay stays
+/// valid after a hard crash (`kill -9`, a full crash, a dead laptop). Runs once
+/// at the top of every turn; over intact history it is a no-op, and after a
+/// repair the history is intact — so the scan is idempotent.
+///
+/// The scan respects contiguity: a call counts as answered only when a
+/// [`Turn::ToolResult`] for its id appears in the contiguous run of results
+/// that immediately follows its assistant turn. Missing results are inserted
+/// at the end of that run, in call order; mid-history orphans (possible only
+/// when the file already mixed corruption, which `load_with_report` truncates
+/// at) are repaired the same way so `verify_invariant` holds end to end.
+fn repair_unpaired_tool_calls(session: &mut Session, sink: &dyn EventSink) {
+    let inserts: Vec<(usize, ToolCall)> = {
+        let mut inserts = Vec::new();
+        let mut idx = 0usize;
+        while idx < session.messages.len() {
+            if let Turn::Assistant { calls, .. } = &session.messages[idx] {
+                if !calls.is_empty() {
+                    let mut answered: HashSet<&str> = HashSet::new();
+                    let mut tail = idx + 1;
+                    while let Some(Turn::ToolResult { call_id, .. }) = session.messages.get(tail) {
+                        answered.insert(call_id.as_str());
+                        tail += 1;
+                    }
+                    let missing: Vec<ToolCall> = calls
+                        .iter()
+                        .filter(|c| !answered.contains(c.id.as_str()))
+                        .cloned()
+                        .collect();
+                    // Ascending (pos, call) order; the apply loop below shifts
+                    // later positions by the number of inserts before them.
+                    for call in missing {
+                        inserts.push((tail, call));
+                    }
+                    idx = tail;
+                    continue;
+                }
+            }
+            idx += 1;
+        }
+        inserts
+    };
+    if inserts.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        calls = inserts.len(),
+        "repaired unpaired tool calls left by a crashed turn (synthesized Interrupted results)"
+    );
+    for (applied, (pos, call)) in inserts.into_iter().enumerate() {
+        let turn = Turn::ToolResult {
+            call_id: call.id,
+            tool: call.name,
+            result: ToolResultBody::Interrupted,
+            duration: Duration::ZERO,
+        };
+        session.messages.insert(pos + applied, turn.clone());
+        // Persistence seam: `on_turn` (only) queues the record to the session
+        // writer. No ToolStart/ToolEnd events fire — these tools never ran in
+        // this process and the UI must not render phantom invocations.
+        sink.on_turn(&turn);
+    }
+    push_turn(
+        session,
+        sink,
+        Turn::SystemNote {
+            kind: crate::turn::NoteKind::Recovery,
+            text: RESUME_REPAIR_NOTE.to_string(),
+        },
+    );
 }
 
 enum ExecItem {
@@ -2087,5 +2171,175 @@ mod investigation_tests {
             },
         ];
         assert!(!is_investigation_batch(&items, &reg));
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    //! opencode #52452: unpaired tool calls after a crash must never wedge the
+    //! next request (gateways 400 a `tool_calls` message with no results).
+    use super::*;
+    use crate::project::{project_with, verify_invariant};
+    use crate::turn::NoteKind;
+    use crate::NullSink;
+
+    fn assistant(calls: &[(&str, &str)]) -> Turn {
+        Turn::Assistant {
+            text: Arc::from(""),
+            reasoning: None,
+            calls: calls
+                .iter()
+                .map(|(id, name)| ToolCall {
+                    id: (*id).into(),
+                    name: (*name).into(),
+                    arguments: Arc::from("{}"),
+                })
+                .collect(),
+            usage: None,
+            cost: None,
+            trace: None,
+        }
+    }
+
+    fn answered(call_id: &str) -> Turn {
+        Turn::ToolResult {
+            call_id: call_id.into(),
+            tool: "Read".into(),
+            result: ToolResultBody::Ok {
+                content: "ok".into(),
+                truncated: false,
+            },
+            duration: Duration::ZERO,
+        }
+    }
+
+    fn interrupted_results(session: &Session) -> Vec<String> {
+        session
+            .messages
+            .iter()
+            .filter_map(|t| match t {
+                Turn::ToolResult {
+                    call_id,
+                    result: ToolResultBody::Interrupted,
+                    ..
+                } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn session_with(turns: Vec<Turn>) -> Session {
+        let mut session = Session::new("test".into(), "/repo".into(), "m".into());
+        session.messages = turns;
+        session
+    }
+
+    fn repairs_hold_on_the_wire(session: &Session) {
+        let wire = project_with(&session.messages, "you are a test");
+        assert!(
+            verify_invariant(&wire).is_ok(),
+            "repaired history must satisfy the tool-answer invariant: {:?}",
+            verify_invariant(&wire)
+        );
+    }
+
+    #[test]
+    fn answers_unpaired_tail_calls_from_a_crashed_session() {
+        let mut session = session_with(vec![
+            Turn::User {
+                content: "hi".into(),
+                ts: SystemTime::now(),
+            },
+            assistant(&[("c1", "Read"), ("c2", "Grep")]),
+        ]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(
+            interrupted_results(&session),
+            vec!["c1".to_string(), "c2".to_string()],
+            "both unanswered calls get Interrupted results, in call order"
+        );
+        assert!(
+            session.messages.iter().any(|t| matches!(
+                t,
+                Turn::SystemNote {
+                    kind: NoteKind::Recovery,
+                    ..
+                }
+            )),
+            "a recovery note explains the synthesized results"
+        );
+        repairs_hold_on_the_wire(&session);
+    }
+
+    #[test]
+    fn only_missing_ids_are_filled_after_partial_results() {
+        let mut session = session_with(vec![
+            assistant(&[("c1", "Read"), ("c2", "Grep")]),
+            answered("c1"),
+        ]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(interrupted_results(&session), vec!["c2".to_string()]);
+        // The intact result keeps its body; the inserted one lands right after
+        // the contiguous result run (assistant, r(c1), r(c2)) and before the note.
+        assert!(matches!(
+            &session.messages[1],
+            Turn::ToolResult { call_id, result: ToolResultBody::Ok { content, .. }, .. }
+                if call_id == "c1" && content.as_ref() == "ok"
+        ));
+        assert!(
+            matches!(&session.messages[2], Turn::ToolResult { call_id, .. } if call_id == "c2")
+        );
+        repairs_hold_on_the_wire(&session);
+    }
+
+    #[test]
+    fn intact_history_is_untouched_and_no_note_is_added() {
+        let turns = vec![assistant(&[("c1", "Read")]), answered("c1")];
+        let mut session = session_with(turns);
+        let before = session.messages.len();
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(
+            session.messages.len(),
+            before,
+            "nothing may be inserted over intact history"
+        );
+        assert!(interrupted_results(&session).is_empty());
+    }
+
+    #[test]
+    fn repair_is_idempotent_across_runs() {
+        let mut session = session_with(vec![assistant(&[("c1", "Read"), ("c2", "Bash")])]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        let after_first = session.messages.clone();
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(
+            session.messages.len(),
+            after_first.len(),
+            "a second repair must be a no-op"
+        );
+        repairs_hold_on_the_wire(&session);
+    }
+
+    #[test]
+    fn mid_history_orphan_before_a_later_user_turn_is_repaired_inline() {
+        // Crash shape with an extra twist: the orphaned turn sits mid-file
+        // behind a later user message (only possible for corrupted files that
+        // `load_with_report` already truncates at, or a hand-edited transcript)
+        // — the repair still preserves tool-answer contiguity.
+        let mut session = session_with(vec![
+            assistant(&[("orphan", "Read")]),
+            Turn::User {
+                content: "next prompt".into(),
+                ts: SystemTime::now(),
+            },
+            assistant(&[("c9", "Grep")]),
+            answered("c9"),
+        ]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(interrupted_results(&session), vec!["orphan".to_string()]);
+        assert!(
+            matches!(&session.messages[1], Turn::ToolResult { call_id, .. } if call_id == "orphan")
+        );
+        repairs_hold_on_the_wire(&session);
     }
 }
