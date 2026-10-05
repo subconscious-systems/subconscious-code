@@ -995,6 +995,58 @@ struct BenchmarkUsage {
     total_tokens: u64,
 }
 
+/// Where a run starts in its session. A `--continue` run loads every earlier
+/// turn and its usage, but its benchmark artifacts must describe only its own
+/// work, or a multi-step benchmark counts each earlier step again.
+#[derive(Clone)]
+struct InvocationStart {
+    message_count: usize,
+    usage: rc_proto::Usage,
+    cost: rc_core::Cost,
+}
+
+impl InvocationStart {
+    fn of(session: &Session) -> Self {
+        Self {
+            message_count: session.messages.len(),
+            usage: session.total_usage.clone(),
+            cost: session.total_cost,
+        }
+    }
+
+    /// The session as this run alone produced it.
+    fn view(&self, session: &Session) -> Session {
+        let mut view = session.clone();
+        view.messages = session.messages[self.message_count.min(session.messages.len())..].to_vec();
+        let total = &session.total_usage;
+        let cached = |usage: &rc_proto::Usage| {
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens)
+        };
+        view.total_usage = rc_proto::Usage {
+            prompt_tokens: total.prompt_tokens.saturating_sub(self.usage.prompt_tokens),
+            completion_tokens: total
+                .completion_tokens
+                .saturating_sub(self.usage.completion_tokens),
+            total_tokens: total.total_tokens.saturating_sub(self.usage.total_tokens),
+            prompt_tokens_details: total.prompt_tokens_details.as_ref().map(|_| {
+                rc_proto::wire::PromptTokensDetails {
+                    cached_tokens: cached(total).saturating_sub(cached(&self.usage)),
+                }
+            }),
+        };
+        view.total_cost = rc_core::Cost::from_micro_usd(
+            session
+                .total_cost
+                .as_micro_usd()
+                .saturating_sub(self.cost.as_micro_usd()),
+        );
+        view
+    }
+}
+
 fn build_benchmark_report(
     session: &Session,
     outcome: LoopOutcome,
@@ -1589,6 +1641,73 @@ mod benchmark_report_tests {
     }
 
     #[test]
+    fn resumed_run_reports_only_its_own_turns() {
+        let mut session = measured_session();
+        let start = InvocationStart::of(&session);
+        session.messages.push(user_turn("second step"));
+        let usage = rc_proto::Usage {
+            prompt_tokens: 500,
+            completion_tokens: 7,
+            total_tokens: 507,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 300 }),
+        };
+        session.total_usage.add(&usage);
+        session.total_cost.add(&Cost::from_micro_usd(11));
+        session.messages.push(Turn::Assistant {
+            text: Arc::from("second answer"),
+            reasoning: None,
+            calls: Vec::new(),
+            usage: Some(usage),
+            cost: Some(Cost::from_micro_usd(11)),
+            trace: Some(ModelTrace {
+                total_ms: 40,
+                ..ModelTrace::default()
+            }),
+        });
+
+        let view = start.view(&session);
+        let report = serde_json::to_value(build_benchmark_report(
+            &view,
+            LoopOutcome::Stop,
+            Duration::from_millis(60),
+        ))
+        .unwrap();
+        assert_eq!(report["request_count"], 1);
+        assert_eq!(report["tool_call_count"], 0);
+        assert_eq!(report["model_time_ms"], 40);
+        assert_eq!(report["usage"]["input_tokens"], 500);
+        assert_eq!(report["usage"]["cached_input_tokens"], 300);
+        assert_eq!(report["usage"]["output_tokens"], 7);
+        assert_eq!(report["usage"]["total_tokens"], 507);
+        assert_eq!(report["cost_micro_usd"], 11);
+
+        let trajectory =
+            build_benchmark_trajectory(&view, LoopOutcome::Stop, Duration::from_millis(60));
+        let messages: Vec<&str> = trajectory["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|step| step["message"].as_str())
+            .collect();
+        assert_eq!(messages, ["second step", "second answer"]);
+    }
+
+    #[test]
+    fn fresh_run_view_is_the_whole_session() {
+        let fresh = Session::new(
+            "fresh".to_string(),
+            PathBuf::from("/workspace"),
+            "subconscious/glm-5.2".to_string(),
+        );
+        let start = InvocationStart::of(&fresh);
+        let session = measured_session();
+        let view = start.view(&session);
+        assert_eq!(view.messages.len(), session.messages.len());
+        assert_eq!(view.total_usage.prompt_tokens, 120);
+        assert_eq!(view.total_cost.as_micro_usd(), 42);
+    }
+
+    #[test]
     fn report_is_published_at_requested_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/report.json");
@@ -2000,8 +2119,16 @@ impl HeadlessCheckpoint {
         // The dispatcher owns checkpoint I/O. Enqueuing a completed turn must
         // never park a Tokio runtime worker on slow artifact storage.
         let (sender, receiver) = std::sync::mpsc::channel();
+        let start = InvocationStart::of(&session);
         let thread = std::thread::spawn(move || {
-            checkpoint_worker(session, report_path, trajectory_path, started, receiver);
+            checkpoint_worker(
+                session,
+                start,
+                report_path,
+                trajectory_path,
+                started,
+                receiver,
+            );
         });
         Self {
             sender: std::sync::Mutex::new(Some(sender)),
@@ -2062,6 +2189,7 @@ impl Drop for HeadlessCheckpoint {
 
 fn checkpoint_worker(
     mut session: Session,
+    start: InvocationStart,
     report_path: Option<PathBuf>,
     trajectory_path: Option<PathBuf>,
     started: Instant,
@@ -2108,7 +2236,7 @@ fn checkpoint_worker(
                     if let Err(error) = publish_checkpoint(
                         report_path.as_deref(),
                         trajectory_path.as_deref(),
-                        &session,
+                        &start.view(&session),
                         LoopOutcome::Incomplete,
                         started.elapsed(),
                     ) {
@@ -2125,7 +2253,7 @@ fn checkpoint_worker(
                 let result = publish_checkpoint(
                     report_path.as_deref(),
                     trajectory_path.as_deref(),
-                    &session,
+                    &start.view(&session),
                     outcome,
                     started.elapsed(),
                 )
