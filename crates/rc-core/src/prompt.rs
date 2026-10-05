@@ -24,6 +24,9 @@ pub enum AskResponse {
     Deny(String),
 }
 
+// async_trait's generated wrapper carries its own #[must_use]; clippy 1.99+
+// reports it as double_must_use on code we do not write.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Prompter: Send + Sync {
     async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse;

@@ -40,7 +40,7 @@ the SHA-256 checksum. It does not publish anything.
 
 Settings, saved keys, history, global `AGENTS.md`, and sessions use
 `%USERPROFILE%\.sc` (with a `HOMEDRIVE`/`HOMEPATH` fallback). A Unix `HOME`
-environment variable is not required. Headless `-p` runs remain ephemeral.
+environment variable is not required. Headless `-p` runs save their sessions there too.
 `SC_*` variables and existing sessions are unchanged. The CLI keeps `subc sc`
 as an alias for `subc marathon`, but never falls back to `sc.exe` on Windows.
 The installer leaves any existing `sc.exe` untouched, including Windows' own

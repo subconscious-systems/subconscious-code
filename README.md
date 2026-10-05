@@ -223,7 +223,9 @@ A session is one conversation thread, appended to `~/.sc/sessions/<id>.jsonl` as
 it happens — one line per turn, flushed immediately, so a crash leaves a readable
 prefix rather than a corrupt file. `marathon --continue` reloads the newest one and
 restores its visible transcript, saved model, latest permission mode, and full
-request context before continuing. The wire format is in
+request context before continuing. Headless `-p` runs are saved the same way, so
+`marathon -p "next message" --continue` (or `--resume <path>`) carries a
+conversation forward one prompt at a time. The wire format is in
 [rc-session](#the-core-crates) below.
 
 The session ID also travels as `x-subconscious-code-session-id`, which groups
