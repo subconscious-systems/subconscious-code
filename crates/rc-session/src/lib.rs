@@ -706,7 +706,10 @@ mod tests {
         drop(store);
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(f, "{{\"type\":\"user\",\"content\":\"corrupt").unwrap();
             f.flush().unwrap();
             drop(f);
@@ -721,7 +724,9 @@ mod tests {
         // is itself fine — the file is simply treated as truncated there.
         let report = load_with_report(&path).unwrap();
         assert_eq!(report.session.messages.len(), 2);
-        assert!(matches!(&report.session.messages[1], Turn::Assistant { calls, .. } if calls.len() == 1));
+        assert!(
+            matches!(&report.session.messages[1], Turn::Assistant { calls, .. } if calls.len() == 1)
+        );
         assert!(
             !report
                 .session
@@ -925,7 +930,8 @@ mod tests {
         assert!(error.to_string().contains("another process"), "{error}");
 
         drop(first);
-        let _ = SessionStore::open_append(path).expect("the lock is released when the holder drops");
+        let _ =
+            SessionStore::open_append(path).expect("the lock is released when the holder drops");
     }
 
     /// A disk that accepts the line itself but fails on the newline — a

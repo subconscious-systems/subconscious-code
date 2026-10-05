@@ -875,7 +875,10 @@ mod tests {
             "a >{{64}}-byte line with no newline must overflow (fed {fed})"
         );
         // The buffer was dropped at the cap: memory does not keep growing.
-        assert!(dec.finish().is_empty(), "nothing left buffered after overflow");
+        assert!(
+            dec.finish().is_empty(),
+            "nothing left buffered after overflow"
+        );
     }
 
     /// A line that stays under the cap — even split across feeds with no
@@ -1008,9 +1011,9 @@ mod tests {
             "nameless call must fail with the specific error, got {evs:?}"
         );
         assert!(
-            !evs
-                .iter()
-                .any(|e| matches!(e, AgentStreamEvent::ToolCallReady { name, .. } if name.is_empty())),
+            !evs.iter().any(
+                |e| matches!(e, AgentStreamEvent::ToolCallReady { name, .. } if name.is_empty())
+            ),
             "no ready call with an empty name may reach the loop"
         );
     }
@@ -1070,7 +1073,8 @@ mod tests {
             .unwrap(),
         ));
         assert!(
-            !evs.iter().any(|e| matches!(e, AgentStreamEvent::ToolCallReady { .. })),
+            !evs.iter()
+                .any(|e| matches!(e, AgentStreamEvent::ToolCallReady { .. })),
             "no call may be fabricated from nothing"
         );
         let finishes: Vec<_> = evs

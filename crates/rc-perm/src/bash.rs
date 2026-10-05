@@ -162,13 +162,15 @@ fn write_redirect(tok: &str) -> Option<Redirect<'_>> {
     if let Some(rest) = b.strip_prefix("&>") {
         // `>&1` / `2>&2` is fd duplication when the word is all digits;
         // `&>file` / `>&file` redirects stdout+stderr to a file.
-        return Some(if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            Redirect::Dup
-        } else if rest.is_empty() {
-            Redirect::Next
-        } else {
-            Redirect::Attached(rest)
-        });
+        return Some(
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                Redirect::Dup
+            } else if rest.is_empty() {
+                Redirect::Next
+            } else {
+                Redirect::Attached(rest)
+            },
+        );
     }
     let rest = b.strip_prefix('>')?;
     if let Some(dst) = rest.strip_prefix('&') {
@@ -209,12 +211,8 @@ fn collect_redirect_targets(tokens: &[String]) -> Result<Vec<String>, ()> {
 /// A redirection target that is never a dangerous write. `2>/dev/null` is the
 /// canonical suppression idiom; whitelisting it in the permission engine
 /// keeps routine commands from asking.
-pub(crate) const BENIGN_REDIRECT_TARGETS: &[&str] = &[
-    "/dev/null",
-    "/dev/zero",
-    "/dev/stdout",
-    "/dev/stderr",
-];
+pub(crate) const BENIGN_REDIRECT_TARGETS: &[&str] =
+    &["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr"];
 
 /// Is `t` a target whose deletion (`rm -rf`) would be catastrophic: the
 /// filesystem root, anything absolute (over-refusal is intended — the raw
@@ -328,9 +326,10 @@ fn is_catastrophic_tokens(tokens: &[String]) -> bool {
         }
         // Any mkfs / mkfs.* filesystem builder.
         n if n == "mkfs" || n.starts_with("mkfs.") => true,
-        "dd" => tokens
-            .iter()
-            .any(|t| t.strip_prefix("of=").is_some_and(|v| v.starts_with("/dev/"))),
+        "dd" => tokens.iter().any(|t| {
+            t.strip_prefix("of=")
+                .is_some_and(|v| v.starts_with("/dev/"))
+        }),
         "chmod" => {
             let recursive = tokens.iter().any(|t| t == "-R" || t == "--recursive");
             recursive
@@ -390,8 +389,7 @@ fn normalize_for_raw_match(cmd: &str) -> String {
 
 /// Catastrophic commands are always denied, even in bypass mode.
 pub fn is_catastrophic(sub: &Sub) -> bool {
-    is_catastrophic_tokens(&sub.tokens)
-        || CATASTROPHIC_RAW.iter().any(|p| sub.raw.contains(p))
+    is_catastrophic_tokens(&sub.tokens) || CATASTROPHIC_RAW.iter().any(|p| sub.raw.contains(p))
 }
 
 /// Catastrophic commands checked against the raw command string — catches
@@ -431,7 +429,10 @@ pub fn is_always_ask(cmd: &str) -> bool {
             continue;
         };
         any_parsed = true;
-        if tokens.iter().any(|t| ALWAYS_ASK_TOKENS.contains(&t.as_str())) {
+        if tokens
+            .iter()
+            .any(|t| ALWAYS_ASK_TOKENS.contains(&t.as_str()))
+        {
             return true;
         }
         // A shell script as a pipe destination (`curl … | sh`): any
@@ -439,9 +440,9 @@ pub fn is_always_ask(cmd: &str) -> bool {
         // output of everything before it. A lone `bash script.sh` (single
         // sub-command) is ordinary and stays unflagged.
         if i > 0
-            && tokens
-                .first()
-                .is_some_and(|t| t == "sh" || t == "bash" || t.ends_with("/sh") || t.ends_with("/bash"))
+            && tokens.first().is_some_and(|t| {
+                t == "sh" || t == "bash" || t.ends_with("/sh") || t.ends_with("/bash")
+            })
         {
             return true;
         }
@@ -665,13 +666,25 @@ mod tests {
         assert!(matches!(write_redirect(">>"), Some(Redirect::Next)));
         assert!(matches!(write_redirect("2>"), Some(Redirect::Next)));
         assert!(matches!(write_redirect("&>"), Some(Redirect::Next)));
-        assert!(matches!(write_redirect(">log"), Some(Redirect::Attached("log"))));
-        assert!(matches!(write_redirect(">>log"), Some(Redirect::Attached("log"))));
-        assert!(matches!(write_redirect("2>err"), Some(Redirect::Attached("err"))));
+        assert!(matches!(
+            write_redirect(">log"),
+            Some(Redirect::Attached("log"))
+        ));
+        assert!(matches!(
+            write_redirect(">>log"),
+            Some(Redirect::Attached("log"))
+        ));
+        assert!(matches!(
+            write_redirect("2>err"),
+            Some(Redirect::Attached("err"))
+        ));
         assert!(matches!(write_redirect("12>&3"), Some(Redirect::Dup)));
         assert!(matches!(write_redirect("2>&1"), Some(Redirect::Dup)));
         assert!(matches!(write_redirect(">&1"), Some(Redirect::Dup)));
-        assert!(matches!(write_redirect("&>both"), Some(Redirect::Attached("both"))));
+        assert!(matches!(
+            write_redirect("&>both"),
+            Some(Redirect::Attached("both"))
+        ));
         assert!(write_redirect("file.txt").is_none());
         assert!(write_redirect("--force").is_none());
     }
@@ -710,8 +723,14 @@ mod tests {
 
     #[test]
     fn suggest_command_name_skips_assignments() {
-        assert_eq!(suggest_command_name("FOO=1 cargo build").as_deref(), Some("cargo"));
-        assert_eq!(suggest_command_name("A=1 B=2 git status").as_deref(), Some("git"));
+        assert_eq!(
+            suggest_command_name("FOO=1 cargo build").as_deref(),
+            Some("cargo")
+        );
+        assert_eq!(
+            suggest_command_name("A=1 B=2 git status").as_deref(),
+            Some("git")
+        );
         assert_eq!(suggest_command_name("env X=1 git").as_deref(), Some("env"));
         assert_eq!(suggest_command_name("plain cmd").as_deref(), Some("plain"));
         assert_eq!(suggest_command_name("  "), None, "no command word");

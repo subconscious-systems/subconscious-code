@@ -244,7 +244,10 @@ mod tests {
         let joined = a.join(&b);
         let live = joined.live();
         assert_eq!(live.len(), 1);
-        assert_eq!(live[0].epoch, 9, "epoch dominates the context_key tie-break");
+        assert_eq!(
+            live[0].epoch, 9,
+            "epoch dominates the context_key tie-break"
+        );
     }
 
     #[test]

@@ -2576,9 +2576,7 @@ async fn identical_failing_calls_trip_the_circuit_breaker() {
     let boom = Arc::new(Boom {
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    let registry = Arc::new(ToolRegistry::new(vec![
-        boom.clone() as Arc<dyn Tool>,
-    ]));
+    let registry = Arc::new(ToolRegistry::new(vec![boom.clone() as Arc<dyn Tool>]));
     let response = |id: &str| ModelResponse {
         retries: 0,
         text: String::new(),
@@ -2603,11 +2601,7 @@ async fn identical_failing_calls_trip_the_circuit_breaker() {
         registry,
         Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
     );
-    let mut session = Session::new(
-        "repeat-breaker".into(),
-        std::env::temp_dir(),
-        "mock".into(),
-    );
+    let mut session = Session::new("repeat-breaker".into(), std::env::temp_dir(), "mock".into());
 
     let outcome = agent
         .run(
@@ -2672,11 +2666,9 @@ async fn identical_failing_calls_trip_the_circuit_breaker() {
 /// identical failures, otherwise fresh attempts look like a loop.
 #[tokio::test]
 async fn changing_the_arguments_resets_the_failure_pattern() {
-    let registry = Arc::new(ToolRegistry::new(vec![
-        Arc::new(Boom {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }) as Arc<dyn Tool>,
-    ]));
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Boom {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    }) as Arc<dyn Tool>]));
     let response = |id: &str, args: &str| ModelResponse {
         retries: 0,
         text: String::new(),
@@ -2708,11 +2700,7 @@ async fn changing_the_arguments_resets_the_failure_pattern() {
         registry,
         Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
     );
-    let mut session = Session::new(
-        "breaker-reset".into(),
-        std::env::temp_dir(),
-        "mock".into(),
-    );
+    let mut session = Session::new("breaker-reset".into(), std::env::temp_dir(), "mock".into());
 
     let outcome = agent
         .run(
@@ -2744,9 +2732,7 @@ async fn changing_the_arguments_resets_the_failure_pattern() {
 /// spinning forever on the same empty response.
 #[tokio::test]
 async fn empty_tool_calls_marker_gets_bounded_recovery() {
-    let registry = Arc::new(ToolRegistry::new(vec![
-        Arc::new(Echo) as Arc<dyn Tool>,
-    ]));
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
     let response = || ModelResponse {
         retries: 0,
         text: "on it".into(),
@@ -2755,11 +2741,8 @@ async fn empty_tool_calls_marker_gets_bounded_recovery() {
         finish_reason: FinishReason::ToolCalls,
         usage: None,
     };
-    let model = Arc::new(MockModel::new(vec![
-        response(),
-        response(),
-        response(),
-    ])) as Arc<dyn Model>;
+    let model =
+        Arc::new(MockModel::new(vec![response(), response(), response()])) as Arc<dyn Model>;
     let agent = AgentLoop::new(
         model,
         registry,
@@ -2786,11 +2769,13 @@ async fn empty_tool_calls_marker_gets_bounded_recovery() {
     let notes = session
         .messages
         .iter()
-        .filter(|t| matches!(
-            t,
-            Turn::SystemNote { kind: rc_core::NoteKind::Recovery, text }
-                if text.contains("carried no tool-call data")
-        ))
+        .filter(|t| {
+            matches!(
+                t,
+                Turn::SystemNote { kind: rc_core::NoteKind::Recovery, text }
+                    if text.contains("carried no tool-call data")
+            )
+        })
         .count();
     assert_eq!(
         notes, 2,

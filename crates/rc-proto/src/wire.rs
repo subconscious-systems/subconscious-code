@@ -367,13 +367,17 @@ mod tests {
     /// instead of failing the whole response.
     #[test]
     fn choice_finish_reason_is_optional() {
-        let with: Choice =
-            serde_json::from_str(r#"{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}"#)
-                .unwrap();
+        let with: Choice = serde_json::from_str(
+            r#"{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}"#,
+        )
+        .unwrap();
         assert_eq!(with.finish_reason.as_deref(), Some("stop"));
         let without: Choice =
             serde_json::from_str(r#"{"index":0,"message":{"role":"assistant","content":"ok"}}"#)
                 .unwrap();
-        assert_eq!(without.finish_reason, None, "absent finish_reason must parse");
+        assert_eq!(
+            without.finish_reason, None,
+            "absent finish_reason must parse"
+        );
     }
 }

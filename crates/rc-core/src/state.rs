@@ -804,7 +804,8 @@ mod tests {
         // `rename(file, dir)`: rotation fails after the flush step.
         std::fs::create_dir(&rotated).unwrap();
         std::fs::write(rotated.join("occupied"), b"x").unwrap();
-        log.rotate().expect_err("rename onto a non-empty directory must fail");
+        log.rotate()
+            .expect_err("rename onto a non-empty directory must fail");
 
         // The bug: this used to panic on `expect("log writer")`.
         log.write_all(b"after failed rotate\n").unwrap();
@@ -836,9 +837,7 @@ mod tests {
         // The next write stays in the new segment (no re-rotation loop).
         log.write_all(b"more\n").unwrap();
         log.flush().unwrap();
-        assert!(std::fs::read_to_string(&log_path)
-            .unwrap()
-            .contains("more"));
+        assert!(std::fs::read_to_string(&log_path).unwrap().contains("more"));
     }
 
     #[test]

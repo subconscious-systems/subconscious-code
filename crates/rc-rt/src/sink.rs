@@ -84,16 +84,10 @@ impl SessionWriter {
         };
         match sender.try_send(turn.clone()) {
             Ok(()) => {
-                self.inner
-                    .overflow_notified
-                    .store(false, Ordering::Relaxed);
+                self.inner.overflow_notified.store(false, Ordering::Relaxed);
             }
             Err(TrySendError::Full(_)) => {
-                if !self
-                    .inner
-                    .overflow_notified
-                    .swap(true, Ordering::Relaxed)
-                {
+                if !self.inner.overflow_notified.swap(true, Ordering::Relaxed) {
                     self.inner.events.send(AgentEvent::Notice(
                         "session persistence is running behind; some completed turns were not persisted".into(),
                     ));
@@ -260,9 +254,7 @@ mod tests {
         let writer = SessionWriter::new(events, store);
 
         writer.append(&user_turn("one"));
-        let error = expect_event(&receiver, 5, |event| {
-            matches!(event, AgentEvent::Error(_))
-        });
+        let error = expect_event(&receiver, 5, |event| matches!(event, AgentEvent::Error(_)));
         let AgentEvent::Error(text) = error else {
             unreachable!("checked the variant above");
         };
@@ -356,7 +348,9 @@ mod tests {
 
         // Release: the writer drains every accepted turn and none of the
         // dropped ones (no turn is silently lost, none is duplicated).
-        release.send(()).expect("the gated consumer is still parked");
+        release
+            .send(())
+            .expect("the gated consumer is still parked");
         drop(writer); // takes the sender and joins the writer thread
 
         let written = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();

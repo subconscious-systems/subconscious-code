@@ -235,7 +235,8 @@ async fn cut_mid_body_flushes_partial_text_and_unconfirmed_finish_before_the_err
     // ever arrive, then close the socket mid-body.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer\"}}]}\n\n";
+    let body =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer\"}}]}\n\n";
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len() * 10
@@ -305,7 +306,10 @@ async fn cut_mid_body_flushes_partial_text_and_unconfirmed_finish_before_the_err
     }
     server.join().unwrap();
 
-    assert_eq!(text, "partial answer", "streamed text must not be lost by the cut");
+    assert_eq!(
+        text, "partial answer",
+        "streamed text must not be lost by the cut"
+    );
     let finish = finish_index.expect("the cut-stream finish (stream-ended) must be flushed");
     let error = error_index.expect("the transport error must surface after the flush");
     assert!(

@@ -537,10 +537,13 @@ impl ChatClient {
                 attempt += 1;
                 continue;
             }
-            tracing::debug!("← {status}\n{}", match &error {
-                ProtoError::Status { body, .. } => body.as_str(),
-                _ => "",
-            });
+            tracing::debug!(
+                "← {status}\n{}",
+                match &error {
+                    ProtoError::Status { body, .. } => body.as_str(),
+                    _ => "",
+                }
+            );
             return Err((error, attempt));
         }
     }

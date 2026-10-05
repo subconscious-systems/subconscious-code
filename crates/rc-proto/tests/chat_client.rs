@@ -451,10 +451,7 @@ async fn error_response_body_is_read_bounded() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(400)
-                .set_body_string(big_error_page),
-        )
+        .respond_with(ResponseTemplate::new(400).set_body_string(big_error_page))
         .mount(&server)
         .await;
 

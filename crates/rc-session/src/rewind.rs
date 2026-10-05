@@ -45,10 +45,7 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into());
-    let tmp = dir.join(format!(
-        ".{name}.sc-rewind-{}",
-        std::process::id()
-    ));
+    let tmp = dir.join(format!(".{name}.sc-rewind-{}", std::process::id()));
     let attempt = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(bytes)?;

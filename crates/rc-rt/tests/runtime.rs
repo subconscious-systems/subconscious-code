@@ -939,7 +939,9 @@ mod compact_growth {
             call_id: "old-tool".into(),
             tool: "Read".into(),
             result: rc_core::ToolResultBody::Ok {
-                content: "bulky raw tool output that must leave the context".repeat(64).into(),
+                content: "bulky raw tool output that must leave the context"
+                    .repeat(64)
+                    .into(),
                 truncated: false,
             },
             duration: Default::default(),
@@ -981,7 +983,9 @@ mod compact_growth {
         // 1st compact: legit, shrinks the projection.
         rt.action(UserAction::Compact);
         let first = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
-        assert!(first.iter().any(|event| matches!(event, AgentEvent::Compacted)));
+        assert!(first
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Compacted)));
 
         // 2nd compact: the summary of a summary is not smaller — a warning,
         // never a fake success.
@@ -991,21 +995,30 @@ mod compact_growth {
             event,
             AgentEvent::Notice(text) if text.contains("not smaller")
         )));
-        assert!(!second.iter().any(|event| matches!(event, AgentEvent::Compacted)));
+        assert!(!second
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Compacted)));
 
         // 3rd: the fixed point repeats — compaction is disabled, loudly.
         rt.action(UserAction::Compact);
         let third = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
-        assert!(third.iter().any(|event|
-            matches!(event, AgentEvent::Error(text) if text.contains("did not shrink"))), "{third:?}");
+        assert!(
+            third.iter().any(
+                |event| matches!(event, AgentEvent::Error(text) if text.contains("did not shrink"))
+            ),
+            "{third:?}"
+        );
 
         // 4th: refused outright, without building another note.
         rt.action(UserAction::Compact);
         let fourth = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
-        assert!(fourth.iter().any(|event| matches!(
-            event,
-            AgentEvent::Error(text) if text.contains("disabled for this session")
-        )), "{fourth:?}");
+        assert!(
+            fourth.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(text) if text.contains("disabled for this session")
+            )),
+            "{fourth:?}"
+        );
 
         rt.shutdown().await;
     }

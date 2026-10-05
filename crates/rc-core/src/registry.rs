@@ -59,9 +59,7 @@ impl ToolRegistry {
     /// while the wire `tools` array exposed both definitions — which is
     /// exactly the state a caller can't diagnose later. This returns an error
     /// naming the collision instead.
-    pub fn try_new(
-        tools: Vec<Arc<dyn Tool>>,
-    ) -> Result<Self, DuplicateToolNameError> {
+    pub fn try_new(tools: Vec<Arc<dyn Tool>>) -> Result<Self, DuplicateToolNameError> {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for tool in &tools {
             if !seen.insert(tool.name()) {

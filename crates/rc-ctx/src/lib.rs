@@ -435,7 +435,10 @@ fn expand_line_mentions(line: &str, root: &Path, cap: usize) -> String {
         // check only accepted start-of-string or a literal space, so
         // `\t@file`, `(@file`, and `-@file` were silently never expanded.
         let begins_token = at == 0 || {
-            let prev = rest[..at].chars().next_back().expect("at > 0 implies a char before");
+            let prev = rest[..at]
+                .chars()
+                .next_back()
+                .expect("at > 0 implies a char before");
             !prev.is_alphanumeric()
         };
         out.push_str(&rest[..at + 1]);

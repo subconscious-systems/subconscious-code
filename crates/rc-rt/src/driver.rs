@@ -150,9 +150,7 @@ pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<Drive
                         events.send(AgentEvent::Error(format!("rewind failed: {e}")));
                     }
                     Err(e) => {
-                        events.send(AgentEvent::Error(format!(
-                            "rewind worker task failed: {e}"
-                        )));
+                        events.send(AgentEvent::Error(format!("rewind worker task failed: {e}")));
                     }
                 }
                 events.send(AgentEvent::Idle);
