@@ -170,7 +170,7 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
             let path = entry.path();
             let rel = path.strip_prefix(&root).unwrap_or(path);
             if let Some(gm) = &glob_matcher {
-                let base = rel.file_name().map(Path::new);
+                let base = path.file_name().map(Path::new);
                 let matched = gm.is_match(rel) || base.is_some_and(|b| gm.is_match(b));
                 if !matched {
                     continue;
@@ -359,6 +359,36 @@ mod tests {
                 assert!(!content.contains("b.txt"), "{content}");
             }
             o => panic!("expected ok, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_roots_apply_globs_to_the_filename() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.rs", "foo\n");
+        for path in [
+            "a.rs".to_string(),
+            dir.path().join("a.rs").to_string_lossy().into_owned(),
+        ] {
+            for glob in ["*.rs", "a.rs", "*.txt"] {
+                for mode in ["files_with_matches", "count", "content"] {
+                    let outcome = Grep::new()
+                        .call(
+                            json!({"pattern": "foo", "path": path, "glob": glob, "output_mode": mode}),
+                            &test_ctx(dir.path()),
+                        )
+                        .await
+                        .unwrap();
+                    let ToolOutcome::Ok { content, .. } = outcome else {
+                        panic!("expected search results, got {outcome:?}");
+                    };
+                    assert_eq!(
+                        content.contains("a.rs"),
+                        glob != "*.txt",
+                        "{path}, {glob}, {mode}: {content}"
+                    );
+                }
+            }
         }
     }
 

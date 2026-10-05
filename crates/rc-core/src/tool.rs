@@ -123,5 +123,7 @@ pub trait Tool: Send + Sync {
     fn concurrency(&self) -> Concurrency {
         Concurrency::Parallel
     }
+    // async_trait adds #[must_use] to a Future already marked must_use.
+    #[allow(clippy::double_must_use)]
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome, ToolError>;
 }
