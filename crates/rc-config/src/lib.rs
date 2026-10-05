@@ -20,6 +20,7 @@
 //! unlimited by default; tool results use a provider-safe projection cap so a
 //! runaway result cannot invalidate the next request.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub mod edit;
@@ -126,6 +127,12 @@ pub struct Settings {
     /// copies on release while captured; Ctrl+O releases the mouse when native
     /// terminal selection is preferred.
     pub mouse: bool,
+    /// MCP servers from the `mcpServers` block, keyed by server name. Layers
+    /// merge per name: a project entry replaces a user entry of the same name,
+    /// and `null` removes an inherited one. Values stay raw JSON here; rc-mcp
+    /// parses and validates them, so a bad entry fails that one server rather
+    /// than the whole settings load.
+    pub mcp_servers: BTreeMap<String, serde_json::Value>,
 }
 
 /// The `permissions` block (§7.1/§10.2). Rule strings are parsed by rc-perm.
@@ -222,6 +229,10 @@ struct SettingsFile {
     sandbox: Option<SandboxConfig>,
     context: Option<ContextConfig>,
     ui: Option<UiFile>,
+    /// The Claude Code / Cursor spelling, so an existing `mcpServers` block can
+    /// be pasted in unchanged.
+    #[serde(rename = "mcpServers", alias = "mcp_servers")]
+    mcp_servers: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// The `ui` block: terminal-interaction preferences.
@@ -337,6 +348,7 @@ impl Settings {
         // work on first launch. Ctrl+O hands the mouse back to the terminal for
         // native selection whenever that is preferable.
         let mut mouse = true;
+        let mut mcp_servers: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
         // Later layers override earlier ones. User before project so a
         // committed project file beats a user global — matches §10.1 (project
@@ -415,6 +427,9 @@ impl Settings {
                     }
                     if let Some(c) = file.context {
                         context = c;
+                    }
+                    if let Some(servers) = file.mcp_servers {
+                        merge_mcp_servers(&mut mcp_servers, servers);
                     }
                 }
                 Err(e) => report.warnings.push(e),
@@ -623,6 +638,7 @@ impl Settings {
             dlr_ingress_token_env,
             dlr_repair_margin_pct,
             mouse,
+            mcp_servers,
         }
     }
 
@@ -668,6 +684,21 @@ fn normalize_reasoning_effort(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_ascii_lowercase())
+    }
+}
+
+/// Merge one layer's `mcpServers` block into the accumulated set: an entry
+/// replaces any earlier entry of the same name, and `null` removes it.
+fn merge_mcp_servers(
+    into: &mut BTreeMap<String, serde_json::Value>,
+    layer: BTreeMap<String, serde_json::Value>,
+) {
+    for (name, value) in layer {
+        if value.is_null() {
+            into.remove(&name);
+        } else {
+            into.insert(name, value);
+        }
     }
 }
 
@@ -832,6 +863,31 @@ pub fn scan_for_secret(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_block_accepts_both_spellings() {
+        let camel: SettingsFile =
+            serde_json::from_str(r#"{"mcpServers": {"fs": {"command": "fs-server"}}}"#).unwrap();
+        let snake: SettingsFile =
+            serde_json::from_str(r#"{"mcp_servers": {"fs": {"command": "fs-server"}}}"#).unwrap();
+        assert_eq!(camel.mcp_servers, snake.mcp_servers);
+        assert_eq!(camel.mcp_servers.unwrap()["fs"]["command"], "fs-server");
+    }
+
+    #[test]
+    fn mcp_server_layers_merge_by_name_and_null_removes() {
+        let mut merged = BTreeMap::new();
+        let user: BTreeMap<String, serde_json::Value> = serde_json::from_str(
+            r#"{"fs": {"command": "user-fs"}, "web": {"url": "https://example.com/mcp"}}"#,
+        )
+        .unwrap();
+        let project: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(r#"{"fs": {"command": "project-fs"}, "web": null}"#).unwrap();
+        merge_mcp_servers(&mut merged, user);
+        merge_mcp_servers(&mut merged, project);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged["fs"]["command"], "project-fs");
+    }
 
     #[test]
     fn provider_defaults_leave_retry_ownership_upstream() {

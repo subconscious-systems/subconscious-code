@@ -18,6 +18,7 @@
 //! accordingly for a very large context until those clones are removed.
 
 mod doctor;
+mod mcp;
 mod resource_scope;
 mod update;
 
@@ -121,6 +122,16 @@ struct Cli {
     /// SC_SANDBOX_NET=1. Implies --sandbox.
     #[arg(long = "sandbox-net")]
     sandbox_net: bool,
+
+    /// Load MCP servers from a JSON file or inline JSON holding
+    /// `{"mcpServers": {...}}` (the Claude Code shape). Repeatable; layers
+    /// over the settings `mcpServers` block, later entries winning.
+    #[arg(long = "mcp-config", value_name = "FILE_OR_JSON")]
+    mcp_config: Vec<String>,
+
+    /// Use only the servers from `--mcp-config`, ignoring settings files.
+    #[arg(long = "strict-mcp-config", requires = "mcp_config")]
+    strict_mcp_config: bool,
 
     /// Verify the endpoint before trusting it: config, non-streaming, streaming,
     /// and tool-call support. Exits non-zero if a check fails. Run as
@@ -285,7 +296,19 @@ async fn run(cli: Cli) -> Result<()> {
     // cap; a settings file or SC_* env var can tune every limit. Each tool is
     // told its own cap so the schema it advertises matches what it enforces.
     let caps = settings.context;
-    let tools = Arc::new(ToolRegistry::new(vec![
+    // MCP servers connect before the registry is built so the tool set is
+    // fixed for the whole session (see rc-mcp).
+    let mcp_hub = mcp::connect(mcp::collect(
+        &settings.mcp_servers,
+        &cli.mcp_config,
+        cli.strict_mcp_config,
+    )?)
+    .await;
+    let mcp_report: rc_tui::McpReport = {
+        let hub = mcp_hub.clone();
+        Arc::new(move || hub.report_lines())
+    };
+    let builtin_tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(Read::with_limits(
             caps.read_default_limit,
             caps.read_max_line_chars,
@@ -306,7 +329,10 @@ async fn run(cli: Cli) -> Result<()> {
         Arc::new(Grep::with_cap(caps.grep_output_cap)) as Arc<dyn Tool>,
         Arc::new(GrepMany::with_cap(caps.grep_output_cap)) as Arc<dyn Tool>,
         Arc::new(Bash::with_cap(caps.bash_output_cap)) as Arc<dyn Tool>,
-    ]));
+    ];
+    let tools = Arc::new(ToolRegistry::new(
+        builtin_tools.into_iter().chain(mcp_hub.tools()).collect(),
+    ));
     // Permission engine (§7): bypass, or the real engine from the settings block.
     let permission: Arc<dyn PermissionChecker> = if cli.dangerously_skip_permissions {
         if std::env::var("CI").as_deref() == Ok("true")
@@ -436,7 +462,10 @@ async fn run(cli: Cli) -> Result<()> {
             sessions_dir.clone(),
             mode,
             session_path.clone(),
-            settings.mouse,
+            rc_tui::TuiOptions {
+                mouse: settings.mouse,
+                mcp_report: mcp_report.clone(),
+            },
         )
         .await?;
         let Some(next) = next else { return Ok(()) };
@@ -2169,7 +2198,7 @@ async fn run_tui(
     sessions_dir: PathBuf,
     initial_mode: AgentMode,
     resumed_path: Option<PathBuf>,
-    mouse: bool,
+    options: rc_tui::TuiOptions,
 ) -> Result<Option<rc_tui::Outcome>> {
     let cwd = session.cwd.clone();
     let history = session.messages.clone();
@@ -2212,7 +2241,7 @@ async fn run_tui(
         control.action(rc_rt::UserAction::Quit);
     });
     match tokio::task::spawn_blocking(move || {
-        rc_tui::run(runtime, model_name, cwd, initial_mode, history, mouse)
+        rc_tui::run(runtime, model_name, cwd, initial_mode, history, options)
     })
     .await
     {

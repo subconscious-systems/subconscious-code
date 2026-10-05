@@ -6,3 +6,28 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rc-core = { path = "../rc-core" }
+# The official Rust MCP SDK. TLS comes from the workspace's existing rustls +
+# ring stack (`reqwest-tls-no-provider`), so no second crypto provider and no
+# C toolchain enter the build.
+rmcp = { version = "3.5", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+http = "1"
+which = "8"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util.workspace = true
+
+# A stdio MCP server used only by this crate's integration tests. It is built
+# with the workspace but never packaged: releases build `--bin marathon` only.
+[[bin]]
+name = "rc-mcp-fixture"
+path = "tests/fixture/server.rs"
+test = false
+doc = false

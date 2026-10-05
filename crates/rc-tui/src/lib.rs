@@ -36,6 +36,17 @@ use rc_rt::Runtime;
 
 pub use menu::Outcome;
 
+/// Produces the `/mcp` report on demand: one line per server, its state and
+/// its tools. The host owns the MCP connections, so the TUI only renders it.
+pub type McpReport = std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Host-side settings for one TUI run.
+pub struct TuiOptions {
+    /// Capture the mouse for in-app scrolling and selection (`ui.mouse`).
+    pub mouse: bool,
+    pub mcp_report: McpReport,
+}
+
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Launch the TUI against `runtime`. Blocks the calling thread — run it on a
@@ -59,8 +70,9 @@ pub fn run(
     cwd: PathBuf,
     initial_mode: rc_core::AgentMode,
     history: Vec<rc_core::Turn>,
-    mouse: bool,
+    options: TuiOptions,
 ) -> anyhow::Result<Option<Outcome>> {
+    let mouse = options.mouse;
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -80,7 +92,7 @@ pub fn run(
         cwd,
         initial_mode,
         history,
-        mouse,
+        options,
     );
 
     // Restore the terminal whatever happened above.

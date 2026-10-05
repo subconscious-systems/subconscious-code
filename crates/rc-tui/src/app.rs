@@ -88,6 +88,8 @@ pub(crate) struct App {
     /// Esc with a queued prompt waits for the current parallel tool batch to
     /// finish, then cancels the turn so the runtime starts that prompt.
     send_queued_after_tool: bool,
+    /// Renders `/mcp`. Unset in tests, where `/mcp` reports no servers.
+    mcp_report: Option<crate::McpReport>,
 }
 
 impl App {
@@ -119,6 +121,7 @@ impl App {
             pending_submit: None,
             queued_prompts: VecDeque::new(),
             send_queued_after_tool: false,
+            mcp_report: None,
         }
     }
 }
@@ -133,9 +136,11 @@ pub(crate) fn run(
     cwd: PathBuf,
     initial_mode: AgentMode,
     history: Vec<Turn>,
-    mouse: bool,
+    options: crate::TuiOptions,
 ) -> anyhow::Result<Option<crate::menu::Outcome>> {
+    let mouse = options.mouse;
     let mut app = App::new(runtime, model_name, cwd, history);
+    app.mcp_report = Some(options.mcp_report);
     // The host already emitted the capture sequence (or didn't); this keeps
     // the flag, the hint and Ctrl+O agreeing with the terminal's actual state.
     app.view.mouse_capture = mouse;
@@ -1441,6 +1446,13 @@ impl App {
                 ));
             }
             SlashAction::SelectMode => self.toggle_mouse_capture(),
+            SlashAction::Mcp => {
+                let lines = match &self.mcp_report {
+                    Some(report) => report(),
+                    None => vec!["  no MCP servers configured".into()],
+                };
+                self.push_info("mcp", &lines);
+            }
             SlashAction::Permissions => {
                 let lines = vec![
                     format!("  mode   {:?}", self.view.mode),
@@ -1618,6 +1630,7 @@ fn classify_slash(text: &str) -> Option<SlashAction> {
         "/permissions" | "/approval" => Some(SlashAction::Permissions),
         "/select" | "/mouse" => Some(SlashAction::SelectMode),
         "/doctor" => Some(SlashAction::Doctor),
+        "/mcp" => Some(SlashAction::Mcp),
         "/history" => Some(SlashAction::History),
         "/export" => Some(SlashAction::Export),
         "/quit" | "/exit" | "/q" => Some(SlashAction::Quit),
@@ -1743,6 +1756,8 @@ enum SlashAction {
     Status,
     Model,
     Permissions,
+    /// List MCP servers, their state, and their tools (`/mcp`).
+    Mcp,
     /// Toggle mouse capture so the terminal can select text (`/select`).
     SelectMode,
     Quit,

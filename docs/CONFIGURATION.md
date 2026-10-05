@@ -163,6 +163,66 @@ headless Rust maintenance task might contain:
 Keep rules narrow. `--dangerously-skip-permissions` is intended for an already
 isolated environment and still enforces the catastrophic-command safety floor.
 
+MCP tools are confirmed in `default` and `acceptEdits` modes and denied in
+`plan` mode, like `Bash`. Allow one tool with its full name
+(`mcp__search__query`) or every tool of a server with `mcp__search`.
+
+## MCP servers
+
+Marathon connects to [Model Context Protocol](https://modelcontextprotocol.io)
+servers and offers their tools to the model as `mcp__<server>__<tool>`. The
+`mcpServers` block uses the same shape as Claude Code and Cursor, so an
+existing block can be pasted in:
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "env": { "LOG_LEVEL": "warn" }
+    },
+    "search": {
+      "type": "http",
+      "url": "https://search.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${SEARCH_TOKEN}" }
+    }
+  }
+}
+```
+
+| Field | Applies to | Meaning |
+| --- | --- | --- |
+| `type` (or `transport`) | all | `stdio` or `http` (`streamable-http`). Inferred from `command` or `url` when omitted |
+| `command`, `args`, `env`, `cwd` | stdio | The server process to start |
+| `url`, `headers` | http | A streamable HTTP endpoint |
+| `startup_timeout_ms` | all | Time to start and list tools (default 30000) |
+| `tool_timeout_ms` | all | Time for one tool call (default 300000) |
+| `disabled` | all | Keep the entry but do not start it |
+
+- `${VAR}` and `${VAR:-default}` expand from the environment in every string
+  field. Keep credentials in environment variables, not in settings files.
+- Server names may use letters, digits, `_` and `-`.
+- The legacy SSE transport is not supported. Use the server's streamable HTTP
+  endpoint.
+- Project settings replace user settings server by server. Set a server to
+  `null` to remove one inherited from user settings.
+
+From the command line, `--mcp-config <file-or-json>` adds servers from a file or
+inline JSON holding the same `{"mcpServers": {...}}` object. Repeat it to layer
+several files. `--strict-mcp-config` ignores the settings files and uses only
+`--mcp-config`, which suits benchmark harnesses:
+
+```bash
+marathon -p "summarize the open issues" --mcp-config ./mcp.json --strict-mcp-config
+```
+
+All servers start in parallel before the first model request, so the tool list
+stays the same for the whole session. A server that fails to start, or exits
+later, does not stop the session: Marathon prints a warning, its tools return
+the error, and `/mcp` in the terminal UI shows each server's state, tools, and
+last stderr line. A server's stderr never reaches the terminal.
+
 ## Memory files
 
 Project instructions are loaded in this order:

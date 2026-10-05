@@ -83,6 +83,7 @@ pub(crate) fn slash_palette() -> &'static [(&'static str, &'static str)] {
             "Show the active permission mode and rule hints",
         ),
         ("/doctor", "Run a self-check of the environment and config"),
+        ("/mcp", "List MCP servers, their status, and their tools"),
         ("/select", "Toggle whether sc captures the mouse (Ctrl+O)"),
         ("/history", "Summarize the transcript length so far"),
         ("/export", "Export the transcript to a file"),

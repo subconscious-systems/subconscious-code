@@ -5,6 +5,14 @@ All notable changes to Subconscious Code are documented here. This project uses
 
 ## [Unreleased]
 
+### Added
+
+- MCP server support. Configure servers in the `mcpServers` settings block
+  (the Claude Code shape) or with `--mcp-config`; stdio and streamable HTTP
+  servers are supported. Their tools appear as `mcp__<server>__<tool>`, follow
+  the permission rules, and work in headless `-p` runs. `/mcp` lists each
+  server's state and tools. See `docs/CONFIGURATION.md`.
+
 ### Changed
 
 - Headless `-p` runs now save their session to `~/.sc/sessions` like the
