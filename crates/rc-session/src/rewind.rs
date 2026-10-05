@@ -269,7 +269,46 @@ mod tests {
         let _ = ChangeJournal::new();
     }
 
+    /// A CAS snapshot whose backing blob is gone: the restore fails before
+    /// any write is attempted. Portable failure mode — unlike a read-only
+    /// directory, which Windows ignores for file creation (the Unix-only
+    /// sibling test below covers the write side there).
     #[test]
+    fn a_restore_failure_is_reported_and_the_file_is_untouched() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("guarded.txt");
+        fs::write(&path, "current contents").unwrap();
+        let records = vec![ChangeRecord {
+            path: path.clone(),
+            prior: Some(rc_core::state::FileSnapshot::Cas {
+                // The blob this snapshot points at never existed: reading it
+                // fails on every platform.
+                path: dir.path().join("missing.cas"),
+                len: 14,
+            }),
+            turn: 1,
+        }];
+
+        let (restored, failed) = restore_files(&records);
+        assert!(restored.is_empty(), "nothing was restored: {restored:?}");
+        assert_eq!(failed, vec![path.clone()], "the failure is reported");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "current contents",
+            "previous contents survive the failed restore intact"
+        );
+        // No temp-file litter from the aborted atomic write.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// The write-side atomicity property: the pre-restore write of the temp
+    /// file fails *after* reading succeeded, and the old in-place `fs::write`
+    /// would have truncated the target before failing — the atomic restore
+    /// must leave its contents untouched. Unix-only: the read-only-directory
+    /// mechanism relies on POSIX directory permissions, which Windows
+    /// ignores for file creation.
+    #[test]
+    #[cfg(unix)]
     fn a_failed_restore_leaves_previous_contents_intact_and_is_reported() {
         // The restore target lives in a directory we make read-only after
         // the file exists, so the pre-restore write of the temp file fails.
