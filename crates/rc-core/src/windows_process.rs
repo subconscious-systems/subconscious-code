@@ -21,6 +21,12 @@ use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUS
 
 pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
+/// `CREATE_NO_WINDOW`: allocate no console window for the child. Every
+/// console-spawning helper (PowerShell shells, `gh`, clipboard helpers)
+/// otherwise flashes a blank console window on screen — and steals focus — per
+/// invocation; both opencode (#52281/#52266/#52433) and codex (#50193) hit
+/// this in the wild. OR it into the child's `creation_flags`.
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Debug)]
 pub struct Job(OwnedHandle, Option<tempfile::TempDir>);
 

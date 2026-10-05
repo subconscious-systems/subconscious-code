@@ -97,6 +97,13 @@ async fn latest_release() -> Result<LatestRelease> {
 
 async fn latest_release_with_gh() -> Option<LatestRelease> {
     let mut command = Command::new("gh");
+    // opencode #52281 / codex #50193: never flash a console window for the
+    // probe child on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(rc_core::windows_process::CREATE_NO_WINDOW);
+    }
     command.kill_on_drop(true).args([
         "release",
         "view",

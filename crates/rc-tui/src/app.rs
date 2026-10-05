@@ -2685,12 +2685,23 @@ fn copy_with_command(program: &str, args: &[&str], text: &str) -> std::io::Resul
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new(program)
+    // The command must be built as an owned binding: the builder methods
+    // borrow `&mut Command`, so a split chain would borrow the statement's
+    // temporary and dangle (E0716).
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    // opencode #52281 / codex #50193: no console flash for a clipboard helper
+    // invoked from the TUI on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(rc_core::windows_process::CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn()?;
     child
         .stdin
         .take()
