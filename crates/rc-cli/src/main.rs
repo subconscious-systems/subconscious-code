@@ -312,6 +312,7 @@ async fn run(cli: Cli) -> Result<()> {
         strict: cli.strict_mcp_config,
     })?)
     .await;
+    mcp::stop_on_signal(mcp_hub.clone(), cli.print.is_none());
     let mcp_report: rc_tui::McpReport = {
         let hub = mcp_hub.clone();
         Arc::new(move || hub.report_lines())

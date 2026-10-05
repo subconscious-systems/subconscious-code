@@ -1864,6 +1864,7 @@ dependencies = [
  "libc",
  "rc-core",
  "rmcp",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

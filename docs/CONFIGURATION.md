@@ -248,8 +248,10 @@ stays the same for the whole session. A server that fails to start, or exits
 later, does not stop the session: Marathon prints a warning, its tools return
 the error, and `/mcp` in the terminal UI shows each server's state, tools, and
 last stderr line. A server's stderr never reaches the terminal. When the
-session ends, Marathon closes each connection and then stops the server's
-whole process tree, including processes a launcher such as `npx` started.
+session ends, or Marathon receives SIGINT, SIGTERM or SIGHUP (Ctrl-C, Ctrl-Break
+or closing the console on Windows), Marathon closes each connection and then
+stops the server's whole process tree, including processes a launcher such as
+`npx` started. On Linux a server is also killed if Marathon itself is killed.
 
 An MCP server is a program you choose to run, with your user's permissions.
 It is trusted from the moment it connects: `--sandbox` and `--sandbox-net`

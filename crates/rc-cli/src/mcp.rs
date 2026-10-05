@@ -112,6 +112,64 @@ pub(crate) async fn connect(servers: Servers) -> McpHub {
     hub
 }
 
+/// Signals end the process before `main` returns, so neither `shutdown` nor
+/// the hub's `Drop` would run, and servers in their own session never see the
+/// terminal's SIGINT or SIGHUP. Catch the usual termination signals, stop
+/// every server, restore the terminal, and exit with the shell's code.
+pub(crate) fn stop_on_signal(hub: McpHub, restore_terminal: bool) {
+    if hub.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let code = termination_signal().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), hub.shutdown()).await;
+        if restore_terminal {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+                crossterm::event::DisableBracketedPaste
+            );
+        }
+        std::process::exit(code);
+    });
+}
+
+/// Wait for SIGINT, SIGTERM or SIGHUP and return 128 + its number.
+#[cfg(unix)]
+async fn termination_signal() -> i32 {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+    ) else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = interrupt.recv() => 128 + libc::SIGINT,
+        _ = terminate.recv() => 128 + libc::SIGTERM,
+        _ = hangup.recv() => 128 + libc::SIGHUP,
+    }
+}
+
+/// Wait for Ctrl-C, Ctrl-Break or the console closing. The exit codes mirror
+/// the Unix ones for SIGINT and SIGHUP.
+#[cfg(windows)]
+async fn termination_signal() -> i32 {
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close};
+    let (Ok(mut interrupt), Ok(mut brk), Ok(mut close)) = (ctrl_c(), ctrl_break(), ctrl_close())
+    else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = interrupt.recv() => 130,
+        _ = brk.recv() => 130,
+        _ = close.recv() => 129,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -200,14 +200,40 @@ impl McpHub {
         skipped: Skipped,
     ) -> Self {
         let mut tasks = tokio::task::JoinSet::new();
+        let mut pending = std::collections::HashMap::new();
         for (index, config) in servers.into_iter().enumerate() {
-            tasks.spawn(async move { (index, connect_one(config).await) });
+            let label = (
+                config.name.clone(),
+                config.display.clone(),
+                config.tool_timeout,
+            );
+            let id = tasks
+                .spawn(async move { (index, connect_one(config).await) })
+                .id();
+            pending.insert(id, (index, label));
         }
         let mut connected = Vec::new();
-        while let Some(joined) = tasks.join_next().await {
+        while let Some(joined) = tasks.join_next_with_id().await {
             match joined {
-                Ok(pair) => connected.push(pair),
-                Err(e) => tracing::warn!(target: "sc.mcp", "MCP connect task failed: {e}"),
+                Ok((_, pair)) => connected.push(pair),
+                // A panic inside a transport must still leave the server
+                // visible in `/mcp`, not silently drop it.
+                Err(error) => {
+                    if let Some((index, (name, display, tool_timeout))) =
+                        pending.remove(&error.id())
+                    {
+                        tracing::warn!(target: "sc.mcp", server = %name, "connect task failed: {error}");
+                        let handle = ServerHandle::new(
+                            name,
+                            display,
+                            tool_timeout,
+                            ServerState::Failed {
+                                error: "connecting failed unexpectedly (internal error)".into(),
+                            },
+                        );
+                        connected.push((index, (handle, Vec::new())));
+                    }
+                }
             }
         }
         // Registration order is canonicalized by the tool registry; sorting
@@ -433,6 +459,7 @@ async fn start(
                 .map_err(|e| format!("initialize failed: {e}"))?
         }
         Transport::Http { url, headers } => {
+            install_crypto_provider();
             let mut custom = std::collections::HashMap::new();
             for (key, value) in headers {
                 let key = http::HeaderName::from_bytes(key.as_bytes())
@@ -458,6 +485,16 @@ async fn start(
         .await
         .map_err(|e| format!("listing tools failed: {e}"))?;
     Ok((service, tools))
+}
+
+/// reqwest panics when it builds a TLS client with no process-wide rustls
+/// provider. Another part of the process may already have installed one,
+/// which is fine.
+fn install_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// Resolve a bare command on the server's `PATH` the way a shell would. On

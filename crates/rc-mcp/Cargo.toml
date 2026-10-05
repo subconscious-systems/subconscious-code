@@ -12,6 +12,9 @@ rc-core = { path = "../rc-core" }
 # C toolchain enter the build.
 rmcp = { version = "3.5", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 http = "1"
+# rmcp's HTTP client is built without a crypto provider; ring is the one the
+# workspace already ships.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 which = "8"
 serde.workspace = true
 serde_json.workspace = true

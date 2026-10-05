@@ -195,12 +195,7 @@ fn parse_server(
         }
         Transport::Http { .. } => format!("http: {}", raw.url.as_deref().unwrap_or_default()),
     };
-    let mut secrets = secrets.into_inner();
-    // Short values (a port, `1`) would scrub unrelated text; they are also not
-    // credentials worth hiding.
-    secrets.retain(|value| value.len() >= MIN_SECRET_LEN);
-    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    secrets.dedup();
+    let secrets = secret_forms(secrets.into_inner());
     Ok(Some(ServerConfig {
         name: name.to_string(),
         transport,
@@ -276,8 +271,45 @@ fn expand_vars_tracked(
     Ok((out, substituted))
 }
 
-/// Substituted values shorter than this are not scrubbed from messages.
+/// Substituted values shorter than this are not scrubbed from messages: a port
+/// or `1` would scrub unrelated text, and is not a credential worth hiding.
 const MIN_SECRET_LEN: usize = 4;
+
+/// Every form a substituted value can take in a message: as is, each line of
+/// a multi-line value (stderr arrives a line at a time), and percent-encoded
+/// as an HTTP client writes it into a URL. Longest first, so a longer form is
+/// replaced before a shorter one inside it.
+fn secret_forms(values: Vec<String>) -> Vec<String> {
+    let mut forms = Vec::new();
+    for value in values {
+        let lines = value.lines().map(str::to_string).collect::<Vec<_>>();
+        for form in std::iter::once(value).chain(lines) {
+            forms.push(percent_encode(&form, false));
+            forms.push(percent_encode(&form, true));
+            forms.push(form);
+        }
+    }
+    forms.retain(|form| form.trim().len() >= MIN_SECRET_LEN);
+    forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    forms.dedup();
+    forms
+}
+
+/// Percent-encode every byte outside RFC 3986's unreserved set, as
+/// `encodeURIComponent` does, with upper- or lower-case hex.
+fn percent_encode(value: &str, lower: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else if lower {
+            out.push_str(&format!("%{byte:02x}"));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
 
 /// Replace every secret in `text` with `***`.
 pub fn redact(text: &str, secrets: &[String]) -> String {
@@ -393,6 +425,36 @@ mod tests {
                 &web.secrets
             ),
             "GET https://e.com/mcp?key=*** failed"
+        );
+    }
+
+    #[test]
+    fn encoded_and_per_line_forms_are_scrubbed() {
+        let lookup = |name: &str| match name {
+            "TOK" => Some("ab/cd+ef=gh@ij".to_string()),
+            "PEM" => Some("-----BEGIN KEY-----\nc2VjcmV0LWJvZHk=\n-----END KEY-----".to_string()),
+            _ => None,
+        };
+        let raw: BTreeMap<String, serde_json::Value> = serde_json::from_value(json!({
+            "web": {"url": "https://e.com/mcp?key=${TOK}"},
+            "cli": {"command": "srv", "env": {"KEY": "${PEM}"}},
+        }))
+        .unwrap();
+        let (servers, errors) = parse_servers(&raw, &lookup);
+        assert!(errors.is_empty(), "{errors:?}");
+        let web = &servers.iter().find(|s| s.name == "web").unwrap().secrets;
+        for leaked in [
+            "GET https://e.com/mcp?key=ab/cd+ef=gh@ij",
+            "GET https://e.com/mcp?key=ab%2Fcd%2Bef%3Dgh%40ij",
+            "GET https://e.com/mcp?key=ab%2fcd%2bef%3dgh%40ij",
+        ] {
+            let shown = redact(leaked, web);
+            assert_eq!(shown, "GET https://e.com/mcp?key=***", "{leaked}");
+        }
+        let cli = &servers.iter().find(|s| s.name == "cli").unwrap().secrets;
+        assert_eq!(
+            redact("bad key c2VjcmV0LWJvZHk= rejected", cli),
+            "bad key *** rejected"
         );
     }
 

@@ -154,10 +154,17 @@ fn start_tree(mut command: Command) -> std::io::Result<(Child, ProcessTree)> {
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
+                return Err(std::io::Error::last_os_error());
             }
+            // If Marathon is killed outright (SIGKILL, OOM), the kernel kills
+            // the direct child too. Linux ties this to the spawning thread;
+            // servers are spawned from runtime worker threads, which live as
+            // long as the session.
+            #[cfg(target_os = "linux")]
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         });
     }
     let child = command.spawn()?;

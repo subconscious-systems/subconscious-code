@@ -304,3 +304,34 @@ fn alive(pid: u32) -> bool {
         .expect("tasklist");
     String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
 }
+
+#[tokio::test]
+async fn http_connect_errors_do_not_leak_a_url_token() {
+    // Bind and drop a listener so the port refuses connections.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let raw: BTreeMap<String, serde_json::Value> = serde_json::from_value(json!({
+        "web": {"url": format!("http://127.0.0.1:{port}/mcp?key=${{TOK}}"), "startup_timeout_ms": 10000},
+    }))
+    .unwrap();
+    let lookup = |name: &str| (name == "TOK").then(|| "ab/cd+ef=gh@ij".to_string());
+    let (servers, errors) = rc_mcp::parse_servers(&raw, &lookup);
+    assert!(errors.is_empty(), "{errors:?}");
+    let hub = McpHub::connect(servers, Vec::new(), Vec::new()).await;
+    let shown = format!(
+        "{}\n{}",
+        hub.report_lines().join("\n"),
+        hub.problems().join("\n")
+    );
+    assert!(
+        matches!(hub.status()[0].state, ServerState::Failed { .. }),
+        "{shown}"
+    );
+    for fragment in ["cd+ef", "gh@ij", "cd%2Bef", "gh%40ij"] {
+        assert!(!shown.contains(fragment), "{fragment} leaked: {shown}");
+    }
+    assert!(shown.contains("${TOK}"), "{shown}");
+}
