@@ -157,6 +157,9 @@ pub struct NullSink;
 impl EventSink for NullSink {}
 
 /// The model abstraction (§13 MockModel for tests).
+// async_trait's generated wrapper carries its own #[must_use]; clippy 1.99+
+// reports it as double_must_use on code we do not write.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Model: Send + Sync {
     async fn complete(

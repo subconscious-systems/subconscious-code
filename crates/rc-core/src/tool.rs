@@ -114,6 +114,9 @@ pub struct ToolCtx {
 
 /// The tool trait (§6). Schemas are generated once and the registry caches the
 /// canonical on-wire bytes (§4.6). `permission_key` is M3 and omitted here.
+// async_trait's generated wrapper carries its own #[must_use]; clippy 1.99+
+// reports it as double_must_use on code we do not write.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
