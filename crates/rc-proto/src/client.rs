@@ -88,6 +88,11 @@ pub struct ChatClient {
 /// to stderr per request. Set `SC_DEBUG_FULL_BODY=1` to opt back into the full
 /// dump when you genuinely need it.
 const DEBUG_BODY_PREVIEW: usize = 8 * 1024;
+/// Bytes of a non-2xx response body retained for classification/logging. A
+/// hostile or broken gateway can attach an arbitrarily large error page; it
+/// exists only to classify the status and debug-log a snippet, so it is
+/// truncated at read time instead of buffered whole.
+const ERROR_BODY_BYTES: usize = 16 * 1024;
 /// Keep normal chat requests in memory, but spool genuinely large contexts so
 /// retained request bytes cannot consume the editor's whole memory budget.
 const REQUEST_MEMORY_BYTES: usize = 8 * 1024 * 1024;
@@ -375,7 +380,8 @@ impl ChatClient {
                 if status.is_success() {
                     return Ok((response, 0, payload));
                 }
-                let body = response.text().await.unwrap_or_default();
+                // Bounded: error bodies exist for classification/logging only.
+                let body = bounded_error_body(response, ERROR_BODY_BYTES).await;
                 return Err((
                     ProtoError::Status {
                         status: status.as_u16(),
@@ -501,9 +507,24 @@ impl ChatClient {
                 return Ok((resp, attempt));
             }
             let retry_after = self.retry_after(&resp);
-            let text = resp.text().await.unwrap_or_default();
-            let transient = is_transient_status_body(status.as_u16(), &text);
-            if transient && attempt < self.retry.max_retries {
+            // Bounded read: an error body only feeds classification and the
+            // debug log, never deserialization.
+            let text = bounded_error_body(resp, ERROR_BODY_BYTES).await;
+            let is_transient = is_transient_status_body(status.as_u16(), &text);
+            let error = ProtoError::Status {
+                status: status.as_u16(),
+                body: text,
+            };
+            // Classify gzip-unsupported BEFORE any retry decision: the
+            // uncompressed fallback (encode_and_send) must be immediate, not
+            // wait out this loop's transient-retry budget. Today 415/400 are
+            // non-transient so the loop exits anyway; this guarantees the
+            // fallback stays immediate even if transient classification
+            // broadens to cover a gzip-rejecting gateway's status.
+            if gzip && gzip_is_unsupported(&error) {
+                return Err((error, attempt));
+            }
+            if is_transient && attempt < self.retry.max_retries {
                 // Honor `Retry-After` (seconds) if the server sent one, capped at
                 // max_delay; else exponential backoff.
                 let d = retry_after.unwrap_or_else(|| self.backoff(attempt));
@@ -516,14 +537,14 @@ impl ChatClient {
                 attempt += 1;
                 continue;
             }
-            tracing::debug!("← {status}\n{text}");
-            return Err((
-                ProtoError::Status {
-                    status: status.as_u16(),
-                    body: text,
-                },
-                attempt,
-            ));
+            tracing::debug!(
+                "← {status}\n{}",
+                match &error {
+                    ProtoError::Status { body, .. } => body.as_str(),
+                    _ => "",
+                }
+            );
+            return Err((error, attempt));
         }
     }
 
@@ -813,6 +834,27 @@ fn is_transient_status_body(status: u16, body: &str) -> bool {
     body.contains("no router available") || body.contains("no available router")
 }
 
+/// Read at most [`ERROR_BODY_BYTES`] of a non-2xx response body. The rest of
+/// the body is dropped mid-stream: the bytes exist only for classification
+/// and debug logs, and a gateway answering a failure with an enormous payload
+/// must not be buffered whole (the old `resp.text().await` read it all).
+async fn bounded_error_body(mut response: reqwest::Response, cap: usize) -> String {
+    let mut taken: Vec<u8> = Vec::with_capacity(cap.min(4096));
+    loop {
+        if taken.len() >= cap {
+            break;
+        }
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let budget = cap - taken.len();
+                taken.extend_from_slice(&chunk[..chunk.len().min(budget)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&taken).into_owned()
+}
+
 fn gzip_is_unsupported(error: &ProtoError) -> bool {
     let ProtoError::Status { status, body } = error else {
         return false;
@@ -853,6 +895,11 @@ pub struct EventStream {
     fuser: StreamFuser,
     pending: VecDeque<AgentStreamEvent>,
     done: bool,
+    /// A transport failure mid-body: the decoder/fuser flush runs first (same
+    /// as the clean-EOF path), the flushed events drain from `pending`, and
+    /// only then does this error surface — so the cut-stream text and the
+    /// unconfirmed-call finish are never lost.
+    error: Option<ProtoError>,
 }
 
 impl EventStream {
@@ -863,6 +910,24 @@ impl EventStream {
             fuser: StreamFuser::new(),
             pending: VecDeque::new(),
             done: false,
+            error: None,
+        }
+    }
+
+    /// Flush the decoder and fuser exactly like the clean-EOF path: parse any
+    /// buffered partial line, then run the fuser's cut-stream finish (the
+    /// `finish_confirmed(confirmed = false)` path, which refuses to execute
+    /// repair-fabricated tool arguments and emits `Finish{Other("stream-ended")}`).
+    fn flush_decoder_and_fuser(&mut self) {
+        for c in self.dec.finish().into_iter().flatten() {
+            let evs = self.fuser.apply(c);
+            for ev in evs {
+                self.pending.push_back(ev);
+            }
+        }
+        let evs = self.fuser.finish();
+        for ev in evs {
+            self.pending.push_back(ev);
         }
     }
 }
@@ -876,6 +941,11 @@ impl Stream for EventStream {
                 return Poll::Ready(Some(Ok(ev)));
             }
             if self.done {
+                // After the flushed events drain, a mid-body transport error
+                // (if any) surfaces — after the text it must not swallow.
+                if let Some(error) = self.error.take() {
+                    return Poll::Ready(Some(Err(error)));
+                }
                 return Poll::Ready(None);
             }
             match self.body.as_mut().poll_next(cx) {
@@ -902,8 +972,15 @@ impl Stream for EventStream {
                     continue; // drain pending next iteration
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    // A connection reset mid-body is a *cut stream*, not a
+                    // dead request: text has already streamed. Flush the
+                    // decoder/fuser (buffered partial line + the
+                    // confirmed=false finish for any half-assembled tool
+                    // call), let those events drain, then surface the error.
+                    self.flush_decoder_and_fuser();
                     self.done = true;
-                    return Poll::Ready(Some(Err(ProtoError::Http(e))));
+                    self.error = Some(ProtoError::Http(e));
+                    continue;
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
                     let had_pending = !self.pending.is_empty();

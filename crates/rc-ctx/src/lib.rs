@@ -315,13 +315,12 @@ impl ContextAssembler {
     }
 
     /// Assemble the full wire message list for the next request (§4.1 + §4.6):
-    /// expand `@file` mentions in the *most recent* user turn, apply the stable
-    /// per-result projection cap, then project with this assembler's system
-    /// prompt.
+    /// expand `@file` mentions in **every** user turn (uniformly — a pure
+    /// per-turn projection, so an older turn's wire bytes never change when a
+    /// new turn is appended), apply the stable per-result projection cap,
+    /// then project with this assembler's system prompt.
     ///
-    /// `turns` is the session's turn list; the mention expansion applies to the
-    /// last `Turn::User` only (the one driving this request) so earlier turns
-    /// stay byte-stable for prefix caching (§4.6 canonicalization).
+    /// `turns` is the session's turn list.
     pub fn assemble(&self, turns: &[Turn]) -> Vec<WireMessage> {
         let prepared = prepare_turns(turns, &self.env.cwd, self.caps);
         rc_core::project_with(&prepared, &self.system_prompt)
@@ -367,19 +366,26 @@ impl rc_core::ContextAssembler for ContextAssembler {
     }
 }
 
-/// Produce a model-facing turn list with the last user turn's `@file` mentions
+/// Produce a model-facing turn list with **every** user turn's `@file` mentions
 /// expanded and oversized tool results capped. The source session is never
-/// mutated, and an older projected turn never changes merely because a later
-/// edit/read occurred; that prefix stability is more valuable than reclaiming
-/// a few already-cached tool-result tokens retroactively.
+/// mutated; both transforms are pure per-turn functions that never depend on
+/// which turns come after them, so appending a new user turn cannot rewrite
+/// the wire bytes of an older one — the provider prefix-cache invariant.
+///
+/// The review found the previous shape: expansion was a *moving window* that
+/// only touched the turns from the last `Turn::User` onward, so each new user
+/// turn silently reverted the previously-expanded turn to bare `@token` bytes
+/// (the file contents vanished from the request and the older message's wire
+/// bytes changed between requests). Uniform expansion fixes both.
+///
+/// One honest caveat, deliberate: expansion re-reads mentioned files at
+/// projection time, so a later *file edit* (not a turn append) does change the
+/// wire bytes of an older turn that mentions it. Re-expanding uniformly keeps
+/// appends stable without persisting file snapshots into the session; the
+/// tool-result cap shares the same per-turn purity.
 fn prepare_turns(turns: &[Turn], root: &Path, caps: Caps) -> Vec<Turn> {
-    // Find the last user turn — everything before it is the stable prefix.
-    let last_user = turns.iter().rposition(|t| matches!(t, Turn::User { .. }));
-    let Some(idx) = last_user else {
-        return truncate_tool_results(turns, caps.tool_result);
-    };
-    let mut out: Vec<Turn> = turns[..idx].to_vec();
-    for turn in &turns[idx..] {
+    let mut out: Vec<Turn> = Vec::with_capacity(turns.len());
+    for turn in turns {
         match turn {
             Turn::User { content, ts } => {
                 let expanded = expand_mentions(content, root, caps.inline_file);
@@ -422,9 +428,19 @@ fn expand_line_mentions(line: &str, root: &Path, cap: usize) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(at) = rest.find('@') {
-        // Only treat `@` as a trigger if it begins a token (start of line or
-        // preceded by whitespace) — `foo@bar` is an email, not a mention.
-        let begins_token = at == 0 || rest.as_bytes().get(at - 1) == Some(&b' ');
+        // Only treat `@` as a trigger when it is not glued to a word *before*
+        // it: the preceding character may be any whitespace (tab, line start,
+        // NBSP, …) or punctuation like `(`/`-`, but an alphanumeric means this
+        // is mid-word — `me@host.com` is an email, not a mention. The old
+        // check only accepted start-of-string or a literal space, so
+        // `\t@file`, `(@file`, and `-@file` were silently never expanded.
+        let begins_token = at == 0 || {
+            let prev = rest[..at]
+                .chars()
+                .next_back()
+                .expect("at > 0 implies a char before");
+            !prev.is_alphanumeric()
+        };
         out.push_str(&rest[..at + 1]);
         let after = &rest[at + 1..];
         if !begins_token {
@@ -453,13 +469,21 @@ fn expand_line_mentions(line: &str, root: &Path, cap: usize) -> String {
 /// empty string when the path can't be resolved within `root` or read; the
 /// caller keeps the bare `@token` in that case. A fenced block is appended
 /// after the token when the file resolves and reads as UTF-8.
+///
+/// Containment is enforced on **canonicalized** paths via
+/// [`rc_core::resolve_within`]: the candidate is physically resolved before it
+/// is compared against the (also canonicalized) root, so a symlink inside the
+/// workspace pointing outside it is refused — the old lexical guard (`/`
+/// prefix, `contains("..")` substring) was blind to symlinks. `a..b.txt` is a
+/// legitimate filename and no longer trips the check: traversal decisions come
+/// from the canonicalized containment, not a substring scan.
 fn inline_file(rel: &str, root: &Path, cap: usize) -> String {
     let cleaned = rel.strip_prefix("./").unwrap_or(rel);
-    // Refuse absolute paths and `..` escapes — never read outside the workspace.
-    if cleaned.starts_with('/') || cleaned.contains("..") {
-        return String::new();
-    }
-    let path = root.join(cleaned);
+    // Never read outside the workspace (canonical, symlink-proof).
+    let path = match rc_core::resolve_within(&[root.to_path_buf()], root, cleaned) {
+        Ok(path) => path,
+        Err(_) => return String::new(),
+    };
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(_) => return String::new(),

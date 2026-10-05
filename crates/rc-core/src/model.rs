@@ -157,6 +157,11 @@ pub struct NullSink;
 impl EventSink for NullSink {}
 
 /// The model abstraction (§13 MockModel for tests).
+// clippy 1.99+ fires `double_must_use` on `async_trait`'s desugared wrapper
+// (its own `#[must_use]` on a fn returning a `Future`, which is already
+// must_use). The attribute is macro-generated, not ours — the allow lives on
+// the trait so the generated code is covered.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Model: Send + Sync {
     async fn complete(
@@ -413,7 +418,15 @@ async fn consume_stream(
     } else {
         Some(reasoning)
     };
-    let (text, tag_reasoning) = strip_reasoning_tag(&text, reasoning_tag);
+    let (clean, tag_reasoning) = strip_reasoning_tag(&text, reasoning_tag);
+    // Borrowed => no tags were present: reuse the accumulated buffer instead
+    // of copying it. (Two-step match: moving `text` while a live borrow of it
+    // is the match scrutinee does not borrow-check in one step.)
+    let owned_clean = match clean {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(cleaned) => Some(cleaned),
+    };
+    let text = owned_clean.unwrap_or(text);
     let reasoning = match (field_reasoning, tag_reasoning) {
         (Some(r), Some(t)) => Some(format!("{r}\n{t}")),
         (Some(r), None) => Some(r),
@@ -441,14 +454,21 @@ async fn consume_stream(
 }
 
 /// Split `<tag>…</tag>` out of `text`, returning (clean_text, reasoning).
-fn strip_reasoning_tag(text: &str, tag: Option<&str>) -> (String, Option<String>) {
+///
+/// Returns `Cow<'_, str>` for the clean text so the common no-tag path
+/// **borrows** instead of copying — a tagless response reuses the accumulated
+/// stream buffer rather than paying for a full duplicate.
+fn strip_reasoning_tag<'a>(
+    text: &'a str,
+    tag: Option<&str>,
+) -> (std::borrow::Cow<'a, str>, Option<String>) {
     let Some(tag) = tag else {
-        return (text.to_string(), None);
+        return (std::borrow::Cow::Borrowed(text), None);
     };
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     if !text.contains(&open) {
-        return (text.to_string(), None);
+        return (std::borrow::Cow::Borrowed(text), None);
     }
     let mut clean = String::new();
     let mut reasoning = String::new();
@@ -467,7 +487,7 @@ fn strip_reasoning_tag(text: &str, tag: Option<&str>) -> (String, Option<String>
     }
     clean.push_str(rest);
     (
-        clean,
+        std::borrow::Cow::Owned(clean),
         if reasoning.trim().is_empty() {
             None
         } else {
@@ -485,12 +505,24 @@ mod tests {
         let (clean, r) = strip_reasoning_tag("hello <think>secret</think> world", Some("think"));
         assert_eq!(clean, "hello  world");
         assert_eq!(r.as_deref(), Some("secret"));
+        assert!(
+            matches!(clean, std::borrow::Cow::Owned(_)),
+            "a tagged response is rebuilt (owned)"
+        );
     }
 
     #[test]
     fn no_op_when_tag_absent() {
         let (clean, r) = strip_reasoning_tag("plain answer", Some("think"));
         assert_eq!(clean, "plain answer");
+        assert!(r.is_none());
+        assert!(
+            matches!(clean, std::borrow::Cow::Borrowed(_)),
+            "a tagless response must be borrowed, not copied"
+        );
+        // No reasoning-tag mode configured at all borrows too.
+        let (clean, r) = strip_reasoning_tag("plain answer", None);
+        assert!(matches!(clean, std::borrow::Cow::Borrowed(_)));
         assert!(r.is_none());
     }
 

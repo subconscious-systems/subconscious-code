@@ -218,3 +218,112 @@ async fn stream_retries_on_429_then_streams() {
         "1 initial 429 + 1 retry 200"
     );
 }
+
+/// The review's mid-body cut: the server sends a valid SSE body declaring a
+/// `Content-Length` larger than what it then delivers, and the connection
+/// dies. The wire client previously surfaced the transport error immediately —
+/// only the clean-EOF path flushed the decoder/fuser — so any text already
+/// streamed was lost from the drain and a half-assembled tool call never got
+/// the `confirmed=false` finish. Now the flush runs before the error, and the
+/// error surfaces *after* the flushed events.
+#[tokio::test]
+async fn cut_mid_body_flushes_partial_text_and_unconfirmed_finish_before_the_error() {
+    use std::io::Write as _;
+
+    // A raw HTTP server on a plain thread (tokio has no net feature here):
+    // answer the POST with one complete SSE frame, claim more bytes than will
+    // ever arrive, then close the socket mid-body.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer\"}}]}\n\n";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len() * 10
+    );
+    let server = std::thread::spawn(move || {
+        let (mut sock, _peer) = listener.accept().unwrap();
+        // Drain the request before answering: a server that closes without
+        // reading the request makes hyper cancel the whole exchange with
+        // "unexpected message" instead of yielding the (broken) response the
+        // test needs to observe.
+        use std::io::Read as _;
+        let mut seen = Vec::new();
+        let expected = loop {
+            let mut b = [0u8; 4096];
+            let n = sock.read(&mut b).expect("reading the request");
+            if n == 0 {
+                panic!("peer closed before sending a full request");
+            }
+            seen.extend_from_slice(&b[..n]);
+            if let Some(head_end) = find_subsequence(&seen, b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&seen[..head_end]).to_uppercase();
+                let len = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("CONTENT-LENGTH:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                break seen.len() >= head_end + 4 + len;
+            }
+        };
+        assert!(expected, "the request must be fully drained first");
+        sock.write_all(head.as_bytes()).unwrap();
+        sock.write_all(body).unwrap();
+        let _ = sock.flush();
+        // Drop without satisfying Content-Length -> mid-body transport error.
+    });
+
+    let client = ChatClient::new(
+        format!("http://{addr}"),
+        "k".into(),
+        "m".into(),
+        Some(Duration::from_secs(60)),
+    )
+    .unwrap();
+    let (mut stream, _retries, _payload) = client
+        .stream(
+            &[WireMessage::User {
+                content: "hi".into(),
+            }],
+            &CompleteOpts::default(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let mut text = String::new();
+    let mut finish_index = None;
+    let mut error_index = None;
+    let mut index = 0usize;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            Ok(AgentStreamEvent::Text(t)) => text.push_str(&t),
+            Ok(AgentStreamEvent::Finish { .. }) => finish_index = Some(index),
+            Ok(_) => {}
+            Err(_) => error_index = Some(index),
+        }
+        index += 1;
+    }
+    server.join().unwrap();
+
+    assert_eq!(
+        text, "partial answer",
+        "streamed text must not be lost by the cut"
+    );
+    let finish = finish_index.expect("the cut-stream finish (stream-ended) must be flushed");
+    let error = error_index.expect("the transport error must surface after the flush");
+    assert!(
+        finish < error,
+        "fuser finish at event {finish} must precede the error at event {error}"
+    );
+
+    // After the error the stream terminated cleanly (the loop above drained
+    // to None without hanging); the cut-stream text survived.
+}
+
+/// The first index at which `needle` occurs inside `haystack`, if any.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}

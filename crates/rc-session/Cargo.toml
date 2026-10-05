@@ -12,5 +12,10 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Advisory `flock` in `SessionStore::open_append` so two processes never
+# interleave appends into one session file.
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"

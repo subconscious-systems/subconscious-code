@@ -24,6 +24,10 @@ pub enum AskResponse {
     Deny(String),
 }
 
+// clippy 1.99+ fires `double_must_use` on `async_trait`'s desugared wrapper
+// (its own `#[must_use]` on a fn returning a `Future`, which is already
+// must_use). Macro-generated, not ours — the allow covers the generated code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Prompter: Send + Sync {
     async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse;

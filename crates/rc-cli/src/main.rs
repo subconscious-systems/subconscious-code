@@ -341,16 +341,23 @@ async fn run(cli: Cli) -> Result<()> {
         let session = rc_session::load(&path).context("--resume: could not load session")?;
         Some((path, session))
     } else if cli.continue_last {
-        match rc_session::latest(&sessions_dir) {
-            Some(path) => {
-                let session = rc_session::load(&path)
+        // Codex #50334: `--continue` resumes *this project's* last session —
+        // a global "newest anywhere" silently jumped to an unrelated project
+        // the moment two shared the session store. Cross-project resume stays
+        // available through `--resume <file>` and the /menu picker.
+        let cwd = std::env::current_dir()?;
+        match rc_session::latest_in_project(&sessions_dir, &cwd) {
+            Some(latest) => {
+                let session = rc_session::load(&latest.path)
                     .context("--continue: could not load the latest session")?;
-                Some((path, session))
+                Some((latest.path, session))
             }
             None => {
                 anyhow::bail!(
-                    "--continue: no prior session found in {}",
-                    sessions_dir.display()
+                    "--continue: no prior session in {} (this directory). \
+                     Other projects' sessions are skipped; use --resume <file> \
+                     or the /menu picker to reach one.",
+                    cwd.display()
                 );
             }
         }
@@ -858,7 +865,9 @@ async fn run_headless(
 ) -> Result<()> {
     let started = Instant::now();
     let prompter: Box<dyn Prompter> = if std::io::stdin().is_terminal() {
-        Box::new(StdinPrompter)
+        Box::new(StdinPrompter {
+            cwd: session.cwd.clone(),
+        })
     } else {
         Box::new(NullPrompter)
     };
@@ -1149,6 +1158,7 @@ fn benchmark_outcome_label(outcome: LoopOutcome) -> &'static str {
         LoopOutcome::Length => "length",
         LoopOutcome::ItersExceeded => "iteration_limit",
         LoopOutcome::NoProgress => "no_progress",
+        LoopOutcome::RepeatedFailure => "repeated_failure",
         LoopOutcome::Incomplete => "incomplete",
         LoopOutcome::TimeUp => "time_limit",
         LoopOutcome::Cancelled => "cancelled",
@@ -2151,6 +2161,12 @@ fn print_result(session: &Session, outcome: LoopOutcome) {
                     "warning: model reached the completion limit twice without making progress"
                 )
             }
+            LoopOutcome::RepeatedFailure => {
+                eprintln!(
+                    "warning: the identical-failure circuit breaker stopped the turn \
+                     (the same call kept failing the same way)"
+                )
+            }
             LoopOutcome::Incomplete => {
                 eprintln!("warning: model response ended without a clean completion marker")
             }
@@ -2198,11 +2214,14 @@ fn init_tracing() {
 /// A crude stdin prompter (§7.4): `y`=once, `s`=session, `a`=always, `n`=deny.
 /// The blocking `read_line` is fine inside the async fn: this prompter only runs
 /// on a TTY under the multi-thread runtime, so one blocked worker is acceptable.
-struct StdinPrompter;
+struct StdinPrompter {
+    /// The session's working directory, used to scope suggested path grants.
+    cwd: PathBuf,
+}
 #[async_trait::async_trait]
 impl Prompter for StdinPrompter {
     async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse {
-        let suggested = suggested_rule(tool, input);
+        let suggested = rc_core::suggested_rule(tool, input, &self.cwd);
         eprintln!("━ {tool} requires permission: {reason}");
         eprintln!("  granting rule: {suggested}");
         eprint!("  [y]es once / [s]ession / [a]lways / [n]o: ");
@@ -2220,22 +2239,5 @@ impl Prompter for StdinPrompter {
     }
 }
 
-/// A rough "don't ask again for this" rule: `Bash(<first-token>:*)` for Bash,
-/// the bare tool name for everything else (grants the whole tool for the session).
-fn suggested_rule(tool: &str, input: &Value) -> String {
-    #[cfg(windows)]
-    if tool == "PowerShell" {
-        return rc_core::powershell_grant(
-            input.get("command").and_then(Value::as_str).unwrap_or(""),
-        );
-    }
-    if tool == "Bash" {
-        if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-            let first = cmd.split_whitespace().next().unwrap_or("");
-            if !first.is_empty() {
-                return format!("Bash({first}:*)");
-            }
-        }
-    }
-    tool.to_string()
-}
+// The standing-grant rule offered by the prompter lives in rc-perm
+// (`rc_core::suggested_rule`) so every host mints the same, tightest grant.

@@ -57,6 +57,13 @@ pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<Drive
         store,
         feedback,
     } = task;
+    // opencode #52697 / codex #50123: compaction that does not shrink the real
+    // request context is a fixed point — /compact, continue, /compact, continue
+    // — the eternal loop. The audit below counts consecutive no-shrink
+    // compactions; at two, compaction is disabled for this driver with a clear
+    // error instead of silently repeating forever.
+    let mut no_shrink_streak: u32 = 0;
+    let mut compaction_disabled: bool = false;
     while let Some(cmd) = cmds.recv().await {
         match cmd {
             DriverCmd::Run {
@@ -102,13 +109,29 @@ pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<Drive
                 }
             }
             DriverCmd::Rewind { steps } => {
-                match rc_session::rewind::rewind_session(&mut session, steps) {
-                    Ok(report) => {
-                        let text = format!(
+                // Rewind is blocking file IO (temp-file writes, renames, and
+                // the journal rewrite); run it on a blocking worker instead of
+                // stalling this driver task. Only the shared journal handle
+                // crosses over, so this side of the await holds no `Session`
+                // borrow.
+                let journal = session.change_journal.clone();
+                let rewound = tokio::task::spawn_blocking(move || {
+                    rc_session::rewind::rewind_shared(&journal, steps)
+                })
+                .await;
+                match rewound {
+                    Ok(Ok(report)) => {
+                        let mut text = format!(
                             "Rewound {} turn(s) of file changes; restored {} file(s).",
                             report.turns,
                             report.restored.len()
                         );
+                        if !report.failed.is_empty() {
+                            text.push_str(&format!(
+                                " {} file(s) could not be restored.",
+                                report.failed.len()
+                            ));
+                        }
                         events.send(AgentEvent::Notice(text.clone()));
                         // Mark the rewind in the transcript so a resumed session
                         // and the model see it. The transcript is append-only,
@@ -123,27 +146,82 @@ pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<Drive
                             }
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         events.send(AgentEvent::Error(format!("rewind failed: {e}")));
+                    }
+                    Err(e) => {
+                        events.send(AgentEvent::Error(format!("rewind worker task failed: {e}")));
                     }
                 }
                 events.send(AgentEvent::Idle);
             }
             DriverCmd::Compact => {
+                if compaction_disabled {
+                    // The fixed-point audit already tripped (opencode #52697):
+                    // every further /compact would replay the same non-shrinking
+                    // summary. Refuse loudly, tell the user what still works.
+                    events.send(AgentEvent::Error(
+                        "compaction is disabled for this session: repeated \
+                         /compact attempts did not shrink the request context \
+                         (a fixed point). Send a new message, rewind, or /clear; \
+                         a restarted session retries compaction from scratch."
+                            .into(),
+                    ));
+                    events.send(AgentEvent::Idle);
+                    continue;
+                }
+                // The real thing /compact must move: the size of the next
+                // request. Measured on the projected wire messages, because the
+                // raw turn list legitimately *grows* when a bulky tool tail is
+                // summarized away (the projection boundary is what saved us).
+                let before = projected_context_bytes(&session.messages);
                 let summary = compaction_summary(&session.messages);
                 let note = Turn::SystemNote {
                     kind: NoteKind::Compaction,
                     text: summary,
                 };
                 session.messages.push(note);
+                let after = projected_context_bytes(&session.messages);
+                // opencode #52697 / codex #50123: the summary must actually
+                // shrink the projected request; all kinds of fixed points
+                // (transcripts that never sit still, summaries bigger than the
+                // live tail) must surface, not loop.
+                let shrunk = after < before;
+                if shrunk {
+                    no_shrink_streak = 0;
+                } else {
+                    no_shrink_streak += 1;
+                }
                 if let Some(store) = &store {
                     if let Some(turn) = session.messages.last() {
                         append_shared(store, turn, "compaction");
                     }
                 }
-                events.send(AgentEvent::Notice(
-                    "Context compacted; future requests start from the saved summary.".into(),
-                ));
+                if shrunk {
+                    // codex #50337: hosts must refresh any context-meter — the
+                    // next request's usage has nothing to do with the old one.
+                    events.send(AgentEvent::Compacted);
+                    events.send(AgentEvent::Notice(
+                        "Context compacted; future requests start from the saved summary.".into(),
+                    ));
+                } else if no_shrink_streak >= 2 {
+                    compaction_disabled = true;
+                    let _ = after; // error text below, not the raw size
+                    events.send(AgentEvent::Error(
+                        "compaction did not shrink the request context twice in a row \
+                         (a fixed point); the session continued unchanged and further \
+                         /compact attempts are disabled for this session. Send a new \
+                         message, rewind, or /clear."
+                            .into(),
+                    ));
+                } else {
+                    events.send(AgentEvent::Notice(
+                        "compacted, but the summary is not smaller than the live context — \
+                         if /compact again does not shrink it, compaction will be disabled \
+                         for this session (a compaction fixed point)."
+                            .into(),
+                    ));
+                }
                 events.send(AgentEvent::Idle);
             }
             DriverCmd::SetGoal(goal) => {
@@ -189,6 +267,18 @@ pub(crate) async fn driver_task(task: DriverTask, mut cmds: mpsc::Receiver<Drive
 
 fn append_shared(store: &SessionWriter, turn: &Turn, _kind: &str) {
     store.append(turn);
+}
+
+/// Bytes of the *next request* for these turns: the projected wire messages,
+/// serialized. The measure for the compaction audit (#52697) — the raw turn
+/// list grows on purpose during compaction, but the projected context is what
+/// the provider charges for and what "the context is smaller" must mean.
+fn projected_context_bytes(turns: &[Turn]) -> usize {
+    rc_core::project(turns)
+        .iter()
+        .filter_map(|m| serde_json::to_vec(m).ok())
+        .map(|v| v.len())
+        .sum()
 }
 
 fn active_goal(turns: &[Turn]) -> Option<&str> {

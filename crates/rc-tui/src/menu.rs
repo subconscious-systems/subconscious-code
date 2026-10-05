@@ -117,13 +117,18 @@ pub(crate) struct MenuState {
     /// key, which requires a rebuilt client. `app` takes this after each
     /// commit and leaves the TUI with it.
     pub pending_outcome: Option<Outcome>,
+    /// Resolved provenance of the active API key ("(set via $…)", "(saved,
+    /// ~/.sc/key)", "(unset)"), computed once per open/refresh/commit. The
+    /// root page renders it from here so a per-frame redraw doesn't repeat
+    /// the env-var lookup and key-file `stat` per row.
+    pub api_key_source: String,
 }
 
 impl MenuState {
     /// Open the menu, reading the session listing from `sessions_dir` and
     /// resolving settings against `project_dir`.
     pub fn new(sessions_dir: &Path, project_dir: &Path) -> Self {
-        Self {
+        let mut menu = Self {
             page: MenuPage::Root,
             selected: 0,
             projects: group_projects(rc_session::list(sessions_dir)),
@@ -132,7 +137,30 @@ impl MenuState {
             editing_api_key: false,
             status: None,
             pending_outcome: None,
-        }
+            api_key_source: String::new(),
+        };
+        menu.resolve_api_key_source();
+        menu
+    }
+
+    /// Resolve where the active API key would come from. Env wins, so a set
+    /// env var is reported even when a key file also exists. Originally done
+    /// per row per frame; cached at open/refresh/save instead.
+    pub fn resolve_api_key_source(&mut self) {
+        let env_set = std::env::var(&self.settings.api_key_env)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
+        self.api_key_source = if env_set {
+            format!("(set via ${})", self.settings.api_key_env)
+        } else if rc_config::key_file_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+        {
+            "(saved, ~/.sc/key)".to_string()
+        } else {
+            "(unset)".to_string()
+        };
     }
 
     /// The current page's rows, in display order.
@@ -214,6 +242,7 @@ impl MenuState {
     pub fn refresh(&mut self, sessions_dir: &Path, project_dir: &Path) {
         self.projects = group_projects(rc_session::list(sessions_dir));
         self.settings = Settings::load(project_dir);
+        self.resolve_api_key_source();
         let n = self.rows().len();
         self.selected = self.selected.min(n.saturating_sub(1));
         self.status = Some("refreshed".into());
@@ -366,6 +395,7 @@ impl MenuState {
                 self.editing = None;
                 self.editing_api_key = false;
                 self.settings = Settings::load(project_dir);
+                self.resolve_api_key_source();
                 // The env var is still what a *fresh* `marathon` resolves first, so
                 // a saved key that differs from it reverts on the next launch.
                 // Reloading now is honest about both halves.
@@ -420,16 +450,24 @@ impl MenuState {
 
 /// Group sessions by their working directory, newest project first.
 ///
-/// `BTreeMap` keyed by path gives a deterministic grouping; the final sort is
-/// by recency, which is the order a picker wants.
+/// `BTreeMap` keyed by the project-identity key gives a deterministic
+/// grouping — and on case-insensitive filesystems (macOS default APFS, NTFS)
+/// `rc_session::project_key` folds case, so `/Repo` and `/repo` are one
+/// project instead of two near-empty ones (opencode #52501). The final sort
+/// is by recency, which is the order a picker wants.
 pub(crate) fn group_projects(sessions: Vec<SessionInfo>) -> Vec<Project> {
-    let mut by_dir: BTreeMap<PathBuf, Vec<SessionInfo>> = BTreeMap::new();
+    // (identity key → (display spelling from the first session, sessions))
+    let mut by_dir: BTreeMap<PathBuf, (PathBuf, Vec<SessionInfo>)> = BTreeMap::new();
     for s in sessions {
-        by_dir.entry(s.cwd.clone()).or_default().push(s);
+        by_dir
+            .entry(rc_session::project_key(&s.cwd))
+            .or_insert_with(|| (s.cwd.clone(), Vec::new()))
+            .1
+            .push(s);
     }
     let mut projects: Vec<Project> = by_dir
         .into_iter()
-        .map(|(dir, mut sessions)| {
+        .map(|(_, (dir, mut sessions))| {
             sessions.sort_by_key(|a| std::cmp::Reverse(a.modified));
             let last = sessions
                 .first()
@@ -507,6 +545,23 @@ mod tests {
     fn project_name_is_the_directory_leaf() {
         let projects = group_projects(vec![info("a", "/home/d/subconscious-code", 1, "x")]);
         assert_eq!(projects[0].name(), "subconscious-code");
+    }
+
+    /// opencode #52501: a case-spelling difference (`/Repo` vs `/repo`) is one
+    /// project on case-insensitive filesystems (macOS default APFS, NTFS),
+    /// not two near-empty groups. On Linux they remain distinct.
+    #[test]
+    fn case_spellings_of_one_project_do_not_split_the_group() {
+        let projects = group_projects(vec![
+            info("a", "/Alpaca/Cases", 100, "one"),
+            info("b", "/alpaca/cases", 300, "two"),
+        ]);
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert_eq!(projects.len(), 1, "one project, one group");
+            assert_eq!(projects[0].sessions.len(), 2);
+        } else {
+            assert_eq!(projects.len(), 2, "Linux paths are case-sensitive");
+        }
     }
 
     /// Selection wraps at both ends, so holding a direction never dead-ends.
@@ -744,7 +799,7 @@ mod tests {
     /// Build a menu without touching the real `~/.sc` — `MenuState::new` reads
     /// the disk, which a unit test must not depend on.
     fn state_with(sessions: Vec<SessionInfo>) -> MenuState {
-        MenuState {
+        let mut m = MenuState {
             page: MenuPage::Root,
             selected: 0,
             projects: group_projects(sessions),
@@ -753,6 +808,9 @@ mod tests {
             editing_api_key: false,
             status: None,
             pending_outcome: None,
-        }
+            api_key_source: String::new(),
+        };
+        m.resolve_api_key_source();
+        m
     }
 }

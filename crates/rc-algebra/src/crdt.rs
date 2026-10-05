@@ -75,9 +75,17 @@ impl PrefixSet {
         Self::default()
     }
 
-    /// Add `entry` under LWW: wins if `entry.epoch` is `>=` the current entry's
-    /// epoch and `>` any tombstone. A tombstone at a strictly higher epoch
-    /// suppresses the add.
+    /// Add `entry` under LWW: wins if `entry.epoch` is `>` any tombstone and
+    /// (epoch, context_key) lexicographically beats the current entry's. A
+    /// tombstone at a strictly higher epoch suppresses the add.
+    ///
+    /// Ties on equal epoch are broken by a **total order on the context_key
+    /// bytes**, not insert order: "last insert wins" would make `join` (which
+    /// clones `self` then folds in `other`) non-commutative for equal
+    /// (fingerprint, epoch) pairs with different payloads — `a.join(b) != b.join(a)`.
+    /// Comparing (epoch, context_key) keeps new entries from replacing an
+    /// entry that already sorts higher, so either fold order converges to the
+    /// same representative.
     pub fn add(&mut self, entry: PrefixEntry) {
         let fp = entry.fingerprint;
         if let Some(&tomb_epoch) = self.tombstones.get(&fp) {
@@ -87,8 +95,10 @@ impl PrefixSet {
             }
         }
         match self.entries.get(&fp) {
-            Some(existing) if existing.epoch > entry.epoch => {
-                // Older-than-current; keep current.
+            Some(existing)
+                if (existing.epoch, &existing.context_key) > (entry.epoch, &entry.context_key) =>
+            {
+                // Older-than-current (or equal and lower-ordered); keep current.
             }
             _ => {
                 self.entries.insert(fp, entry);
@@ -174,6 +184,70 @@ mod tests {
         let mut b = PrefixSet::new();
         b.add(entry(2, 1));
         assert_eq!(a.join(&b), b.join(&a));
+    }
+
+    /// The review's failure case: equal (fingerprint, epoch) with different
+    /// context keys. "Insert wins" made join non-commutative; the total-order
+    /// tie-break on the context_key bytes restores it and picks the same
+    /// representative from either side.
+    #[test]
+    fn join_is_commutative_on_equal_epoch_ties() {
+        let key = |lead: u8| {
+            let mut context_key = vec![0u8; 2048];
+            context_key[0] = lead;
+            context_key
+        };
+        let with_key = |fp: u64, epoch: u64, lead: u8| PrefixEntry {
+            fingerprint: fp,
+            context_key: key(lead),
+            epoch,
+        };
+        let mut a = PrefixSet::new();
+        a.add(with_key(7, 5, 0x11));
+        let mut b = PrefixSet::new();
+        b.add(with_key(7, 5, 0x22));
+        let joined_ab = a.join(&b);
+        let joined_ba = b.join(&a);
+        assert_eq!(
+            joined_ab, joined_ba,
+            "join must be commutative on equal (fingerprint, epoch) ties"
+        );
+        // Either fold order keeps the same representative — the entry whose
+        // context_key sorts higher, regardless of who folded into whom.
+        let live_ab = joined_ab.live();
+        assert_eq!(live_ab.len(), 1);
+        assert_eq!(live_ab[0].context_key[0], 0x22);
+        let live_ba = joined_ba.live();
+        assert_eq!(live_ba[0].context_key[0], 0x22);
+    }
+
+    /// The tie-break must not weaken plain LWW: a strictly higher epoch still
+    /// wins over a higher-sorted context key.
+    #[test]
+    fn higher_epoch_beats_context_key_order() {
+        let mut key_low = vec![0u8; 2048];
+        key_low[0] = 0xEE;
+        let mut key_high = vec![0u8; 2048];
+        key_high[0] = 0x01;
+        let mut a = PrefixSet::new();
+        a.add(PrefixEntry {
+            fingerprint: 7,
+            context_key: key_low,
+            epoch: 9,
+        });
+        let mut b = PrefixSet::new();
+        b.add(PrefixEntry {
+            fingerprint: 7,
+            context_key: key_high,
+            epoch: 3,
+        });
+        let joined = a.join(&b);
+        let live = joined.live();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].epoch, 9,
+            "epoch dominates the context_key tie-break"
+        );
     }
 
     #[test]

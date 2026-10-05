@@ -249,6 +249,20 @@ fn finalize_one(
     raw: String,
     confirmed: bool,
 ) -> FinalizedToolCall {
+    // Some OpenAI-compatible gateways emit tool-call deltas that never carry a
+    // function name (opencode #52700, "Fledge Alpha Free"-class). A nameless
+    // call cannot be dispatched; report it as a parse error carrying the raw
+    // bytes so the loop feeds the failure back instead of executing a
+    // fabricated `""`-named call that some registry would have to answer.
+    if name.is_empty() {
+        return FinalizedToolCall::ParseError {
+            index,
+            id: Some(id),
+            name: None,
+            raw_arguments: raw,
+            error: "tool call is missing its function name".to_string(),
+        };
+    }
     // Fast path: already valid → preserve the model's exact bytes. Holds even
     // when unconfirmed: a dropped finish_reason chunk after a complete call must
     // not be a false negative.
@@ -373,24 +387,63 @@ pub fn repair(input: &str) -> String {
 
 /// Incremental Server-Sent Events decoder. Feed bytes as they arrive; complete
 /// `data:` lines yield parsed chunks. `data: [DONE]` sets [`SseDecoder::is_done`].
-#[derive(Default)]
+///
+/// The buffer is **bounded**: a single line larger than [`SSE_MAX_LINE_BYTES`]
+/// (without a terminating newline) aborts with
+/// [`ProtoError::LineOverflow`] instead of growing without limit — a
+/// misbehaving or hostile endpoint must not be able to OOM the client by
+/// streaming one endless "data:" frame.
 pub struct SseDecoder {
     buf: BytesMut,
     done: bool,
+    /// Cap on the current (unterminated) line, in bytes.
+    max_line: usize,
 }
+
+/// Default SSE line cap: 4 MiB. Real chunks are single-digit KB; 4 MiB leaves
+/// room for a pathologically large single delta without inviting OOM.
+pub const SSE_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 impl SseDecoder {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            buf: BytesMut::new(),
+            done: false,
+            max_line: SSE_MAX_LINE_BYTES,
+        }
+    }
+
+    /// Test seam: a decoder with an artificially small line cap, so the
+    /// overflow path can be exercised with a few bytes instead of 4 MiB.
+    #[doc(hidden)]
+    pub fn with_max_line_len(max_line: usize) -> Self {
+        Self {
+            max_line,
+            ..Self::new()
+        }
     }
 
     pub fn is_done(&self) -> bool {
         self.done
     }
 
-    /// Feed a chunk of bytes; return any complete `data:` lines parsed.
+    /// Feed a chunk of bytes; return any complete `data:` lines parsed. If the
+    /// unterminated tail of the buffer already exceeds the line cap, the
+    /// buffer is dropped and an overflow error is returned — keep-feeding an
+    /// unbounded line is refused rather than buffered.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Result<ChatCompletionChunk, ProtoError>> {
         self.buf.extend_from_slice(bytes);
+        // Bounded either by the bytes after the last newline (no newline yet
+        // in the buffer at all) or the whole buffer (still no newline).
+        let tail_len = match memchr::memrchr(b'\n', &self.buf) {
+            Some(nl) => self.buf.len() - nl - 1,
+            None => self.buf.len(),
+        };
+        if tail_len > self.max_line {
+            let max = self.max_line;
+            self.buf.clear();
+            return vec![Err(ProtoError::LineOverflow { max })];
+        }
         self.drain_lines()
     }
 
@@ -441,6 +494,12 @@ impl SseDecoder {
         // Deep-debug only (RUST_LOG=rc_proto=trace): the raw SSE data payload.
         tracing::trace!("data: {rest_str}");
         vec![serde_json::from_str::<ChatCompletionChunk>(rest_str).map_err(ProtoError::Json)]
+    }
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -780,6 +839,69 @@ mod tests {
         assert!(dec.is_done(), "[DONE] sets done");
     }
 
+    // ---- bounded SSE line buffer (the unbounded-buffer review finding) -----
+
+    /// The review's case: one endless `data:` line with no newline. The
+    /// decoder must refuse to buffer it past the cap and return the distinct
+    /// overflow error rather than keeping (and growing) the bytes.
+    #[test]
+    fn sse_decoder_refuses_unbounded_lines_instead_of_ooming() {
+        let mut dec = SseDecoder::with_max_line_len(64);
+        // Under the cap with a newline: parses normally.
+        assert_eq!(dec.feed(b"data: {\"choices\":[]}\n\n").len(), 1);
+        // One over-cap line in small increments: cross the cap piecewise so
+        // no single feed is large (the "many small strings" shape) and assert
+        // the error, not an ever-growing buffer.
+        let mut fed = 0usize;
+        let mut overflow_at = None;
+        for piece in std::iter::repeat_n(&b"xxxxxxxxxxxxxxxxx"[..], 20) {
+            let out = dec.feed(piece);
+            fed += piece.len();
+            if let [single] = out.as_slice() {
+                assert!(
+                    matches!(single, Err(ProtoError::LineOverflow { max: 64 })),
+                    "expected LineOverflow at {fed} bytes, got {single:?}"
+                );
+                overflow_at = Some(fed);
+                break;
+            }
+            assert!(
+                out.is_empty(),
+                "partial line must not parse: {out:?} (fed {fed})"
+            );
+        }
+        assert!(
+            overflow_at.is_some(),
+            "a >{{64}}-byte line with no newline must overflow (fed {fed})"
+        );
+        // The buffer was dropped at the cap: memory does not keep growing.
+        assert!(
+            dec.finish().is_empty(),
+            "nothing left buffered after overflow"
+        );
+    }
+
+    /// A line that stays under the cap — even split across feeds with no
+    /// newline for a while — still parses fine at the newline.
+    #[test]
+    fn sse_decoder_under_the_cap_still_parses() {
+        let mut dec = SseDecoder::with_max_line_len(256);
+        let line = br#"data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}"#;
+        // Feed in small pieces with no newlines until the final delimiter.
+        let (rest, last) = line.split_at(line.len() - 8);
+        for piece in rest.chunks(3) {
+            let out = dec.feed(piece);
+            assert!(out.is_empty(), "partial line must not parse: {out:?}");
+        }
+        // The completing feed carries the line terminator: without it the
+        // buffer still holds an unterminated (partial) line and parses nothing.
+        let mut completion = last.to_vec();
+        completion.extend_from_slice(b"\n\n");
+        let out = dec.feed(&completion);
+        assert_eq!(out.len(), 1, "the completed line must parse: {out:?}");
+        out[0].as_ref().expect("valid chunk parses");
+    }
+
     #[test]
     fn fuser_assembles_tool_calls_and_finishes() {
         let mut f = StreamFuser::new();
@@ -864,6 +986,107 @@ mod tests {
                 ("read-1", "Read", r#"{"file_path":"src/lib.rs"}"#),
                 ("grep-1", "Grep", r#"{"pattern":"needle"}"#),
             ]
+        );
+    }
+
+    // ---- upstream gateway deltas (opencode #52700/#52691) -------------------
+
+    #[test]
+    fn nameless_tool_call_is_a_parse_error_not_an_empty_dispatch() {
+        // A gateway that streams arguments but never a function name cannot be
+        // dispatched as a `""`-named tool; it surfaces as a named parse error
+        // the loop feeds back to the model.
+        let mut f = StreamFuser::new();
+        for _ in f.apply(call_chunk("c1", "", r#"{"command":"ls"}"#)) {}
+        let evs = f.apply(finish_chunk("tool_calls"));
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                AgentStreamEvent::ToolCallFailed {
+                    id, error, name, ..
+                } if id.as_deref() == Some("c1")
+                    && name.is_none()
+                    && error.contains("missing its function name")
+            )),
+            "nameless call must fail with the specific error, got {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(
+                |e| matches!(e, AgentStreamEvent::ToolCallReady { name, .. } if name.is_empty())
+            ),
+            "no ready call with an empty name may reach the loop"
+        );
+    }
+
+    #[test]
+    fn idless_tool_call_gets_a_stable_synthesized_id() {
+        // Deltas with neither id nor name: the slot still pairs end-to-end via
+        // the index-derived id, and the missing *name* is the reported problem.
+        let mut f = StreamFuser::new();
+        let idless = ChatCompletionChunk {
+            id: String::new(),
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: None,
+                        function: Some(FunctionDelta {
+                            name: None,
+                            arguments: Some(r#"{"x":1}"#.to_string()),
+                        }),
+                    }],
+                    ..Delta::default()
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let mut evs = f.apply(idless);
+        evs.extend(f.apply(finish_chunk("tool_calls")));
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                AgentStreamEvent::ToolCallFailed { id, .. } if id.as_deref() == Some("call_0")
+            )),
+            "the synthesized id keeps the pair intact, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn finish_tool_calls_with_no_deltas_yields_an_empty_confirmation() {
+        // opencode #52691: some gateways send finish_reason=tool_calls with no
+        // tool_calls delta at all. The fuser reports an empty, confirmed finish
+        // (no fabricated calls); the agent loop decides the recovery.
+        let mut f = StreamFuser::new();
+        let mut evs = f.apply(
+            serde_json::from_str::<ChatCompletionChunk>(
+                r#"{"choices":[{"index":0,"delta":{"content":"I'll check."},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap(),
+        );
+        evs.extend(f.apply(
+            serde_json::from_str::<ChatCompletionChunk>(
+                r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap(),
+        ));
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, AgentStreamEvent::ToolCallReady { .. })),
+            "no call may be fabricated from nothing"
+        );
+        let finishes: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                AgentStreamEvent::Finish { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            finishes.contains(&FinishReason::ToolCalls),
+            "the declared finish must pass through: {finishes:?}"
         );
     }
 

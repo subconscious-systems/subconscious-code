@@ -199,7 +199,11 @@ pub struct ChatCompletionResponse {
 pub struct Choice {
     pub index: u32,
     pub message: ResponseMessage,
-    pub finish_reason: String,
+    /// `None` when the provider omits it (some OpenAI-compatible gateways do
+    /// on the non-streaming path, so it is optional rather than required —
+    /// a missing marker must not fail the whole response parse).
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -356,6 +360,24 @@ mod tests {
             with_calls.tool_calls.len(),
             1,
             "a real tool call still parses"
+        );
+    }
+    /// Some OpenAI-compatible gateways omit `finish_reason` on the
+    /// non-streaming path; the field is optional so a missing marker deserializes
+    /// instead of failing the whole response.
+    #[test]
+    fn choice_finish_reason_is_optional() {
+        let with: Choice = serde_json::from_str(
+            r#"{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}"#,
+        )
+        .unwrap();
+        assert_eq!(with.finish_reason.as_deref(), Some("stop"));
+        let without: Choice =
+            serde_json::from_str(r#"{"index":0,"message":{"role":"assistant","content":"ok"}}"#)
+                .unwrap();
+        assert_eq!(
+            without.finish_reason, None,
+            "absent finish_reason must parse"
         );
     }
 }

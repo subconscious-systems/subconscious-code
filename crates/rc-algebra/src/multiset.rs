@@ -41,6 +41,12 @@ impl LtHash {
     pub const ZERO: Self = Self([0; 1024]);
 
     /// Add `block`'s group element: `self += H(block)` (elementwise u16 add).
+    ///
+    /// The limbs add **modulo 2¹⁶** (u16 wrapping) — that wraparound is the
+    /// group operation, not an overflow bug: the accumulator lives in
+    /// `(ℤ/2¹⁶)^1024`, so a limb that wraps simply continues counting and
+    /// duplicates still fail to cancel (`x + x ≢ 0`). Everything downstream
+    /// (`remove`, equality, the 2048-byte key) sees the wrapped limbs.
     pub fn add_block(&mut self, block: &BlockId) {
         let elem = expand_to_element(block);
         add_assign(&mut self.0, &elem);
@@ -372,7 +378,10 @@ impl ContextSet {
         }
     }
 
-    /// The live block ids, in insertion order.
+    /// The live block ids. Insertion order is preserved until the first
+    /// [`evict`](Self::evict), which removes by swap (O(1)) — after any
+    /// eviction the order is unspecified, so callers must not rely on it.
+    /// The [`context_key`](Self::context_key) is order-independent regardless.
     pub fn blocks(&self) -> &[BlockId] {
         &self.blocks
     }

@@ -38,20 +38,33 @@ impl PendingAsks {
     pub(crate) fn register(&self) -> (u64, oneshot::Receiver<AskResponse>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.map.lock().unwrap().insert(id, tx);
+        self.map
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, tx);
         (id, rx)
     }
 
     /// Fulfill a pending ask (no-op if it was already cancelled/dropped).
     pub(crate) fn resolve(&self, id: u64, response: AskResponse) {
-        if let Some(tx) = self.map.lock().unwrap().remove(&id) {
+        if let Some(tx) = self
+            .map
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id)
+        {
             let _ = tx.send(response);
         }
     }
 
     /// Cancel every pending ask — each resolves as `Deny` so its prompter unblocks.
     pub(crate) fn drain_cancel(&self) {
-        for (_, tx) in self.map.lock().unwrap().drain() {
+        for (_, tx) in self
+            .map
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain()
+        {
             let _ = tx.send(AskResponse::Deny("cancelled by user".into()));
         }
     }

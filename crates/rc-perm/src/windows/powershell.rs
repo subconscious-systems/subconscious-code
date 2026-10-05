@@ -183,6 +183,37 @@ mod tests {
         ));
     }
 
+    /// opencode #52615: their tree-sitter PowerShell grammar *derived* a grant
+    /// pattern from the command and truncated it at `=value`, or skipped
+    /// `--`-terminated commands entirely (allow rules never matched, checks
+    /// were bypassed). marathon's exact-byte grant has no derivation to get
+    /// wrong — the grant is the hex of the full command string — so every one
+    /// of the shapes from that issue round-trips byte-exactly, and no command
+    /// is ever silently skipped.
+    #[test]
+    fn exact_grants_round_trip_the_52615_command_shapes() {
+        let commands = [
+            // Truncated at `=` by their grammar.
+            r#"git diff --flag=value a b --"#,
+            // Produced zero parse nodes there — no check ran at all.
+            "chezmoi git -- push",
+            // Their real-world 380-char lossy case, in full.
+            "env -i PATH=\"$PATH\" LC_ALL=C git --no-pager diff --name-status \\
+             32fd1b4373498369c 6f3ceb2e56dc712a --ignore-submodules=none --",
+        ];
+        for command in commands {
+            let grants = [exact_grant(command)];
+            assert!(
+                matches!(check(Mode::Default, command, &grants), Decision::Allow),
+                "full-command grant must match byte-exactly: {command:?}"
+            );
+            let extended = format!("{command} ; Get-Location");
+            assert!(
+                matches!(check(Mode::Default, &extended, &grants), Decision::Ask(_)),
+                "any extension must still ask: {extended:?}"
+            );
+        }
+    }
     #[test]
     fn destructive_floor_and_deny_rules_override_grants() {
         for script in [

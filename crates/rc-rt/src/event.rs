@@ -77,6 +77,11 @@ pub enum AgentEvent {
     /// A host-side notice from the driver (e.g. `/rewind` outcome). Rendered as
     /// a system line, never injected into the model's prompt.
     Notice(String),
+    /// The context was compacted and the projection boundary moved: hosts
+    /// should reset any context-usage meter fed from `Usage` events (codex
+    /// #50337 — a meter still showing the pre-compaction count looks like
+    /// compaction did nothing).
+    Compacted,
 }
 
 /// A bounded, single-consumer event queue. Streaming deltas are coalesced at

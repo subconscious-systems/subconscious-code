@@ -2535,3 +2535,251 @@ async fn permission_check_uses_cwd_from_an_earlier_batch_barrier() {
     assert_eq!(checks[0].1, dir.path());
     assert_eq!(checks[1].1, dir.path().join("subdir"));
 }
+
+// ---- upstream loop-robustness fixes (opencode #52372/#52763/#52691) --------
+
+/// Always fails, deterministically, with the same message — the shape of the
+/// `Read`-on-a-binary retry loop the breaker exists to stop.
+struct Boom {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Tool for Boom {
+    fn name(&self) -> &str {
+        "Boom"
+    }
+    fn description(&self) -> &str {
+        "Always fails with the same error."
+    }
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Parallel
+    }
+    async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolOutcome::Error {
+            message: "cannot render: the file is a binary image".into(),
+            retryable: true,
+        })
+    }
+}
+
+/// opencode #52372/#52763: a model that re-issues the *identical* failing call
+/// gets three executed failures, one explained refusal (paired, not executed),
+/// and — once it re-issues the same call yet again — a terminal
+/// `RepeatedFailure` instead of an unbounded money-burning loop.
+#[tokio::test]
+async fn identical_failing_calls_trip_the_circuit_breaker() {
+    let boom = Arc::new(Boom {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let registry = Arc::new(ToolRegistry::new(vec![boom.clone() as Arc<dyn Tool>]));
+    let response = |id: &str| ModelResponse {
+        retries: 0,
+        text: String::new(),
+        reasoning: None,
+        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+            id: id.into(),
+            name: "Boom".into(),
+            arguments: r#"{"file_path":"img.png"}"#.into(),
+        })],
+        finish_reason: FinishReason::ToolCalls,
+        usage: None,
+    };
+    let model = Arc::new(MockModel::new(vec![
+        response("c1"),
+        response("c2"),
+        response("c3"),
+        response("c4"),
+        response("c5"),
+    ])) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new("repeat-breaker".into(), std::env::temp_dir(), "mock".into());
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "read the image".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::RepeatedFailure);
+    // Three executed failures, one refusal — the fifth re-issue never ran.
+    assert_eq!(
+        boom.calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the breaker must stop re-executing the identical call"
+    );
+    let results: Vec<&Turn> = session
+        .messages
+        .iter()
+        .filter(|t| matches!(t, Turn::ToolResult { .. }))
+        .collect();
+    // 3 executed failures + 1 paired refusal + 1 Interrupted pairing for the
+    // re-issue that ended the turn (never executed either).
+    assert_eq!(results.len(), 5);
+    assert!(
+        session.messages.iter().any(|t| matches!(
+            t,
+            Turn::ToolResult {
+                result: ToolResultBody::Error { message, .. },
+                ..
+            } if message.contains("declined to re-run this exact call")
+        )),
+        "the refusal must explain itself to the model"
+    );
+    assert!(
+        session.messages.iter().any(|t| matches!(
+            t,
+            Turn::ToolResult {
+                result: ToolResultBody::Interrupted,
+                ..
+            }
+        )),
+        "the never-executed re-issue is paired with an Interrupted result"
+    );
+    assert!(
+        session.messages.iter().any(|t| matches!(
+            t,
+            Turn::SystemNote { kind: rc_core::NoteKind::Recovery, text }
+                if text.contains("failed identically three times")
+        )),
+        "the terminal note must be in history"
+    );
+    // The tool-answer invariant survives the breaker: every call is paired.
+    assert!(verify_invariant(&project(&session.messages)).is_ok());
+}
+
+/// opencode #52475-adjacent: a *changed* call (different arguments, or a
+/// different error) must reset the pattern — the breaker may only trip on
+/// identical failures, otherwise fresh attempts look like a loop.
+#[tokio::test]
+async fn changing_the_arguments_resets_the_failure_pattern() {
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Boom {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    }) as Arc<dyn Tool>]));
+    let response = |id: &str, args: &str| ModelResponse {
+        retries: 0,
+        text: String::new(),
+        reasoning: None,
+        tool_calls: vec![FinalizedToolCall::Call(ToolCall {
+            id: id.into(),
+            name: "Boom".into(),
+            arguments: args.into(),
+        })],
+        finish_reason: FinishReason::ToolCalls,
+        usage: None,
+    };
+    // Three failures — but a different file each time: honest retries, no loop.
+    let model = Arc::new(MockModel::new(vec![
+        response("c1", r#"{"file_path":"a.png"}"#),
+        response("c2", r#"{"file_path":"b.png"}"#),
+        response("c3", r#"{"file_path":"c.png"}"#),
+        ModelResponse {
+            retries: 0,
+            text: "gave up gracefully".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        },
+    ])) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new("breaker-reset".into(), std::env::temp_dir(), "mock".into());
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "try three files".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::Stop);
+    assert!(
+        !session.messages.iter().any(|t| matches!(
+            t,
+            Turn::ToolResult {
+                result: ToolResultBody::Error { message, .. },
+                ..
+            } if message.contains("declined to re-run")
+        )),
+        "honest retries must never see a refusal"
+    );
+}
+
+/// opencode #52691: `finish_reason=tool_calls` with no tool-call delta is a
+/// gateway protocol failure. Recovery notes give the model two chances to
+/// reissue; a third empty marker ends the turn `Incomplete` instead of
+/// spinning forever on the same empty response.
+#[tokio::test]
+async fn empty_tool_calls_marker_gets_bounded_recovery() {
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(Echo) as Arc<dyn Tool>]));
+    let response = || ModelResponse {
+        retries: 0,
+        text: "on it".into(),
+        reasoning: None,
+        tool_calls: vec![],
+        finish_reason: FinishReason::ToolCalls,
+        usage: None,
+    };
+    let model =
+        Arc::new(MockModel::new(vec![response(), response(), response()])) as Arc<dyn Model>;
+    let agent = AgentLoop::new(
+        model,
+        registry,
+        Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>,
+    );
+    let mut session = Session::new(
+        "empty-tool-calls".into(),
+        std::env::temp_dir(),
+        "mock".into(),
+    );
+
+    let outcome = agent
+        .run(
+            &mut session,
+            "go".into(),
+            &NullSink,
+            &NullPrompter,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, rc_core::LoopOutcome::Incomplete);
+    let notes = session
+        .messages
+        .iter()
+        .filter(|t| {
+            matches!(
+                t,
+                Turn::SystemNote { kind: rc_core::NoteKind::Recovery, text }
+                    if text.contains("carried no tool-call data")
+            )
+        })
+        .count();
+    assert_eq!(
+        notes, 2,
+        "the recovery budget is two notes before the turn ends"
+    );
+    assert!(verify_invariant(&project(&session.messages)).is_ok());
+}

@@ -336,7 +336,9 @@ impl Prepared {
         command
             .args(&self.args)
             .current_dir(cwd)
-            .creation_flags(CREATE_SUSPENDED)
+            // CREATE_NO_WINDOW (opencode #52281, codex #50193): a console shell
+            // spawned without it flashes a blank window per invocation.
+            .creation_flags(CREATE_SUSPENDED | rc_core::windows_process::CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

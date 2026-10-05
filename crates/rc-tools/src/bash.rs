@@ -34,6 +34,7 @@ use std::collections::VecDeque;
 use std::os::unix::process::{CommandExt as StdCommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -114,7 +115,9 @@ bounded. Default \
 timeout 120s, max 600s. stdin is closed — commands that read input see EOF; use \
 non-interactive flags (`-y`, `--no-pager`, `git --no-pager`). Pipelines use `pipefail`, so \
 any failed stage makes the reported exit non-zero; do not pipe builds or tests to `head`/`tail`, \
-which hides useful diagnostics. \
+which hides useful diagnostics. Multi-command batches (`;`/newline sequences) also run with \
+`-e`: the *first* failing command ends the batch with its own status, so an early failure is \
+never masked by a later success. \
 Set `run_in_background: true` \
 for long-running servers; output goes to a bounded rotating log file you can `Read` to check progress."
     )
@@ -156,6 +159,18 @@ impl Tool for Bash {
                 .min(MAX_TIMEOUT_MS),
         );
         let (shell, shell_args) = env_hygiene::resolve_shell();
+        // codex/opencode #50301: a `;`/newline batch reports only the *last*
+        // command's status — an earlier failure can hide behind a final
+        // success. A detected batch runs with `-e` so the first failure is the
+        // one the model sees. POSIX `-e` never fires on `&&`/`||` operands, so
+        // intentional chains keep their semantics.
+        let (shell, shell_args) = if batched_fail_fast(&inp.command) {
+            let mut args = shell_args;
+            args.push("-e".into());
+            (shell, args)
+        } else {
+            (shell, shell_args)
+        };
 
         let mut cmd = tokio::process::Command::new(&shell);
         cmd.args(&shell_args).arg("-c").arg(&inp.command);
@@ -192,28 +207,51 @@ impl Tool for Bash {
             }
         };
         let mut process_group = ProcessGroupGuard::new(child.id());
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        let mut out_buf = BoundedCapture::new(FOREGROUND_CAPTURE_BYTES_PER_STREAM);
-        let mut err_buf = BoundedCapture::new(FOREGROUND_CAPTURE_BYTES_PER_STREAM);
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let out_buf = Arc::new(std::sync::Mutex::new(BoundedCapture::new(
+            FOREGROUND_CAPTURE_BYTES_PER_STREAM,
+        )));
+        let err_buf = Arc::new(std::sync::Mutex::new(BoundedCapture::new(
+            FOREGROUND_CAPTURE_BYTES_PER_STREAM,
+        )));
+        // codex #50141: the turn is decided by the *shell's* exit, not by the
+        // EOF of a pipe some detached grandchild still holds. The drains run as
+        // tasks against shared captures; when the shell exits they get a short
+        // grace to finish, then the group is killed and whatever arrived is the
+        // result (with a visible note that the tail is missing). The old shape
+        // awaited pipe EOF *before* `wait`, so a `Start-Process
+        // -RedirectStandardOutput`-style detour held the whole tool until its
+        // timeout on every platform.
+        let drain_out = tokio::spawn(drain_capture(stdout, out_buf.clone()));
+        let drain_err = tokio::spawn(drain_capture(stderr, err_buf.clone()));
 
-        let drain = async {
-            let (o, e) = tokio::join!(
-                drain_bounded(&mut stdout, &mut out_buf),
-                drain_bounded(&mut stderr, &mut err_buf),
-            );
-            let _ = (o, e);
-            child.wait().await
-        };
-
-        match tokio::time::timeout(timeout, drain).await {
-            Ok(Ok(status)) => {
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(result) => {
+                let status = match result {
+                    Ok(status) => status,
+                    Err(e) => {
+                        process_group.kill();
+                        drain_out.abort();
+                        drain_err.abort();
+                        return Ok(ToolOutcome::Error {
+                            message: format!("spawn failed: {e}"),
+                            retryable: false,
+                        });
+                    }
+                };
                 // The shell has exited, but a command may have daemonized a
                 // grandchild after redirecting its pipes. Foreground calls do
-                // not own detached work, so clean any survivors in the group.
+                // not own detached work: bounded grace for the pipe EOF, then
+                // clean any survivors in the group and keep what arrived.
+                let drains_finished = tokio::time::timeout(PIPE_EOF_GRACE, async {
+                    let _ = tokio::join!(drain_out, drain_err);
+                })
+                .await
+                .is_ok();
                 process_group.kill();
-                let (stdout_capture_truncated, stdout) = out_buf.render();
-                let (stderr_capture_truncated, stderr) = err_buf.render();
+                let (stdout_capture_truncated, stdout) = render_capture(&out_buf);
+                let (stderr_capture_truncated, stderr) = render_capture(&err_buf);
                 let stdout = strip_ansi(&stdout);
                 let stderr = strip_ansi(&stderr);
                 let mut combined = stdout;
@@ -221,10 +259,18 @@ impl Tool for Bash {
                     combined.push_str("\n--- stderr ---\n");
                     combined.push_str(&stderr);
                 }
+                if !drains_finished {
+                    combined.push_str(
+                        "\n[… capture cut: a background process still holds the output pipe; \
+output after the command exited may be missing …]\n",
+                    );
+                }
                 let (head, tail) = self.head_tail();
                 let (result_truncated, body) = cap_output(&combined, self.cap, head, tail);
-                let truncated =
-                    stdout_capture_truncated || stderr_capture_truncated || result_truncated;
+                let truncated = stdout_capture_truncated
+                    || stderr_capture_truncated
+                    || result_truncated
+                    || !drains_finished;
                 let exit = status.code().map(|c| c.to_string()).unwrap_or_else(|| {
                     status
                         .signal()
@@ -271,19 +317,17 @@ impl Tool for Bash {
                     artifacts: Vec::new(),
                 })
             }
-            Ok(Err(e)) => Ok(ToolOutcome::Error {
-                message: format!("spawn failed: {e}"),
-                retryable: false,
-            }),
             Err(_) => {
                 // Timed out: kill the child (closing its pipes) and reap it, then
                 // surface the partial output captured before the timeout so the
                 // model can see where the command hung without re-running it.
                 process_group.kill();
+                drain_out.abort();
+                drain_err.abort();
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let (_, stdout) = out_buf.render();
-                let (_, stderr) = err_buf.render();
+                let (_, stdout) = render_capture(&out_buf);
+                let (_, stderr) = render_capture(&err_buf);
                 let stdout = strip_ansi(&stdout);
                 let stderr = strip_ansi(&stderr);
                 let mut combined = stdout;
@@ -478,27 +522,65 @@ impl BoundedCapture {
     }
 }
 
-async fn drain_bounded<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    capture: &mut BoundedCapture,
-) -> std::io::Result<()> {
+/// How long after the shell exits its output pipes may still be settling
+/// before the foreground result cuts them off (codex #50141). A well-behaved
+/// command's pipes EOF instantly; a daemonized grandchild still holding the
+/// write end is *detached work* and must not delay the tool's result beyond
+/// this grace.
+const PIPE_EOF_GRACE: Duration = Duration::from_millis(300);
+
+/// Drain one output pipe into a shared bounded capture. Runs as its own task
+/// so the caller decides completion by process exit; a read error or EOF ends
+/// the task (the capture keeps everything pushed so far).
+async fn drain_capture<R: AsyncRead + Unpin>(
+    mut pipe: R,
+    capture: Arc<std::sync::Mutex<BoundedCapture>>,
+) {
     let mut chunk = [0u8; 16 * 1024];
     loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(());
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(&chunk[..n]),
         }
-        capture.push(&chunk[..read]);
     }
+}
+
+/// Snapshot a shared capture for rendering.
+fn render_capture(capture: &Arc<std::sync::Mutex<BoundedCapture>>) -> (bool, String) {
+    capture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .render()
+}
+
+/// opencode/codex #50301: `;`/newline-separated batches report only the *last*
+/// command's exit status, so an earlier failure hides behind a final success
+/// (`-o pipefail` only covers pipelines). Marathon runs a detected
+/// multi-command batch with `-e` so the first failing command ends the shell
+/// with its own status. Detection is conservative — anything `parse_bash`
+/// cannot tokenize runs unchanged. POSIX `-e` exempts `&&`/`||` operands, so
+/// intentional chains keep their semantics.
+fn batched_fail_fast(command: &str) -> bool {
+    let parsed = parse_bash(command);
+    !parsed.unparseable && parsed.subcommands.len() > 1
 }
 
 /// Apply env hygiene (drop secrets, set non-interactive vars) to a tokio
 /// `Command`. `PATH` is set separately by the caller.
+///
+/// Enumerates with `vars_os`, never `vars()`: codex #50149 — an inherited
+/// environment variable whose name or value is not valid UTF-8 (a stray
+/// locale, a binary's export) must not panic the whole Bash tool. Names are
+/// suffixed-checked lossily and removed as `OsString`s.
 fn apply_env_hygiene(cmd: &mut tokio::process::Command) {
     cmd.env_remove("SC_API_KEY");
-    for (k, _) in std::env::vars() {
+    for (k, _) in std::env::vars_os() {
+        let k = k.to_string_lossy();
         if k.ends_with("_API_KEY") || k.ends_with("_TOKEN") || k.ends_with("_SECRET") {
-            cmd.env_remove(&k);
+            cmd.env_remove(k.as_ref());
         }
     }
     cmd.env("GIT_PAGER", "cat")
@@ -512,9 +594,10 @@ fn apply_env_hygiene(cmd: &mut tokio::process::Command) {
 /// Same env hygiene for a std `Command` (background shells).
 fn apply_env_hygiene_std(cmd: &mut Command) {
     cmd.env_remove("SC_API_KEY");
-    for (k, _) in std::env::vars() {
+    for (k, _) in std::env::vars_os() {
+        let k = k.to_string_lossy();
         if k.ends_with("_API_KEY") || k.ends_with("_TOKEN") || k.ends_with("_SECRET") {
-            cmd.env_remove(&k);
+            cmd.env_remove(k.as_ref());
         }
     }
     cmd.env("GIT_PAGER", "cat")
@@ -1181,5 +1264,128 @@ mod tests {
             }
             o => panic!("expected an error, got {o:?}"),
         }
+    }
+    // ---- upstream shell-tool fixes (codex #50301/#50141/#50149) --------------
+
+    /// codex #50301: in a `;`/newline batch the *first* failure must be the
+    /// reported one, not hidden behind the last command's success.
+    #[tokio::test]
+    async fn batched_commands_fail_fast_on_the_first_failure() {
+        let dir = tempdir().unwrap();
+        let out = Bash::new()
+            .call(
+                json!({"command": "false; echo \"should not run\""}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.starts_with("exit: 1"), "{content}");
+                assert!(
+                    !content.contains("should not run"),
+                    "an earlier failure must end the batch: {content}"
+                );
+            }
+            o => panic!("expected a shell result, got {o:?}"),
+        }
+
+        // `||` operands are exempt from `-e` by POSIX: fallbacks still run.
+        let out = Bash::new()
+            .call(
+                json!({"command": "false || echo fallback"}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutcome::Ok { content, .. } => {
+                assert!(content.starts_with("exit: 0"), "{content}");
+                assert!(content.contains("fallback"), "{content}");
+            }
+            o => panic!("expected a shell result, got {o:?}"),
+        }
+
+        // A lone failing command is unchanged (no batch stationed around it).
+        let out = Bash::new()
+            .call(
+                json!({"command": "cd /nonexistent-dir-xyz || true && cd /also-no"}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        match out {
+            // `||`-guarded cds never trip -e; this all-chain is one batch by
+            // parser lights, but every guarded failure lands on `true` or the
+            // final cd — which fails and is *the last* command: exit != 0.
+            ToolOutcome::Ok { content, .. } => assert!(
+                !content.starts_with("exit: 0"),
+                "the final failing cd must surface: {content}"
+            ),
+            other => panic!("expected a shell result, got {other:?}"),
+        }
+    }
+
+    /// codex #50149: an environment variable whose *value* is not valid UTF-8
+    /// must not panic the tool (`env::vars()` did exactly that; the sweep now
+    /// uses `vars_os`).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn non_utf8_env_vars_do_not_panic_the_tool() {
+        let name = std::ffi::CString::new(b"SC_TEST_INVALID_ENV_1".to_vec()).unwrap();
+        let value = std::ffi::CString::new(vec![0xC3, 0x28]).unwrap(); // invalid UTF-8
+                                                                       // SAFETY: setenv with a constant NUL-terminated name; the value is
+                                                                       // copied by libc. Removed again below so sibling tests never see it.
+        unsafe {
+            assert_eq!(libc::setenv(name.as_ptr(), value.as_ptr(), 1), 0);
+        }
+        let dir = tempdir().unwrap();
+        let result = Bash::new()
+            .call(json!({"command": "echo survived"}), &test_ctx(dir.path()))
+            .await;
+        // SAFETY: symmetric removal of the test fixture name.
+        unsafe {
+            libc::unsetenv(name.as_ptr());
+        }
+        // Before the fix this panicked inside `apply_env_hygiene`.
+        let out = result.unwrap();
+        match out {
+            ToolOutcome::Ok { content, .. } => assert!(content.contains("survived"), "{content}"),
+            o => panic!("expected a shell result, got {o:?}"),
+        }
+    }
+
+    /// codex #50141: a command that daemonizes a child still holding the
+    /// stdout pipe must not hold the tool until its timeout — the result is
+    /// decided by the shell's exit (plus a bounded grace), the capture is cut
+    /// with a visible note, and the surviving group is killed.
+    #[tokio::test]
+    async fn a_grandchild_holding_the_pipe_cuts_the_result_instead_of_hanging() {
+        let dir = tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let out = Bash::new()
+            .call(
+                json!({"command": "echo ready; sleep 30 &", "timeout_ms": 10_000}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let content = match out {
+            ToolOutcome::Ok { content, .. } => content,
+            o => panic!("expected a shell result, got {o:?}"),
+        };
+        assert!(
+            content.contains("ready"),
+            "the shell's own output must survive the cut: {content}"
+        );
+        assert!(
+            content.contains("capture cut"),
+            "the user must be told the tail is missing: {content}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the tool must not wait for the detached sleeper (took {elapsed:?}, timeout 10s)"
+        );
     }
 }

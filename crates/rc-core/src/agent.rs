@@ -38,6 +38,11 @@ pub enum LoopOutcome {
     /// Two consecutive completion-limit responses made no visible or tool
     /// progress. Continuing again would only spend another model allowance.
     NoProgress,
+    /// The identical-failure circuit breaker tripped (opencode #52372/#52763):
+    /// the model re-issued the exact same failing call after the harness had
+    /// already refused one plain retry with an explanation. Not a successful
+    /// `Stop` — but everything up to the refusal stayed paired in history.
+    RepeatedFailure,
     /// The provider ended the response without a clean terminal marker (or a
     /// content filter stopped it). This is not a successful `Stop` outcome.
     Incomplete,
@@ -82,6 +87,58 @@ const MAX_LENGTH_RECOVERIES_PER_TURN: u32 = 1;
 /// Repeated unconfirmed mutations are terminal: executing them is unsafe and
 /// retrying forever only grows the malformed-history surface.
 const MAX_UNCONFIRMED_TOOL_RECOVERIES_PER_TURN: u32 = 1;
+/// opencode #52691: some gateways end a response with `finish_reason=tool_calls`
+/// but never assemble a tool call. That is a protocol failure, not a turn
+/// boundary; the model gets the recovery note so it can reissue the call for
+/// real. The budget is small: a gateway that repeats the failure twice in one
+/// turn is broken, and the turn ends `Incomplete` rather than burning requests.
+const EMPTY_TOOL_CALLS_RECOVERY: &str = "[harness recovery] Your previous response ended with \
+finish_reason=tool_calls but carried no tool-call data (a known gateway failure mode). Reissue \
+the intended tool call(s) with complete arguments, or answer in text now.";
+const MAX_EMPTY_TOOL_CALL_RECOVERIES_PER_TURN: u32 = 2;
+
+/// Consecutive identical failures of the *same* call — same tool name, same
+/// argument bytes, same error text — before the circuit breaker refuses to run
+/// it again (opencode #52372: an agent can spend a whole session retrying a
+/// failing `Read` on a binary file; opencode #52763: repetition loops across
+/// providers). Three was opencode's observed in-the-wild threshold between an
+/// honest retry and a stuck loop.
+const IDENTICAL_FAILURE_LIMIT: u32 = 3;
+
+/// Per-turn state for the identical-failure circuit breaker. Keyed by
+/// (tool name, argument bytes). Deliberately per-turn: a fresh user prompt
+/// legitimately retries a call that failed during the previous turn, and the
+/// model *changing* the arguments or the error text changing are both
+/// observable progress that must reset the pattern (opencode #52475: counting
+/// only normalized stdout made fresh-looking retries look identical).
+struct RepeatFailure {
+    failures: u32,
+    last_error: String,
+    /// The breaker has already refused one re-issue of this exact call.
+    refused: bool,
+}
+
+/// The error result the breaker records when it declines to re-run a call.
+fn refused_repeat_message(entry: &RepeatFailure) -> String {
+    let shown = if entry.last_error.len() > 300 {
+        format!("{}…", &entry.last_error[..300])
+    } else {
+        entry.last_error.clone()
+    };
+    format!(
+        "the harness declined to re-run this exact call: it has failed {} time(s) in a row with \
+         the same error (‹{shown}›). Change the arguments or the approach; repeating it unchanged \
+         will not succeed and ends the turn.",
+        entry.failures
+    )
+}
+
+/// The note paired with the terminal outcome once the model re-issues a refused
+/// call: paired into history so both the user and any resumed session see why
+/// the turn stopped.
+const REPEAT_BREAKER_NOTE: &str = "[harness] That exact tool call failed identically three \
+times, was declined a fourth time with an explanation, and was then re-issued unchanged. The turn \
+was stopped so you can take over; nothing was lost — ask the agent to change approach.";
 /// Keep failure diagnostics useful without duplicating an arbitrarily large
 /// generated document or hidden reasoning trace in memory/session storage.
 const PARTIAL_STREAM_FIELD_BYTES: usize = 16 * 1024;
@@ -381,10 +438,26 @@ fn looks_like_implicit_length(response: &ModelResponse, configured_max: Option<u
     }
 }
 
-fn is_investigation_batch(items: &[ExecItem]) -> bool {
+/// Whether a batch counts as pure investigation for the research nudge —
+/// greedily reading many turns in a row without consolidating.
+///
+/// **Conservative by construction**: a batch is investigation only when every
+/// item is a call to a *registered* tool that declares
+/// [`Concurrency::Parallel`] and is not one of the named file mutators. The
+/// old name-based check treated every tool not named Write/Append/Edit as a
+/// read, so Bash (which can trivially mutate via `>`/`sed -i`) and any
+/// unregistered or plugin tool miscounted as investigation. Undercounting is
+/// safe (the nudge fires less often); overcounting would praise a mutating
+/// batch as investigation.
+fn is_investigation_batch(items: &[ExecItem], tools: &ToolRegistry) -> bool {
     !items.is_empty()
         && items.iter().all(|item| match item {
-            ExecItem::Call(call) => !matches!(call.name.as_str(), "Write" | "Append" | "Edit"),
+            ExecItem::Call(call) => {
+                !matches!(call.name.as_str(), "Write" | "Append" | "Edit")
+                    && tools
+                        .get(&call.name)
+                        .is_some_and(|tool| tool.concurrency() == Concurrency::Parallel)
+            }
             ExecItem::ParseError { .. } => false,
         })
 }
@@ -432,7 +505,8 @@ fn is_retryable(e: &ModelError) -> bool {
         | ProtoError::InvalidSessionId
         | ProtoError::Dlr(_)
         | ProtoError::Gzip(_)
-        | ProtoError::Io(_) => false,
+        | ProtoError::Io(_)
+        | ProtoError::LineOverflow { .. } => false,
     }
 }
 
@@ -627,6 +701,15 @@ impl AgentLoop {
         prompter: &dyn Prompter,
         cancel: CancellationToken,
     ) -> Result<LoopOutcome, LoopError> {
+        // opencode #52452: a crash or kill between an assistant tool-call turn
+        // and its results leaves unpaired `tool_calls` in the loaded history.
+        // OpenAI-compatible gateways reject the very next request then
+        // ("'messages' … must end with tool messages responding to tool_calls"),
+        // so resuming `-c` out of a crashed session would be stuck forever.
+        // Repair before anything else: synthesize `Interrupted` results for
+        // every unanswered call so the replayed request stays valid. A cheap,
+        // idempotent scan over intact history.
+        repair_unpaired_tool_calls(session, sink);
         push_turn(
             session,
             sink,
@@ -669,6 +752,12 @@ impl AgentLoop {
         let mut consecutive_investigation_rounds = 0u32;
         let mut length_recoveries_used = 0u32;
         let mut unconfirmed_tool_recoveries_used = 0u32;
+        // opencode #52691: bounded recoveries for finish_reason=tool_calls
+        // with no assembled call.
+        let mut empty_tool_call_recoveries_used = 0u32;
+        // The identical-failure circuit breaker (opencode #52372/#52763).
+        // Scoped to this run() call — one *turn* — on purpose.
+        let mut failing_repeat: HashMap<(String, String), RepeatFailure> = HashMap::new();
         let mut completion_review_used = false;
         let mut tool_work_observed = false;
         loop {
@@ -753,6 +842,30 @@ impl AgentLoop {
                 }
                 TurnWait::TimeUp => {
                     turn_cancel.cancel();
+                    // Persist the cut request like the neighboring
+                    // Cancelled/Err paths: the turn budget expired with a
+                    // request in flight, and before this the attempt left no
+                    // trace in the transcript (the "lack of errors" blind
+                    // spot). Recorded as a non-retryable error carrying the
+                    // trace and any partial output; the projection skips
+                    // `Turn::Error` on the next request, so the prefix stays
+                    // valid.
+                    let trace = request_sink.finish("time_up", "time_up", 0, false);
+                    let partial = request_sink.partial_response();
+                    push_turn(
+                        session,
+                        sink,
+                        Turn::Error {
+                            message: Arc::<str>::from(
+                                "turn timed out before the model request completed",
+                            ),
+                            retryable: Some(false),
+                            retries: None,
+                            trace: Some(trace),
+                            partial,
+                            ts: SystemTime::now(),
+                        },
+                    );
                     return Ok(LoopOutcome::TimeUp);
                 }
             };
@@ -931,6 +1044,47 @@ impl AgentLoop {
                 continue;
             }
 
+            // opencode #52691: the marker says `tool_calls` but nothing was
+            // assembled. The existing switches all assume the response made
+            // *some* call; without this limb an empty-calls ToolCalls response
+            // would push an empty assistant turn, execute nothing, and request
+            // again — the same input every time, so the model repeats whatever
+            // it repeated: the infinite empty-turn loop. Treat it as a
+            // recoverable protocol failure with a bounded budget instead, and
+            // keep any streamed text in history.
+            if assistant_calls.is_empty() && matches!(finish_reason, FinishReason::ToolCalls) {
+                tracing::warn!(
+                    "finish_reason=tool_calls with no tool-call data; \
+                     asking the model to reissue"
+                );
+                push_turn(
+                    session,
+                    sink,
+                    Turn::Assistant {
+                        text,
+                        reasoning,
+                        calls: assistant_calls.clone(),
+                        usage,
+                        cost: turn_cost,
+                        trace: Some(trace.clone()),
+                    },
+                );
+                if empty_tool_call_recoveries_used >= MAX_EMPTY_TOOL_CALL_RECOVERIES_PER_TURN {
+                    tracing::warn!("repeated empty finish_reason=tool_calls; ending the turn");
+                    return Ok(LoopOutcome::Incomplete);
+                }
+                empty_tool_call_recoveries_used += 1;
+                push_turn(
+                    session,
+                    sink,
+                    Turn::SystemNote {
+                        kind: crate::turn::NoteKind::Recovery,
+                        text: EMPTY_TOOL_CALLS_RECOVERY.to_string(),
+                    },
+                );
+                continue;
+            }
+
             // §4.2 / project.rs:69: every early exit must still pair any
             // outstanding calls with results. Content-filtered calls are never
             // retried automatically; they retain the terminal Interrupted result.
@@ -1059,9 +1213,75 @@ impl AgentLoop {
                 }
             }
 
-            let investigation_batch = is_investigation_batch(&exec_list);
+            // opencode #52372/#52763: before the batch runs, turn any call whose
+            // exact (tool, arguments) key has failed IDENTICALLY enough times in
+            // a row into a refused-but-paired result instead of executing it
+            // again (the image `Read` retry loop, output stuck in repetition).
+            // First refusal explains itself; if the model then re-issues the
+            // unchanged call anyway, the turn is over — every call in this batch
+            // still gets its paired result so history stays replayable.
+            let mut repeat_terminal = false;
+            let mut refused_ids: HashSet<String> = HashSet::new();
+            let mut refused_keys: Vec<(String, String)> = Vec::new();
+            let exec_list: Vec<ExecItem> = exec_list
+                .into_iter()
+                .map(|item| match item {
+                    ExecItem::Call(call) => {
+                        let key = (call.name.clone(), call.arguments.to_string());
+                        match failing_repeat.get(&key) {
+                            Some(entry) if entry.failures >= IDENTICAL_FAILURE_LIMIT => {
+                                if !entry.refused {
+                                    refused_keys.push(key);
+                                } else {
+                                    // Refused once, then re-issued unchanged: terminal.
+                                    repeat_terminal = true;
+                                }
+                                refused_ids.insert(call.id.clone());
+                                ExecItem::ParseError {
+                                    call_id: call.id.clone(),
+                                    tool_name: call.name,
+                                    error: refused_repeat_message(entry),
+                                }
+                            }
+                            _ => ExecItem::Call(call),
+                        }
+                    }
+                    other => other,
+                })
+                .collect();
+            for key in &refused_keys {
+                if let Some(entry) = failing_repeat.get_mut(key) {
+                    entry.refused = true;
+                }
+            }
+            if repeat_terminal {
+                tracing::warn!(
+                    "re-issued an already-refused identical failing call; stopping the turn"
+                );
+                // §4.2: every early exit must still pair any outstanding
+                // calls. The re-issued calls were never executed; Interrupted
+                // results keep replay (and the provider's 400 check) intact.
+                synthesize_interrupted(session, &assistant_calls, sink);
+                push_turn(
+                    session,
+                    sink,
+                    Turn::SystemNote {
+                        kind: crate::turn::NoteKind::Recovery,
+                        text: REPEAT_BREAKER_NOTE.to_string(),
+                    },
+                );
+                return Ok(LoopOutcome::RepeatedFailure);
+            }
+
+            let investigation_batch = is_investigation_batch(&exec_list, self.tools.as_ref());
             tool_work_observed |= !exec_list.is_empty();
             let batch_checkpoint = Arc::new(Mutex::new(BatchCheckpoint::new(exec_list.len())));
+            // Map call ids back to their (tool, arguments) key for the breaker's
+            // post-batch accounting.
+            let batch_keys: HashMap<&str, (String, String)> = assistant_calls
+                .iter()
+                .map(|c| (c.id.as_str(), (c.name.clone(), c.arguments.to_string())))
+                .collect();
             let results = match await_turn_budget(
                 execute_batch(
                     &exec_list,
@@ -1101,6 +1321,63 @@ impl AgentLoop {
                 }
             };
             for (call_id, tool, result, duration, _artifacts) in results {
+                // opencode #52372/#52763/#52475: identical-failure accounting.
+                // Only *executed* results count — our own refusal messages skip
+                // the bookkeeping (`refused_ids`) so a refusal can never look
+                // like the model making progress or new failure. A success at
+                // any point clears the key for that call.
+                if !refused_ids.contains(&call_id) {
+                    if let Some(key) = batch_keys.get(call_id.as_str()) {
+                        match &result {
+                            ToolResultBody::Error { message, .. }
+                            | ToolResultBody::Denied { reason: message } => {
+                                match failing_repeat.get_mut(key) {
+                                    Some(entry) if entry.last_error == *message => {
+                                        entry.failures = entry.failures.saturating_add(1);
+                                    }
+                                    Some(entry) => {
+                                        // A different failure is new information:
+                                        // the pattern restarts from this failure.
+                                        entry.failures = 1;
+                                        entry.last_error = message.clone();
+                                    }
+                                    None => {
+                                        failing_repeat.insert(
+                                            key.clone(),
+                                            RepeatFailure {
+                                                failures: 1,
+                                                last_error: message.clone(),
+                                                refused: false,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            ToolResultBody::Interrupted => match failing_repeat.get_mut(key) {
+                                Some(entry) if entry.last_error == "interrupted" => {
+                                    entry.failures = entry.failures.saturating_add(1);
+                                }
+                                Some(entry) => {
+                                    entry.failures = 1;
+                                    entry.last_error = "interrupted".into();
+                                }
+                                None => {
+                                    failing_repeat.insert(
+                                        key.clone(),
+                                        RepeatFailure {
+                                            failures: 1,
+                                            last_error: "interrupted".into(),
+                                            refused: false,
+                                        },
+                                    );
+                                }
+                            },
+                            ToolResultBody::Ok { .. } => {
+                                failing_repeat.remove(key);
+                            }
+                        }
+                    }
+                }
                 push_turn(
                     session,
                     sink,
@@ -1218,6 +1495,85 @@ fn synthesize_retryable_unconfirmed(
             },
         );
     }
+}
+
+/// The transcript note emitted after a resume-time repair, so both the model
+/// and a resumed UI understand why tool calls carry `interrupted` results.
+const RESUME_REPAIR_NOTE: &str = "This session resumed after the previous process died mid-turn; \
+     tool calls that never received results were answered with `interrupted` so the \
+     conversation remains valid. Re-issue any of them if they were load-bearing.";
+
+/// opencode #52452: synthesize [`ToolResultBody::Interrupted`] results for
+/// every assistant tool call that no longer has an answer, so map-replay stays
+/// valid after a hard crash (`kill -9`, a full crash, a dead laptop). Runs once
+/// at the top of every turn; over intact history it is a no-op, and after a
+/// repair the history is intact — so the scan is idempotent.
+///
+/// The scan respects contiguity: a call counts as answered only when a
+/// [`Turn::ToolResult`] for its id appears in the contiguous run of results
+/// that immediately follows its assistant turn. Missing results are inserted
+/// at the end of that run, in call order; mid-history orphans (possible only
+/// when the file already mixed corruption, which `load_with_report` truncates
+/// at) are repaired the same way so `verify_invariant` holds end to end.
+fn repair_unpaired_tool_calls(session: &mut Session, sink: &dyn EventSink) {
+    let inserts: Vec<(usize, ToolCall)> = {
+        let mut inserts = Vec::new();
+        let mut idx = 0usize;
+        while idx < session.messages.len() {
+            if let Turn::Assistant { calls, .. } = &session.messages[idx] {
+                if !calls.is_empty() {
+                    let mut answered: HashSet<&str> = HashSet::new();
+                    let mut tail = idx + 1;
+                    while let Some(Turn::ToolResult { call_id, .. }) = session.messages.get(tail) {
+                        answered.insert(call_id.as_str());
+                        tail += 1;
+                    }
+                    let missing: Vec<ToolCall> = calls
+                        .iter()
+                        .filter(|c| !answered.contains(c.id.as_str()))
+                        .cloned()
+                        .collect();
+                    // Ascending (pos, call) order; the apply loop below shifts
+                    // later positions by the number of inserts before them.
+                    for call in missing {
+                        inserts.push((tail, call));
+                    }
+                    idx = tail;
+                    continue;
+                }
+            }
+            idx += 1;
+        }
+        inserts
+    };
+    if inserts.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        calls = inserts.len(),
+        "repaired unpaired tool calls left by a crashed turn (synthesized Interrupted results)"
+    );
+    for (applied, (pos, call)) in inserts.into_iter().enumerate() {
+        let turn = Turn::ToolResult {
+            call_id: call.id,
+            tool: call.name,
+            result: ToolResultBody::Interrupted,
+            duration: Duration::ZERO,
+        };
+        session.messages.insert(pos + applied, turn.clone());
+        // Persistence seam: `on_turn` (only) queues the record to the session
+        // writer. No ToolStart/ToolEnd events fire — these tools never ran in
+        // this process and the UI must not render phantom invocations.
+        sink.on_turn(&turn);
+    }
+    push_turn(
+        session,
+        sink,
+        Turn::SystemNote {
+            kind: crate::turn::NoteKind::Recovery,
+            text: RESUME_REPAIR_NOTE.to_string(),
+        },
+    );
 }
 
 enum ExecItem {
@@ -1464,11 +1820,15 @@ async fn execute_batch(
 
     // Permission denials, parse failures, and unknown tools are terminal before
     // execution starts. Publish them too; executed entries were already sent
-    // above.
-    for (i, r) in &results {
-        if !emitted.contains(i) {
-            emit_tool_completion(sink, r);
-            mark_batch_emitted(&checkpoint, *i);
+    // above. Iterate the precomputed `order` (the batch's own order) rather
+    // than the results HashMap, whose iteration order is arbitrary — the
+    // `on_tool_end` callbacks must fire in the order the caller issued them.
+    for &i in &order {
+        if let Some(r) = results.get(&i) {
+            if !emitted.contains(&i) {
+                emit_tool_completion(sink, r);
+                mark_batch_emitted(&checkpoint, i);
+            }
         }
     }
 
@@ -1683,4 +2043,303 @@ fn cap_tool_result(mut completed: ToolExecResult, cap: usize) -> ToolExecResult 
         completed.2 = completed.2.truncate_body(cap);
     }
     completed
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    //! Unit coverage for the conservative `is_investigation_batch` bound.
+    use super::*;
+    use crate::tool::{Tool, ToolCtx, ToolError, ToolOutcome};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    /// A stub tool with a configurable concurrency class.
+    struct Stub {
+        name: &'static str,
+        concurrency: Concurrency,
+    }
+
+    #[async_trait]
+    impl Tool for Stub {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "stub tool"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn concurrency(&self) -> Concurrency {
+            self.concurrency
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::ok("stub".into()))
+        }
+    }
+
+    fn call(name: &str) -> ExecItem {
+        ExecItem::Call(ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        })
+    }
+
+    fn registry(tools: Vec<Arc<dyn Tool>>) -> ToolRegistry {
+        ToolRegistry::new(tools)
+    }
+
+    #[test]
+    fn registered_parallel_reads_count_as_investigation() {
+        let reg = registry(vec![
+            Arc::new(Stub {
+                name: "Read",
+                concurrency: Concurrency::Parallel,
+            }) as Arc<dyn Tool>,
+            Arc::new(Stub {
+                name: "Grep",
+                concurrency: Concurrency::Parallel,
+            }),
+        ]);
+        let items = vec![call("Read"), call("Grep")];
+        assert!(is_investigation_batch(&items, &reg));
+    }
+
+    #[test]
+    fn bash_and_other_barriers_do_not_count() {
+        // Even a pure-`ls` Bash batch is conservatively excluded: Bash is
+        // Exclusive (it can mutate via redirection), so it must not reset the
+        // research-nudge counter. The old name-based check counted it.
+        let reg = registry(vec![
+            Arc::new(Stub {
+                name: "Read",
+                concurrency: Concurrency::Parallel,
+            }) as Arc<dyn Tool>,
+            Arc::new(Stub {
+                name: "Bash",
+                concurrency: Concurrency::Exclusive,
+            }),
+        ]);
+        let items = vec![call("Bash")];
+        assert!(
+            !is_investigation_batch(&items, &reg),
+            "Bash must not count as investigation"
+        );
+        // Mixed batch: one read + one barrier is not pure investigation.
+        let items = vec![call("Read"), call("Bash")];
+        assert!(!is_investigation_batch(&items, &reg));
+    }
+
+    #[test]
+    fn serial_writes_and_unregistered_tools_do_not_count() {
+        let reg = registry(vec![
+            Arc::new(Stub {
+                name: "Read",
+                concurrency: Concurrency::Parallel,
+            }) as Arc<dyn Tool>,
+            Arc::new(Stub {
+                name: "Edit",
+                concurrency: Concurrency::SerialWrite,
+            }),
+        ]);
+        // The named mutators are excluded even if one declared Parallel.
+        let items = vec![call("Read"), call("Edit")];
+        assert!(!is_investigation_batch(&items, &reg));
+        // Anything unregistered (plugin/MCP name the registry doesn't know,
+        // or a hallucinated tool name) is excluded, not assumed read-only.
+        let items = vec![call("Read"), call("SomeNewPlugin")];
+        assert!(
+            !is_investigation_batch(&items, &reg),
+            "unknown tools must not count as investigation"
+        );
+    }
+
+    #[test]
+    fn empty_batches_and_parse_errors_are_not_investigation() {
+        let reg = registry(vec![Arc::new(Stub {
+            name: "Read",
+            concurrency: Concurrency::Parallel,
+        }) as Arc<dyn Tool>]);
+        assert!(!is_investigation_batch(&[], &reg));
+        let items = vec![
+            call("Read"),
+            ExecItem::ParseError {
+                call_id: "p".into(),
+                tool_name: "Read".into(),
+                error: "bad json".into(),
+            },
+        ];
+        assert!(!is_investigation_batch(&items, &reg));
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    //! opencode #52452: unpaired tool calls after a crash must never wedge the
+    //! next request (gateways 400 a `tool_calls` message with no results).
+    use super::*;
+    use crate::project::{project_with, verify_invariant};
+    use crate::turn::NoteKind;
+    use crate::NullSink;
+
+    fn assistant(calls: &[(&str, &str)]) -> Turn {
+        Turn::Assistant {
+            text: Arc::from(""),
+            reasoning: None,
+            calls: calls
+                .iter()
+                .map(|(id, name)| ToolCall {
+                    id: (*id).into(),
+                    name: (*name).into(),
+                    arguments: Arc::from("{}"),
+                })
+                .collect(),
+            usage: None,
+            cost: None,
+            trace: None,
+        }
+    }
+
+    fn answered(call_id: &str) -> Turn {
+        Turn::ToolResult {
+            call_id: call_id.into(),
+            tool: "Read".into(),
+            result: ToolResultBody::Ok {
+                content: "ok".into(),
+                truncated: false,
+            },
+            duration: Duration::ZERO,
+        }
+    }
+
+    fn interrupted_results(session: &Session) -> Vec<String> {
+        session
+            .messages
+            .iter()
+            .filter_map(|t| match t {
+                Turn::ToolResult {
+                    call_id,
+                    result: ToolResultBody::Interrupted,
+                    ..
+                } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn session_with(turns: Vec<Turn>) -> Session {
+        let mut session = Session::new("test".into(), "/repo".into(), "m".into());
+        session.messages = turns;
+        session
+    }
+
+    fn repairs_hold_on_the_wire(session: &Session) {
+        let wire = project_with(&session.messages, "you are a test");
+        assert!(
+            verify_invariant(&wire).is_ok(),
+            "repaired history must satisfy the tool-answer invariant: {:?}",
+            verify_invariant(&wire)
+        );
+    }
+
+    #[test]
+    fn answers_unpaired_tail_calls_from_a_crashed_session() {
+        let mut session = session_with(vec![
+            Turn::User {
+                content: "hi".into(),
+                ts: SystemTime::now(),
+            },
+            assistant(&[("c1", "Read"), ("c2", "Grep")]),
+        ]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(
+            interrupted_results(&session),
+            vec!["c1".to_string(), "c2".to_string()],
+            "both unanswered calls get Interrupted results, in call order"
+        );
+        assert!(
+            session.messages.iter().any(|t| matches!(
+                t,
+                Turn::SystemNote {
+                    kind: NoteKind::Recovery,
+                    ..
+                }
+            )),
+            "a recovery note explains the synthesized results"
+        );
+        repairs_hold_on_the_wire(&session);
+    }
+
+    #[test]
+    fn only_missing_ids_are_filled_after_partial_results() {
+        let mut session = session_with(vec![
+            assistant(&[("c1", "Read"), ("c2", "Grep")]),
+            answered("c1"),
+        ]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(interrupted_results(&session), vec!["c2".to_string()]);
+        // The intact result keeps its body; the inserted one lands right after
+        // the contiguous result run (assistant, r(c1), r(c2)) and before the note.
+        assert!(matches!(
+            &session.messages[1],
+            Turn::ToolResult { call_id, result: ToolResultBody::Ok { content, .. }, .. }
+                if call_id == "c1" && content.as_ref() == "ok"
+        ));
+        assert!(
+            matches!(&session.messages[2], Turn::ToolResult { call_id, .. } if call_id == "c2")
+        );
+        repairs_hold_on_the_wire(&session);
+    }
+
+    #[test]
+    fn intact_history_is_untouched_and_no_note_is_added() {
+        let turns = vec![assistant(&[("c1", "Read")]), answered("c1")];
+        let mut session = session_with(turns);
+        let before = session.messages.len();
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(
+            session.messages.len(),
+            before,
+            "nothing may be inserted over intact history"
+        );
+        assert!(interrupted_results(&session).is_empty());
+    }
+
+    #[test]
+    fn repair_is_idempotent_across_runs() {
+        let mut session = session_with(vec![assistant(&[("c1", "Read"), ("c2", "Bash")])]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        let after_first = session.messages.clone();
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(
+            session.messages.len(),
+            after_first.len(),
+            "a second repair must be a no-op"
+        );
+        repairs_hold_on_the_wire(&session);
+    }
+
+    #[test]
+    fn mid_history_orphan_before_a_later_user_turn_is_repaired_inline() {
+        // Crash shape with an extra twist: the orphaned turn sits mid-file
+        // behind a later user message (only possible for corrupted files that
+        // `load_with_report` already truncates at, or a hand-edited transcript)
+        // — the repair still preserves tool-answer contiguity.
+        let mut session = session_with(vec![
+            assistant(&[("orphan", "Read")]),
+            Turn::User {
+                content: "next prompt".into(),
+                ts: SystemTime::now(),
+            },
+            assistant(&[("c9", "Grep")]),
+            answered("c9"),
+        ]);
+        repair_unpaired_tool_calls(&mut session, &NullSink);
+        assert_eq!(interrupted_results(&session), vec!["orphan".to_string()]);
+        assert!(
+            matches!(&session.messages[1], Turn::ToolResult { call_id, .. } if call_id == "orphan")
+        );
+        repairs_hold_on_the_wire(&session);
+    }
 }

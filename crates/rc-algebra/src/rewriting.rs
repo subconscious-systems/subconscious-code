@@ -21,8 +21,6 @@
 //! is undecidable in general); the shipped [`demo_rules`] terminate because
 //! every rule is strictly length-decreasing.
 
-use std::collections::BTreeMap;
-
 /// A symbol in the rewrite alphabet. Cheap to copy and compare.
 pub type Symbol = u32;
 
@@ -116,11 +114,16 @@ impl RewriteSystem {
         None
     }
 
-    /// All critical pairs: for every pair of rules (including a rule with
-    /// itself), every non-trivial overlap of `a.lhs` with `b.lhs` — where a
-    /// proper suffix of `a.lhs` equals a proper prefix of `b.lhs` — produces a
+    /// All critical pairs: for every ordered pair of rules (including a rule
+    /// with itself), every intersecting position of the two LHSs produces a
     /// term reducible by both; if the two normal forms differ, that's a
     /// non-confluence witness.
+    ///
+    /// "Intersecting" covers the trivial overlap the old suffix/prefix
+    /// enumeration missed: identical LHSs (two rules rewriting the same
+    /// redex) and one LHS strictly contained in the other (a redex nested
+    /// inside a bigger redex). Either is a fork with two distinct reductions,
+    /// so `is_confluent` reported `true` for trivially non-confluent systems.
     pub fn critical_pairs(&self) -> Vec<CriticalPair> {
         let mut out = Vec::new();
         let n = self.rules.len();
@@ -132,30 +135,48 @@ impl RewriteSystem {
         out
     }
 
+    /// Enumerate every position where `b.lhs` intersects `a.lhs`: `b.lhs`
+    /// starting at offset `off` inside (or exactly on) `a.lhs`'s span. For
+    /// `off < la` the overlap region is `a.lhs[off..]` against
+    /// `b.lhs[..la-off]` — that covers proper suffix/prefix overlaps, exact
+    /// identity (`off == 0`, equal lengths), and strict containment
+    /// (`a.lhs[off..off+lb] == b.lhs` with `off+lb <= la`).
     fn overlaps(&self, a: &Rule, b: &Rule, out: &mut Vec<CriticalPair>) {
-        // Overlap where a suffix of a.lhs of length `k` equals a prefix of
-        // b.lhs of length `k`, for 1 <= k < min(len_a, len_b) (proper overlap,
-        // so the two redexes start at different positions).
         let la = a.lhs.len();
         let lb = b.lhs.len();
-        let max_k = la.min(lb).saturating_sub(1);
-        for k in 1..=max_k {
-            if la >= k && lb >= k && a.lhs[la - k..] == b.lhs[..k] {
-                // The combined term: a.lhs followed by b.lhs[k..].
-                let mut term = a.lhs.clone();
-                term.extend_from_slice(&b.lhs[k..]);
-                // Redex a starts at 0; redex b starts at la - k.
-                let red_a = self.apply_at(&term, 0, a);
-                let red_b = self.apply_at(&term, la - k, b);
-                let nf_a = self.normalize(&red_a);
-                let nf_b = self.normalize(&red_b);
-                if nf_a != nf_b {
-                    out.push(CriticalPair {
-                        term,
-                        reduction_a: nf_a,
-                        reduction_b: nf_b,
-                    });
-                }
+        if la == 0 || lb == 0 {
+            return;
+        }
+        for off in 0..la {
+            let overlap_len = la - off;
+            // The shared subterm must agree, or the redexes don't coexist in
+            // one term (no overlap, no fork).
+            let matches = if lb >= overlap_len {
+                a.lhs[off..] == b.lhs[..overlap_len]
+            } else {
+                a.lhs[off..off + lb] == b.lhs[..]
+            };
+            if !matches {
+                continue;
+            }
+            // The combined term: a.lhs plus whatever tail of b.lhs extends
+            // past a.lhs's end (empty in the containment / identity cases,
+            // where b.lhs ends at or before a.lhs does).
+            let tail = lb.saturating_sub(overlap_len);
+            let mut term = a.lhs.clone();
+            if tail > 0 {
+                term.extend_from_slice(&b.lhs[overlap_len..]);
+            }
+            let red_a = self.apply_at(&term, 0, a);
+            let red_b = self.apply_at(&term, off, b);
+            let nf_a = self.normalize(&red_a);
+            let nf_b = self.normalize(&red_b);
+            if nf_a != nf_b {
+                out.push(CriticalPair {
+                    term,
+                    reduction_a: nf_a,
+                    reduction_b: nf_b,
+                });
             }
         }
     }
@@ -198,8 +219,7 @@ impl RewriteSystem {
 ///
 /// Rules (all length-decreasing ⇒ terminating):
 /// - `[0, 0] → [0]`            — collapse repeated whitespace
-/// - `[1, 2] → [1, 2]` ... no; a length-decreasing empty-args rule:
-///   `[1, 2] → []`             — elide empty tool-call argument list
+/// - `[1, 2] → []`             — elide empty tool-call argument list
 /// - `[3, 0] → [0]`            — trailing separator whitespace simplifies
 /// - `[0, 2] → [2]`            — whitespace before close elided
 pub fn demo_rules() -> RewriteSystem {
@@ -231,12 +251,6 @@ pub fn syms(xs: &[u32]) -> Vec<Symbol> {
 /// is length-decreasing, a sufficient (not necessary) termination condition.
 pub fn all_rules_length_decreasing(sys: &RewriteSystem) -> bool {
     sys.rules().iter().all(|r| r.rhs.len() < r.lhs.len())
-}
-
-/// For callers that want a stable map of symbol → meaning; not used by the
-/// engine itself, only for documentation/introspection.
-pub fn _rule_index(_sys: &RewriteSystem) -> BTreeMap<usize, Rule> {
-    BTreeMap::new()
 }
 
 #[cfg(test)]
@@ -320,5 +334,69 @@ mod tests {
             Rule::new(vec![R, R], vec![R]),
         ]);
         assert!(sys.is_confluent().confluent);
+    }
+
+    // ---- overlap enumeration: the trivial intersections the old
+    // suffix/prefix-only loop missed (is_confluent false positives) ---------
+
+    #[test]
+    fn identical_lhs_different_rhs_is_not_confluent() {
+        // The most trivial non-confluence there is: one redex, two rewrites.
+        // The old enumeration required the two redexes to start at different
+        // positions, so this was invisible and is_confluent reported true.
+        let sys = RewriteSystem::new(vec![
+            Rule::new(vec![L, R], vec![]),
+            Rule::new(vec![L, R], vec![S]),
+        ]);
+        let report = sys.is_confluent();
+        assert!(
+            !report.confluent,
+            "identical LHS with different RHS must be detected, got {report:?}"
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|cp| cp.term == vec![L, R] && cp.reduction_a != cp.reduction_b),
+            "the witness must be the shared LHS term itself: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn contained_lhs_is_not_confluent() {
+        // One LHS strictly inside the other: [R,S] nests at offset 1 inside
+        // [L,R,S]. Both redexes coexist at their own positions in `[L,R,S]`,
+        // which the proper suffix/prefix loop never constructed.
+        let sys = RewriteSystem::new(vec![
+            Rule::new(vec![L, R, S], vec![]),
+            Rule::new(vec![R, S], vec![W]),
+        ]);
+        let report = sys.is_confluent();
+        assert!(
+            !report.confluent,
+            "a nested LHS must produce a critical pair, got {report:?}"
+        );
+        assert!(
+            report.failures.iter().any(|cp| cp.term == vec![L, R, S]),
+            "the witness term must be the containing LHS: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn prefix_lhs_overlap_is_enumerated() {
+        // The mirror containment: the shorter LHS at offset 0. `b` matches at
+        // the head of `a` (lb < la); previously only k < lb overlaps existed,
+        // so a full-prefix match was skipped.
+        let sys = RewriteSystem::new(vec![
+            Rule::new(vec![W, W, R], vec![]),
+            Rule::new(vec![W, W], vec![L]),
+        ]);
+        let report = sys.is_confluent();
+        assert!(
+            !report.confluent,
+            "offset-0 containment must be enumerated, got {report:?}"
+        );
     }
 }

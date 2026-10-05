@@ -3,7 +3,9 @@
 //! Append-only JSONL per session: one header line (session metadata) followed
 //! by one line per [`Turn`]. The store flushes after every append so a crash
 //! mid-conversation leaves a valid, replayable file — the worst case is a
-//! truncated final line, which [`load`] skips.
+//! truncated final line, where [`load`] stops replaying and reports what was
+//! dropped. A failed append poisons the store: it never writes again through
+//! that handle, so a later turn can't get concatenated onto a corrupt tail.
 //!
 //! ```text
 //! {"type":"header","id":"…","cwd":"…","model":"…","mode":"default",…}
@@ -12,7 +14,7 @@
 //! {"type":"tool_result","call_id":"c1",…}
 //! ```
 //!
-//! Session files live under a caller-chosen directory (e.g. `~/.rc/sessions/`);
+//! Session files live under a caller-chosen directory (e.g. `~/.sc/sessions/`);
 //! this crate is I/O, not policy. M10 will layer CAS checkpoints and `/rewind`
 //! on top — rewind restores only files the agent touched; Bash side effects
 //! (build artifacts, clones) are outside the CAS and not rolled back.
@@ -20,6 +22,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 pub mod rewind;
 
@@ -42,12 +47,19 @@ struct SessionHeader {
 
 /// An append-only handle to a session's JSONL file. Flushes on every append
 /// so a crash leaves a valid prefix (crash recovery, §9).
+///
+/// If any append fails, the store is **poisoned**: the file may now hold a
+/// partial line, so every later `append_turn` through this handle errors
+/// immediately instead of concatenating fresh JSON onto the corrupt tail.
 pub struct SessionStore {
-    writer: Option<BufWriter<File>>,
+    writer: Option<Box<dyn Write + Send>>,
     path: PathBuf,
     /// Serialized header held until the first turn for a lazy fresh session.
     /// Resumed and eagerly-created stores have already written it.
     pending_header: Option<String>,
+    /// Set by the first failed append; every later append fails fast with
+    /// this reason rather than writing after a corrupt tail.
+    poisoned: Option<String>,
 }
 
 impl SessionStore {
@@ -63,7 +75,7 @@ impl SessionStore {
     }
 
     /// Create (or overwrite) a session file at `path`, writing the header.
-    /// The caller picks the path — typically `~/.rc/sessions/<id>.jsonl`.
+    /// The caller picks the path — typically `~/.sc/sessions/<id>.jsonl`.
     pub fn create(path: PathBuf, session: &Session) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -80,9 +92,10 @@ impl SessionStore {
         writeln!(writer, "{line}")?;
         writer.flush()?;
         Ok(Self {
-            writer: Some(writer),
+            writer: Some(Box::new(writer)),
             path,
             pending_header: None,
+            poisoned: None,
         })
     }
 
@@ -94,41 +107,73 @@ impl SessionStore {
             writer: None,
             path,
             pending_header: Some(Self::serialized_header(session)?),
+            poisoned: None,
         })
     }
 
-    fn ensure_writer(&mut self) -> Result<&mut BufWriter<File>> {
-        if self.writer.is_none() {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating session dir {}", parent.display()))?;
-            }
-            let file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&self.path)
-                .with_context(|| format!("creating session file {}", self.path.display()))?;
-            let mut writer = BufWriter::new(file);
-            let header = self.pending_header.take().ok_or_else(|| {
-                anyhow::anyhow!("lazy session store is missing its pending header")
-            })?;
-            writeln!(writer, "{header}")?;
-            self.writer = Some(writer);
+    /// Make sure a writer exists, opening the file (and writing the lazy
+    /// header) on the first append of a lazy session.
+    fn ensure_writer(&mut self) -> Result<()> {
+        if self.writer.is_some() {
+            return Ok(());
         }
-        self.writer
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("session writer was not initialized"))
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating session dir {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .with_context(|| format!("creating session file {}", self.path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let header = self
+            .pending_header
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("lazy session store is missing its pending header"))?;
+        writeln!(writer, "{header}")?;
+        self.writer = Some(Box::new(writer));
+        Ok(())
+    }
+
+    /// Write one pre-serialized line and flush it.
+    fn write_line(&mut self, line: &str) -> Result<()> {
+        self.ensure_writer()?;
+        let Some(writer) = self.writer.as_deref_mut() else {
+            anyhow::bail!("session writer was not initialized");
+        };
+        writeln!(writer, "{line}").context("writing to session file")?;
+        writer.flush().context("flushing session file")
     }
 
     /// Append a turn as one JSON line, then flush (crash recovery: the file is
     /// always a valid prefix up to the last completed turn).
+    ///
+    /// A failed append poisons the store: every later append through this
+    /// handle errors immediately, so the next turn's JSON can never be glued
+    /// onto a partial line left by the failed write.
     pub fn append_turn(&mut self, turn: &Turn) -> Result<()> {
         let line = serde_json::to_string(turn).context("serializing turn")?;
-        let writer = self.ensure_writer()?;
-        writeln!(writer, "{line}")?;
-        writer.flush().context("flushing session file")?;
-        Ok(())
+        if let Some(reason) = &self.poisoned {
+            anyhow::bail!(
+                "session store stopped persisting after an earlier write failure: {reason}"
+            );
+        }
+        match self.write_line(&line) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Best-effort recovery: terminate whatever partial bytes made
+                // it out so a future appender (e.g. a resumed process) starts
+                // on a fresh line rather than continuing the corrupt one.
+                if let Some(writer) = self.writer.as_deref_mut() {
+                    let _ = writer.write_all(b"\n");
+                    let _ = writer.flush();
+                }
+                self.poisoned = Some(format!("append to {} failed", self.path.display()));
+                Err(error)
+            }
+        }
     }
 
     /// The path this store writes to.
@@ -136,28 +181,101 @@ impl SessionStore {
         &self.path
     }
 
+    /// Test/injection seam: a store that writes through `writer` instead of the
+    /// filesystem at `path`. Not part of the stable API — it exists so tests
+    /// can simulate a failing disk without depending on platform quirks.
+    #[doc(hidden)]
+    pub fn from_writer(path: PathBuf, writer: impl Write + Send + 'static) -> Self {
+        Self {
+            writer: Some(Box::new(writer)),
+            path,
+            pending_header: None,
+            poisoned: None,
+        }
+    }
+
+    /// Take an exclusive advisory lock on an already-open session file, so a
+    /// second process can't interleave appends with ours (the lock lives until
+    /// the store — and so the file handle — is dropped). Contention fails with
+    /// a clear error rather than a corrupt interleaved transcript.
+    #[cfg(unix)]
+    fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+        // SAFETY: `flock` only touches this owned file descriptor.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            anyhow::bail!("session is open in another process: {}", path.display());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn lock_exclusive(_file: &File, _path: &Path) -> Result<()> {
+        // Windows build: std exposes no advisory file lock, and a lockfile
+        // scheme needs stale-detection to be safe. Inter-process interleaving
+        // remains possible there; the poisoning/recovery behavior in
+        // `append_turn` still keeps a single handle's tail intact.
+        // TODO: LockFileEx for first-party Windows builds.
+        Ok(())
+    }
+
     /// Open an existing session file in append mode (for `--resume`: keep the
     /// header and all prior turns, append new ones after). The file must already
     /// exist with a valid header — use [`SessionStore::create`] for a fresh
-    /// session. Returns an error if the file is missing or empty.
+    /// session. Returns an error if the file is missing or empty, or if another
+    /// process already holds the session open: interleaved appends from two
+    /// processes would corrupt the transcript mid-file.
     pub fn open_append(path: PathBuf) -> Result<Self> {
         let file = OpenOptions::new()
             .create(false)
             .append(true)
             .open(&path)
             .with_context(|| format!("opening session file for append: {}", path.display()))?;
+        Self::lock_exclusive(&file, &path)?;
         Ok(Self {
-            writer: Some(BufWriter::new(file)),
+            writer: Some(Box::new(BufWriter::new(file))),
             path,
             pending_header: None,
+            poisoned: None,
         })
     }
 }
 
-/// Load a session file: read the header, replay every well-formed turn line
-/// into a [`Session`], and skip any truncated/garbled trailing line (the
-/// crash-recovery contract — a killed process may leave a partial last line).
+/// What a [`load_with_report`] recovered, including where replay stopped when
+/// the file isn't intact.
+#[derive(Debug)]
+pub struct LoadReport {
+    /// The replayed session (header plus every turn up to the stop point).
+    pub session: Session,
+    /// The 1-based line at which replay stopped: the first malformed line,
+    /// or the first line that couldn't be read. `None` when the file was
+    /// intact end to end.
+    pub stopped_at_line: Option<usize>,
+    /// How many lines were abandoned at/after [`LoadReport::stopped_at_line`]
+    /// — treated as truncated, never replayed.
+    pub dropped_lines: usize,
+}
+
+/// Load a session file: read the header and replay the turns into a
+/// [`Session`]. Replay stops at the **first** malformed line: a crash or an
+/// interleaved write means everything from there onward cannot be trusted —
+/// skipping the bad line and continuing could pair a tool result with a call
+/// that never ran, so the whole remainder is treated as truncated. Intact
+/// callers learn what was dropped via `tracing::warn!`; programmatic callers
+/// use [`load_with_report`].
 pub fn load(path: &Path) -> Result<Session> {
+    let report = load_with_report(path)?;
+    if let Some(line) = report.stopped_at_line {
+        tracing::warn!(
+            "session {}: stopped replaying at line {line}; {} line(s) after the corruption were dropped",
+            path.display(),
+            report.dropped_lines
+        );
+    }
+    Ok(report.session)
+}
+
+/// [`load`], but reporting where replay stopped and how much was dropped.
+pub fn load_with_report(path: &Path) -> Result<LoadReport> {
     let file =
         File::open(path).with_context(|| format!("opening session file {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -173,15 +291,30 @@ pub fn load(path: &Path) -> Result<Session> {
     session.mode = header.mode;
     session.extra_dirs = header.extra_dirs;
 
-    let mut skipped = 0;
+    // The header is line 1; the first turn line is line 2.
+    let mut line_no = 1usize;
+    let mut stopped_at_line = None;
+    let mut dropped_lines = 0usize;
     for line in lines {
+        line_no += 1;
         let line = match line {
             Ok(l) => l,
             Err(_) => {
-                // A read error on a later line — stop, keep what we have.
+                // A read error mid-file: this line is lost, and nothing
+                // behind it can even be counted.
+                if stopped_at_line.is_none() {
+                    stopped_at_line = Some(line_no);
+                }
+                dropped_lines += 1;
                 break;
             }
         };
+        if stopped_at_line.is_some() {
+            // Past the stop point the file is truncated: lines are counted
+            // (so the user learns what was dropped) but never replayed.
+            dropped_lines += 1;
+            continue;
+        }
         match serde_json::from_str::<Turn>(&line) {
             Ok(turn) => {
                 if let Turn::SystemNote {
@@ -209,15 +342,21 @@ pub fn load(path: &Path) -> Result<Session> {
                 session.messages.push(turn);
             }
             Err(_) => {
-                // A truncated/garbled final line (crash mid-write): skip it.
-                skipped += 1;
+                // First malformed line = the write interleaved or died here.
+                // Everything after it is truncated, not skipped: replay must
+                // stop so call/result pairing stays intact. The remaining
+                // lines are still counted (below) so the user learns how much
+                // was dropped.
+                stopped_at_line = Some(line_no);
+                dropped_lines += 1;
             }
         }
     }
-    if skipped > 0 {
-        tracing::debug!("session load: skipped {skipped} malformed trailing line(s)");
-    }
-    Ok(session)
+    Ok(LoadReport {
+        session,
+        stopped_at_line,
+        dropped_lines,
+    })
 }
 
 /// Decode append-only mode metadata written after the immutable header.
@@ -352,6 +491,43 @@ pub fn latest(dir: &Path) -> Option<PathBuf> {
         .map(|(p, _)| p)
 }
 
+/// The `--continue` target: the newest session **of this directory** (codex
+/// #50334). A globally-newest pick silently resumed an unrelated project's
+/// conversation the moment two projects shared the session store.
+pub struct LatestIn {
+    pub path: PathBuf,
+}
+
+/// Find the most recently modified session whose recorded working directory is
+/// the same project as `cwd` (newest first). Sessions from other projects are
+/// skipped entirely; the caller's error message should say so.
+pub fn latest_in_project(dir: &Path, cwd: &Path) -> Option<LatestIn> {
+    let wanted = project_key(cwd);
+    for info in list(dir) {
+        if project_key(&info.cwd) == wanted {
+            return Some(LatestIn { path: info.path });
+        }
+        // list() is newest-first: keep scanning for a same-project session.
+    }
+    None
+}
+
+/// Project-identity key for a session's cwd (opencode #52501): the canonicalized
+/// path, ASCII case-folded on case-insensitive filesystems (macOS's default
+/// APFS, Windows NTFS). `/Repo` and `/repo` are one project there, and both
+/// spellings occur because shells and configs disagree about case.
+pub fn project_key(cwd: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        PathBuf::from(canon.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        canon
+    }
+}
+
 /// Does this session file hold at least one turn line beyond the header? Cheap:
 /// stops at the second line rather than parsing the file.
 fn has_turns(path: &Path) -> bool {
@@ -480,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_recovery_skips_truncated_trailing_line() {
+    fn crash_recovery_stops_at_truncated_trailing_line() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("crash.jsonl");
         let session = sample_session(dir.path());
@@ -504,9 +680,66 @@ mod tests {
         f.flush().unwrap();
         drop(f);
 
+        let report = load_with_report(&path).unwrap();
+        // The 4 well-formed turns are recovered; replay stopped at the
+        // truncated 5th (line 6 = header + 4 turns + the partial line).
+        assert_eq!(report.session.messages.len(), turns.len());
+        assert_eq!(report.stopped_at_line, Some(6));
+        assert_eq!(report.dropped_lines, 1);
+
         let loaded = load(&path).unwrap();
-        // The 4 well-formed turns are recovered; the truncated 5th is skipped.
         assert_eq!(loaded.messages.len(), turns.len());
+    }
+
+    #[test]
+    fn mid_file_corruption_truncates_replay_and_keeps_call_pairing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mid.jsonl");
+        let session = sample_session(dir.path());
+        let turns = sample_turns();
+
+        // User + Assistant(calls Read) are intact; then a corrupt line; then
+        // the tool result and a later note.
+        let mut store = SessionStore::create(path.clone(), &session).unwrap();
+        store.append_turn(&turns[0]).unwrap();
+        store.append_turn(&turns[1]).unwrap();
+        drop(store);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "{{\"type\":\"user\",\"content\":\"corrupt").unwrap();
+            f.flush().unwrap();
+            drop(f);
+        }
+        let mut store = SessionStore::open_append(path.clone()).unwrap();
+        store.append_turn(&turns[2]).unwrap();
+        store.append_turn(&turns[3]).unwrap();
+        drop(store);
+
+        // Replay must stop at the corrupt line: the ToolResult behind it is
+        // abandoned rather than replayed against a call whose assistant turn
+        // is itself fine — the file is simply treated as truncated there.
+        let report = load_with_report(&path).unwrap();
+        assert_eq!(report.session.messages.len(), 2);
+        assert!(
+            matches!(&report.session.messages[1], Turn::Assistant { calls, .. } if calls.len() == 1)
+        );
+        assert!(
+            !report
+                .session
+                .messages
+                .iter()
+                .any(|t| matches!(t, Turn::ToolResult { .. })),
+            "no orphaned tool result may be replayed past the corruption"
+        );
+        assert_eq!(report.stopped_at_line, Some(4));
+        assert_eq!(report.dropped_lines, 3); // the corrupt line + 2 valid ones behind it
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
     }
 
     /// Write a session file with a header and, optionally, one turn.
@@ -635,6 +868,127 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nope.jsonl");
         assert!(SessionStore::open_append(missing).is_err());
+    }
+
+    /// Codex #50334: `--continue` must scope to the current directory's
+    /// project — a newer session from another project is never the pick.
+    #[test]
+    fn latest_in_project_scopes_to_the_current_directory() {
+        let dir = tempdir().unwrap();
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // An older session in repo-a, then a newer one in repo-b.
+        write_session(&sessions, "in-a-1", &repo_a, "older prompt");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_session(&sessions, "in-b-1", &repo_b, "newer prompt");
+
+        // `--continue` from repo-a picks repo-a's session, never repo-b's
+        // newer one.
+        let pick = latest_in_project(&sessions, &repo_a).expect("repo-a has a session");
+        assert!(pick.path.ends_with("in-a-1.jsonl"), "{:?}", pick.path);
+        let pick_b = latest_in_project(&sessions, &repo_b).expect("repo-b has a session");
+        assert!(pick_b.path.ends_with("in-b-1.jsonl"), "{:?}", pick_b.path);
+        // A directory with no sessions at all yields None.
+        let empty = dir.path().join("empty-sessions");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(latest_in_project(&empty, &repo_a).is_none());
+    }
+
+    /// opencode #52501: project identity folds case on case-insensitive
+    /// filesystems (macOS default APFS, Windows NTFS), stays exact on Linux.
+    #[test]
+    fn project_key_folds_case_on_case_insensitive_filesystems() {
+        let upper = PathBuf::from("/Definitely/A/Repo");
+        let lower = PathBuf::from("/definitely/a/repo");
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert_eq!(project_key(&upper), project_key(&lower));
+        } else {
+            assert_ne!(project_key(&upper), project_key(&lower));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_append_refuses_a_second_concurrent_handle() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.jsonl");
+        let session = sample_session(dir.path());
+        let mut store = SessionStore::create(path.clone(), &session).unwrap();
+        store.append_turn(&sample_turns()[0]).unwrap();
+        drop(store);
+
+        let first = SessionStore::open_append(path.clone()).unwrap();
+        let error = match SessionStore::open_append(path.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("a second concurrent opener must be refused"),
+        };
+        assert!(error.to_string().contains("another process"), "{error}");
+
+        drop(first);
+        let _ =
+            SessionStore::open_append(path).expect("the lock is released when the holder drops");
+    }
+
+    /// A disk that accepts the line itself but fails on the newline — a
+    /// partial line is on "disk" with no way to terminate it.
+    struct FlakyDiskWriter {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        writes_left: usize,
+    }
+
+    impl std::io::Write for FlakyDiskWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.writes_left == 0 {
+                return Err(std::io::Error::other("disk gone"));
+            }
+            self.writes_left -= 1;
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_append_poisons_the_store_and_never_glues_new_lines() {
+        let dir = tempdir().unwrap();
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut store = SessionStore::from_writer(
+            dir.path().join("poison.jsonl"),
+            FlakyDiskWriter {
+                bytes: bytes.clone(),
+                writes_left: 1, // the JSON makes it out; the newline doesn't
+            },
+        );
+
+        let turn = sample_turns()[0].clone();
+        store
+            .append_turn(&turn)
+            .expect_err("the failing newline write must surface");
+
+        // Every later append fails fast — the store never writes again, so
+        // the next turn's JSON can't be concatenated onto the corrupt tail.
+        store.append_turn(&turn).unwrap_err();
+        store.append_turn(&sample_turns()[3]).unwrap_err();
+        let error = store.append_turn(&sample_turns()[3]).unwrap_err();
+        assert!(
+            error.to_string().contains("stopped persisting"),
+            "the error must say the store gave up: {error}"
+        );
+
+        // Exactly the one partial (newline-less) line ever reached the disk.
+        let written = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(written, serde_json::to_string(&turn).unwrap());
+        assert!(
+            !written.ends_with('\n'),
+            "the corrupt tail was never terminated or extended"
+        );
     }
 
     /// Write a session file with `id`/`cwd` and one user turn, for the

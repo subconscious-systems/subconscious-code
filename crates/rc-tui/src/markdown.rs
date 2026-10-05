@@ -212,6 +212,14 @@ pub fn parse_blocks(text: &str) -> Vec<Line<'static>> {
 
 // ---- tables ----------------------------------------------------------------
 
+/// Display width of a table cell in terminal cells — CJK and other wide
+/// glyphs occupy two, so `chars().count()` would under-measure them and
+/// misalign every padded column. Routed through `Span::width` (ratatui's
+/// unicode-width) so no new dependency is needed.
+fn cell_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
 /// Split a GFM table row into trimmed cells. A single leading/trailing `|` is
 /// stripped; `\|` is an escaped pipe (a literal `|` inside a cell), not a
 /// separator.
@@ -260,11 +268,11 @@ fn render_table(header: &[String], rows: &[Vec<String>]) -> Vec<Line<'static>> {
     let ncols = header.len();
     let mut widths = vec![0usize; ncols];
     for (i, c) in header.iter().enumerate() {
-        widths[i] = widths[i].max(c.chars().count());
+        widths[i] = widths[i].max(cell_width(c));
     }
     for row in rows {
         for (i, c) in row.iter().enumerate().take(ncols) {
-            widths[i] = widths[i].max(c.chars().count());
+            widths[i] = widths[i].max(cell_width(c));
         }
     }
     let mut out = Vec::new();
@@ -322,13 +330,13 @@ fn table_row_line(cells: &[String], widths: &[usize], header: bool) -> Line<'sta
                 cell.to_string(),
                 p.accent().add_modifier(Modifier::BOLD),
             ));
-            let dw = cell.chars().count();
+            let dw = cell_width(cell);
             if dw < *w {
                 spans.push(Span::raw(" ".repeat(w - dw)));
             }
         } else {
             let mut cell_spans = parse_inline(cell);
-            let dw: usize = cell_spans.iter().map(|s| s.content.chars().count()).sum();
+            let dw: usize = cell_spans.iter().map(|s| s.width()).sum();
             if dw < *w {
                 cell_spans.push(Span::raw(" ".repeat(w - dw)));
             }

@@ -97,6 +97,15 @@ async fn latest_release() -> Result<LatestRelease> {
 
 async fn latest_release_with_gh() -> Option<LatestRelease> {
     let mut command = Command::new("gh");
+    // opencode #52281 / codex #50193: never flash a console window for the
+    // probe child on Windows. This command is *tokio's*, whose
+    // creation_flags is an inherent method — a CommandExt import here is an
+    // unused-import error under -D warnings (std's Command wants the trait;
+    // tokio's has it built in).
+    #[cfg(windows)]
+    {
+        command.creation_flags(rc_core::windows_process::CREATE_NO_WINDOW);
+    }
     command.kill_on_drop(true).args([
         "release",
         "view",

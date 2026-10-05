@@ -64,7 +64,7 @@ async fn completes_a_simple_turn() {
 
     assert_eq!(resp.choices.len(), 1);
     assert_eq!(resp.choices[0].message.content.as_deref(), Some("hi there"));
-    assert_eq!(resp.choices[0].finish_reason, "stop");
+    assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
     let usage = resp.usage.expect("usage present");
     assert_eq!(usage.prompt_tokens, 5);
     assert_eq!(usage.cached_tokens(), Some(5));
@@ -439,5 +439,45 @@ async fn respects_retry_after_header_on_429() {
             .expect("requests recorded")
             .len(),
         2
+    );
+}
+
+/// A gateway answering a failure with an arbitrarily large error page must
+/// not have that page buffered whole: the retained body is capped at
+/// ERROR_BODY_BYTES (16 KiB) for classification/logging.
+#[tokio::test]
+async fn error_response_body_is_read_bounded() {
+    let big_error_page = "x".repeat(300 * 1024);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(big_error_page))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(
+        server.uri(),
+        "k".into(),
+        "m".into(),
+        Some(Duration::from_secs(600)),
+    )
+    .unwrap();
+    let err = client
+        .complete(
+            &[WireMessage::User {
+                content: "hi".into(),
+            }],
+            &CompleteOpts::default(),
+        )
+        .await
+        .expect_err("400 must fail");
+    let rc_proto::ProtoError::Status { status, body } = err else {
+        panic!("expected a status error, got {err:?}");
+    };
+    assert_eq!(status, 400);
+    assert!(
+        body.len() <= 16 * 1024,
+        "error body must be capped, got {} bytes",
+        body.len()
     );
 }

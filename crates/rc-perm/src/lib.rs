@@ -14,8 +14,11 @@ pub mod bash;
 pub mod path;
 pub mod rules;
 
-pub use bash::{parse_bash, ParsedBash, Sub};
+pub use bash::{
+    is_catastrophic_cmd, is_shell_assignment, parse_bash, suggest_command_name, ParsedBash, Sub,
+};
 pub use path::{resolve_within, resolve_within_loose};
 pub use rules::{
-    AllowAllChecker, BypassChecker, Decision, Mode, PermissionChecker, PermissionEngine,
+    suggested_rule, AllowAllChecker, BypassChecker, Decision, Mode, PermissionChecker,
+    PermissionEngine,
 };

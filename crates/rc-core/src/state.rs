@@ -425,14 +425,32 @@ impl SegmentedLog {
         })
     }
 
+    /// Rotate the segment: flush, rename the current file to `<path>.1`, and
+    /// recreate `<path>` with a rotation marker.
+    ///
+    /// The writer is **never left absent on failure**. It flushes in place via
+    /// `as_mut()` rather than `take()`, so a `?` early-return (flush/rename
+    /// errors) keeps the old writer — `write` on the `Write` impl must not hit
+    /// `expect("log writer")` and panic the supervisor thread. If the recreate
+    /// fails after a successful rename, the rename is rolled back so the same
+    /// fd keeps referring to the live segment path.
     fn rotate(&mut self) -> std::io::Result<()> {
-        if let Some(mut writer) = self.writer.take() {
+        if let Some(writer) = self.writer.as_mut() {
             writer.flush()?;
         }
         let rotated = PathBuf::from(format!("{}.1", self.path.display()));
         let _ = std::fs::remove_file(&rotated);
         std::fs::rename(&self.path, &rotated)?;
-        let mut file = std::io::BufWriter::new(std::fs::File::create(&self.path)?);
+        let file = match std::fs::File::create(&self.path) {
+            Ok(file) => file,
+            Err(error) => {
+                // The old fd now points at the renamed segment; put it back so
+                // subsequent writes land on the live path again.
+                let _ = std::fs::rename(&rotated, &self.path);
+                return Err(error);
+            }
+        };
+        let mut file = std::io::BufWriter::new(file);
         let marker = format!("[log rotated; previous segment: {}]\n", rotated.display());
         file.write_all(marker.as_bytes())?;
         self.written = marker.len() as u64;
@@ -768,6 +786,59 @@ fn snapshot_reference(snapshot: Option<&FileSnapshot>) -> (Option<String>, Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixed review finding: `rotate` used to `take()` the writer and
+    /// early-return via `?`, so a failed rotation left `writer = None` and the
+    /// next write panicked the supervisor thread on `expect("log writer")`.
+    /// Inject a rename failure (a non-empty directory at the rotation target)
+    /// and assert the log stays writable — the sentinel the review asked for.
+    #[test]
+    fn rotate_failure_keeps_the_log_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("bg.log");
+        let rotated = dir.path().join("bg.log.1");
+        let mut log = SegmentedLog::new(&log_path).unwrap();
+        log.write_all(b"before rotate\n").unwrap();
+
+        // A non-empty directory at `<path>.1` cannot be replaced by
+        // `rename(file, dir)`: rotation fails after the flush step.
+        std::fs::create_dir(&rotated).unwrap();
+        std::fs::write(rotated.join("occupied"), b"x").unwrap();
+        log.rotate()
+            .expect_err("rename onto a non-empty directory must fail");
+
+        // The bug: this used to panic on `expect("log writer")`.
+        log.write_all(b"after failed rotate\n").unwrap();
+        log.flush().unwrap();
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("before rotate") && contents.contains("after failed rotate"),
+            "both writes must survive in the live segment: {contents:?}"
+        );
+        // The occupied rotation target was untouched.
+        assert!(rotated.join("occupied").exists());
+    }
+
+    #[test]
+    fn rotate_success_moves_the_segment_and_restarts_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("bg.log");
+        let rotated = dir.path().join("bg.log.1");
+        let mut log = SegmentedLog::new(&log_path).unwrap();
+        log.write_all(b"first segment\n").unwrap();
+        log.rotate().unwrap();
+        log.write_all(b"second segment\n").unwrap();
+        log.flush().unwrap();
+        let old = std::fs::read_to_string(&rotated).unwrap();
+        let new = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(old, "first segment\n");
+        assert!(new.contains("log rotated"), "marker line: {new:?}");
+        assert!(new.contains("second segment"));
+        // The next write stays in the new segment (no re-rotation loop).
+        log.write_all(b"more\n").unwrap();
+        log.flush().unwrap();
+        assert!(std::fs::read_to_string(&log_path).unwrap().contains("more"));
+    }
 
     #[test]
     fn rewind_pops_only_the_last_n_turns_in_reverse_order() {

@@ -35,4 +35,12 @@ pub enum ProtoError {
     /// mid-stream stall from a connection / total-timeout failure.
     #[error("stream stalled: no chunk for {0:?}")]
     Idle(std::time::Duration),
+
+    /// The SSE decoder's line cap was exceeded: a single `data:` line grew
+    /// past `max` bytes without a newline. Distinct from transport/JSON errors
+    /// so a caller can tell "the provider sent an unbounded line" from a
+    /// decode bug — and so a hostile or broken gateway cannot grow the
+    /// decoder buffer without limit.
+    #[error("sse line exceeded the {max}-byte cap without a newline")]
+    LineOverflow { max: usize },
 }

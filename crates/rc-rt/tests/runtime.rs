@@ -917,3 +917,109 @@ async fn goal_set_show_and_clear_are_persisted_session_state() {
         .collect::<Vec<_>>();
     assert_eq!(goals, vec!["ship the release", ""]);
 }
+
+// ---- compaction convergence (opencode #52697 / codex #50123/#50337) --------
+
+/// A compaction that does not shrink the projected context is a fixed point.
+/// Two in a row disable compaction for the session with a loud error, and the
+/// next /compact is refused — never the old loop of compacting, continuing,
+/// compacting again, forever.
+mod compact_growth {
+    use super::*;
+
+    /// A session whose live tail (big tool results) compacts to a much
+    /// Smaller summary — the one legitimate, shrinking /compact.
+    fn fixtured_session() -> Session {
+        let mut s = session();
+        s.messages.push(Turn::User {
+            content: "analyze this".into(),
+            ts: std::time::SystemTime::now(),
+        });
+        s.messages.push(Turn::ToolResult {
+            call_id: "old-tool".into(),
+            tool: "Read".into(),
+            result: rc_core::ToolResultBody::Ok {
+                content: "bulky raw tool output that must leave the context"
+                    .repeat(64)
+                    .into(),
+                truncated: false,
+            },
+            duration: Default::default(),
+        });
+        s
+    }
+
+    #[tokio::test]
+    async fn shrinking_compaction_emits_the_meter_reset_event() {
+        let model = Arc::new(MockModel::new(vec![])) as Arc<dyn Model>;
+        let tools = Arc::new(ToolRegistry::new(vec![]));
+        let perm = Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>;
+        let rt = Runtime::new(agent(model, tools, perm), fixtured_session(), None);
+        let mut rx = rt.subscribe();
+        rt.action(UserAction::Compact);
+        let events = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+        rt.shutdown().await;
+        // codex #50337: the host must be able to refresh its context meter.
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compacted)),
+            "a shrinking /compact must announce the reset: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.contains("Context compacted")
+        )));
+    }
+
+    #[tokio::test]
+    async fn compaction_fixed_point_warns_then_disables_itself() {
+        let model = Arc::new(MockModel::new(vec![])) as Arc<dyn Model>;
+        let tools = Arc::new(ToolRegistry::new(vec![]));
+        let perm = Arc::new(AllowAllChecker) as Arc<dyn PermissionChecker>;
+        let rt = Runtime::new(agent(model, tools, perm), fixtured_session(), None);
+        let mut rx = rt.subscribe();
+
+        // 1st compact: legit, shrinks the projection.
+        rt.action(UserAction::Compact);
+        let first = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+        assert!(first
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Compacted)));
+
+        // 2nd compact: the summary of a summary is not smaller — a warning,
+        // never a fake success.
+        rt.action(UserAction::Compact);
+        let second = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+        assert!(second.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(text) if text.contains("not smaller")
+        )));
+        assert!(!second
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Compacted)));
+
+        // 3rd: the fixed point repeats — compaction is disabled, loudly.
+        rt.action(UserAction::Compact);
+        let third = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+        assert!(
+            third.iter().any(
+                |event| matches!(event, AgentEvent::Error(text) if text.contains("did not shrink"))
+            ),
+            "{third:?}"
+        );
+
+        // 4th: refused outright, without building another note.
+        rt.action(UserAction::Compact);
+        let fourth = drain_until(&mut rx, |event| matches!(event, AgentEvent::Idle)).await;
+        assert!(
+            fourth.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(text) if text.contains("disabled for this session")
+            )),
+            "{fourth:?}"
+        );
+
+        rt.shutdown().await;
+    }
+}
