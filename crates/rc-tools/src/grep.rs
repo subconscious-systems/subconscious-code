@@ -14,7 +14,6 @@ use rc_core::{Concurrency, Tool, ToolCtx, ToolError, ToolOutcome};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
 use std::path::Path;
 
 const BINARY_SCAN: usize = 8192;
@@ -84,7 +83,8 @@ impl Tool for Grep {
         "Search file contents with a Rust regex, respecting .gitignore; binary files are \
 skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/-C context), \
 `files_with_matches` (default — just paths, the cheapest mode), or `count`. Use \
-`files_with_matches` first to find where to look, then `content` to see the lines."
+`files_with_matches` first to find where to look, then `content` to see the lines. \
+Anchors match line boundaries in every mode; `multiline=true` also lets `.` match newlines."
     }
 
     fn schema(&self) -> Value {
@@ -111,6 +111,8 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
 
         let re = match regex::RegexBuilder::new(&inp.pattern)
             .case_insensitive(inp.case_insensitive)
+            .multi_line(true)
+            .crlf(true)
             .dot_matches_new_line(inp.multiline)
             .build()
         {
@@ -210,33 +212,49 @@ skipped. `output_mode`: `content` (matching lines with line numbers, plus -A/-B/
                 }
                 Mode::Content => {
                     let lines: Vec<&str> = text.lines().collect();
-                    let mut to_print: BTreeSet<usize> = BTreeSet::new();
+                    if lines.is_empty() {
+                        continue;
+                    }
+                    let starts: Vec<usize> = std::iter::once(0)
+                        .chain(text.match_indices('\n').map(|(offset, _)| offset + 1))
+                        .take(lines.len())
+                        .collect();
+                    let line_at = |offset| {
+                        starts
+                            .partition_point(|&start| start <= offset)
+                            .saturating_sub(1)
+                    };
+                    // Match the same complete text used by files/count mode,
+                    // then merge overlapping context windows before rendering.
+                    let mut windows: Vec<(usize, usize)> = Vec::new();
                     let mut file_hits: u64 = 0;
-                    for (i, line) in lines.iter().enumerate() {
-                        if re.is_match(line) {
-                            file_hits += 1;
-                            let lo = i.saturating_sub(before);
-                            let hi = (i + after).min(lines.len().saturating_sub(1));
-                            for j in lo..=hi {
-                                to_print.insert(j);
-                            }
+                    for found in re.find_iter(text) {
+                        file_hits += 1;
+                        let lo = line_at(found.start()).saturating_sub(before);
+                        let last_byte = found.end().saturating_sub(1).max(found.start());
+                        let hi = line_at(last_byte)
+                            .saturating_add(after)
+                            .min(lines.len() - 1);
+                        if let Some((_, end)) = windows.last_mut().filter(|(_, end)| lo <= *end + 1)
+                        {
+                            *end = (*end).max(hi);
+                        } else {
+                            windows.push((lo, hi));
                         }
                     }
                     if file_hits > 0 {
-                        let mut prev: Option<usize> = None;
-                        for &i in &to_print {
-                            if let Some(p) = prev {
-                                if p + 1 != i {
-                                    out.push_str("--\n");
-                                }
+                        for (window, (lo, hi)) in windows.into_iter().enumerate() {
+                            if window > 0 {
+                                out.push_str("--\n");
                             }
-                            out.push_str(&format!(
-                                "{}:{}:{}\n",
-                                path.to_string_lossy(),
-                                i + 1,
-                                lines[i]
-                            ));
-                            prev = Some(i);
+                            for (i, line) in lines.iter().enumerate().take(hi + 1).skip(lo) {
+                                out.push_str(&format!(
+                                    "{}:{}:{}\n",
+                                    path.to_string_lossy(),
+                                    i + 1,
+                                    line
+                                ));
+                            }
                         }
                         out.push('\n');
                         total += file_hits;
@@ -280,6 +298,112 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(p, content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_modes_agree_on_anchored_and_multiline_matches() {
+        for newline in ["\n", "\r\n"] {
+            let dir = tempdir().unwrap();
+            write(
+                dir.path(),
+                "matches.txt",
+                &format!("intro{newline}foo{newline}bar{newline}end{newline}"),
+            );
+            for (pattern, multiline, expected_lines) in [
+                ("^bar$", false, vec![":3:bar"]),
+                (r"foo\r?\nbar", true, vec![":2:foo", ":3:bar"]),
+                ("foo.*bar", true, vec![":2:foo", ":3:bar"]),
+            ] {
+                for mode in ["files_with_matches", "count", "content"] {
+                    let outcome = Grep::new()
+                        .call(
+                            json!({"pattern": pattern, "multiline": multiline, "output_mode": mode}),
+                            &test_ctx(dir.path()),
+                        )
+                        .await
+                        .unwrap();
+                    let ToolOutcome::Ok { content, .. } = outcome else {
+                        panic!("expected matches, got {outcome:?}");
+                    };
+                    assert!(
+                        content.contains("matches.txt"),
+                        "{pattern:?}, {mode}: {content}"
+                    );
+                    if mode == "count" {
+                        assert!(content.ends_with(":1\n"), "{content}");
+                    }
+                    if mode == "content" {
+                        for line in &expected_lines {
+                            assert!(content.contains(line), "{pattern:?}: {content}");
+                        }
+                        assert!(!content.contains(":1:intro"), "{content}");
+                        assert!(!content.contains(":4:end"), "{content}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multiline_content_merges_context_and_preserves_unicode_line_numbers() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.txt", "préface\nα\nβ\nα\nβ\ntail\n");
+        let outcome = Grep::new()
+            .call(
+                json!({"pattern": "α\\nβ", "multiline": true, "output_mode": "content", "context": 1}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Ok { content, .. } = outcome else {
+            panic!("expected content, got {outcome:?}");
+        };
+        for expected in [":1:préface", ":2:α", ":3:β", ":4:α", ":5:β", ":6:tail"] {
+            assert_eq!(content.matches(expected).count(), 1, "{content}");
+        }
+        assert!(!content.contains("--\n"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn content_handles_match_boundaries_empty_files_and_disjoint_windows() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.txt", "α\nβ\ngap\nδ");
+        for (pattern, expected, separator) in [
+            ("α\\n", vec![":1:α"], false),
+            ("^", vec![":1:α", ":2:β", ":3:gap", ":4:δ"], false),
+            ("α|δ", vec![":1:α", ":4:δ"], true),
+        ] {
+            let outcome = Grep::new()
+                .call(
+                    json!({"pattern": pattern, "output_mode": "content"}),
+                    &test_ctx(dir.path()),
+                )
+                .await
+                .unwrap();
+            let ToolOutcome::Ok { content, .. } = outcome else {
+                panic!("expected content, got {outcome:?}");
+            };
+            assert_eq!(
+                content
+                    .lines()
+                    .filter(|line| line.contains("a.txt:"))
+                    .count(),
+                expected.len()
+            );
+            for line in expected {
+                assert!(content.contains(line), "{pattern:?}: {content}");
+            }
+            assert_eq!(content.contains("--\n"), separator, "{content}");
+        }
+        write(dir.path(), "a.txt", "");
+        let outcome = Grep::new()
+            .call(
+                json!({"pattern": "^$", "output_mode": "content"}),
+                &test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Ok { content, .. } if content.is_empty()));
     }
 
     #[tokio::test]
