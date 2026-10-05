@@ -159,6 +159,8 @@ impl EventSink for NullSink {}
 /// The model abstraction (§13 MockModel for tests).
 #[async_trait]
 pub trait Model: Send + Sync {
+    // async_trait adds #[must_use] to a Future already marked must_use.
+    #[allow(clippy::double_must_use)]
     async fn complete(
         &self,
         req: ModelRequest,

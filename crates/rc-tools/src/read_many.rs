@@ -171,21 +171,20 @@ impl Tool for ReadMany {
 }
 
 /// Keep a UTF-8-safe prefix within an exact byte ceiling and leave a sentinel
-/// whenever enough room exists. Batch reads favor file starts because imports,
-/// declarations, and module docs carry most inventory-description value.
-fn truncate_utf8_bytes(text: &str, cap: usize) -> (String, bool) {
+/// whenever enough room exists. Labeled batch sections retain their prefixes
+/// so each file or query can receive a share of the available output budget.
+pub(crate) fn truncate_utf8_bytes(text: &str, cap: usize) -> (String, bool) {
     if text.len() <= cap {
         return (text.to_string(), false);
     }
     const SENTINEL: &str = "\n[… section truncated]\n";
-    let mut end = cap.saturating_sub(SENTINEL.len()).min(text.len());
+    let sentinel = if SENTINEL.len() <= cap { SENTINEL } else { "" };
+    let mut end = cap.saturating_sub(sentinel.len()).min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     let mut output = text[..end].to_string();
-    if output.len() + SENTINEL.len() <= cap {
-        output.push_str(SENTINEL);
-    }
+    output.push_str(sentinel);
     (output, true)
 }
 
