@@ -2658,10 +2658,12 @@ fn copy_with_command(program: &str, args: &[&str], text: &str) -> std::io::Resul
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // opencode #52281 / codex #50193: no console flash for a clipboard helper
-    // invoked from the TUI on Windows.
+    // invoked from the TUI on Windows. This is std's Command, where
+    // creation_flags is a CommandExt *trait* method — the trait must be in
+    // scope (tokio's Command, unlike std's, has it inherent).
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt as _;
+        use std::os::windows::process::CommandExt;
         command.creation_flags(rc_core::windows_process::CREATE_NO_WINDOW);
     }
     let mut child = command.spawn()?;
