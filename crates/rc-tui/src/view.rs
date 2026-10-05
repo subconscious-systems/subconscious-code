@@ -500,14 +500,13 @@ impl ViewState {
     /// Total renderable logical lines, mirroring `draw_transcript`'s notion of
     /// the trailing lines (cached stream parse, or the one spinner row).
     pub(crate) fn renderable_line_count(&self) -> usize {
-        let streaming =
-            if !self.current_text.is_empty() || !self.current_reasoning.is_empty() {
-                self.current_parsed.len()
-            } else if self.busy {
-                1
-            } else {
-                0
-            };
+        let streaming = if !self.current_text.is_empty() || !self.current_reasoning.is_empty() {
+            self.current_parsed.len()
+        } else if self.busy {
+            1
+        } else {
+            0
+        };
         self.transcript.len() + streaming
     }
 
@@ -526,10 +525,7 @@ impl ViewState {
                 .map(|expanded| vec![expanded])
                 .unwrap_or_else(|| responsive_content_lines(line.clone(), width))
         } else if has_stream && index < self.renderable_line_count() {
-            responsive_content_lines(
-                self.current_parsed[index - tr_len].clone(),
-                width,
-            )
+            responsive_content_lines(self.current_parsed[index - tr_len].clone(), width)
         } else {
             // The live spinner line: single compact row.
             Vec::new()
@@ -1560,11 +1556,13 @@ fn draw_transcript(frame: &mut Frame, state: &mut ViewState, area: Rect, now: In
             .skip(scroll_y as usize)
             .take(h)
             .enumerate()
-            .map(|(offset, (source_index, source_row))| VisibleTranscriptRow {
-                screen_row: area.y.saturating_add(offset as u16),
-                source_index: *source_index,
-                source_row: *source_row,
-            }),
+            .map(
+                |(offset, (source_index, source_row))| VisibleTranscriptRow {
+                    screen_row: area.y.saturating_add(offset as u16),
+                    source_index: *source_index,
+                    source_row: *source_row,
+                },
+            ),
     );
     // Reconstruct each logical line's physical wrapped rows using the same
     // `Paragraph` + `Wrap` configuration as the real render. This makes the
@@ -2180,23 +2178,32 @@ const TURN_DIVIDER_RIGHT_MARKER: &str = " ────────";
 /// A compact transcript marker for a completed turn. It is expanded to the
 /// current terminal width by [`full_width_turn_divider`] during rendering, so
 /// resizes do not leave a stale short rule in history.
+/// A local-time HH:MM label for turn markers (opencode #52748). Computed from
+/// `SystemTime` so resumed history renders the *recorded* clock, not "now".
+pub(crate) fn wall_clock_label(ts: std::time::SystemTime) -> String {
+    let local: chrono::DateTime<chrono::Local> = ts.into();
+    local.format("%H:%M").to_string()
+}
+
 pub(crate) fn turn_divider_line(
     duration: String,
     lines_added: usize,
     lines_removed: usize,
+    at_wall_clock: &str,
 ) -> Line<'static> {
     let p = theme::palette();
     let label = if lines_added == 0 && lines_removed == 0 {
-        vec![Span::styled(
-            format!("worked for {duration}"),
-            p.accent_dim(),
-        )]
+        vec![
+            Span::styled(format!("worked for {duration}"), p.accent_dim()),
+            Span::styled(format!(" · {at_wall_clock}"), p.accent_dim()),
+        ]
     } else {
         vec![
             Span::styled(format!("worked for {duration} · "), p.accent_dim()),
             Span::styled(format!("+{lines_added}"), p.semantic(Color::Green)),
             Span::styled(" ", p.accent_dim()),
             Span::styled(format!("-{lines_removed}"), p.semantic(Color::Red)),
+            Span::styled(format!(" · {at_wall_clock}"), p.accent_dim()),
         ]
     };
     let mut spans = Vec::with_capacity(label.len() + 2);
@@ -4244,7 +4251,7 @@ mod tests {
         let mut state = ViewState::new("m".into());
         state
             .transcript
-            .push(turn_divider_line("12.4s".into(), 0, 0));
+            .push(turn_divider_line("12.4s".into(), 0, 0, "14:05"));
         let screen = rendered_sized(&mut state, 120, 10);
         let divider = screen
             .lines()
@@ -4253,8 +4260,8 @@ mod tests {
 
         assert_eq!(divider.chars().count(), 120, "divider width: {divider:?}");
         assert!(
-            divider.starts_with("─ worked for 12.4s ─"),
-            "left-aligned duration: {divider:?}"
+            divider.starts_with("─ worked for 12.4s · 14:05 ─"),
+            "left-aligned duration with the wall clock: {divider:?}"
         );
         assert!(!divider.contains("changed"), "{divider:?}");
         assert!(!divider.contains("+0"), "{divider:?}");
@@ -4265,7 +4272,7 @@ mod tests {
     #[test]
     fn turn_divider_colors_added_and_removed_counts_independently() {
         let p = theme::palette();
-        let line = turn_divider_line("2.0s".into(), 12, 3);
+        let line = turn_divider_line("2.0s".into(), 12, 3, "23:59");
         let added = line
             .spans
             .iter()

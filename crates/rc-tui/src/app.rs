@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -1317,7 +1317,9 @@ impl App {
 
     /// Echo a prompt at its actual turn boundary and retain it for history.
     fn record_prompt(&mut self, text: &str) {
-        self.view.transcript.push(user_prompt_line(text));
+        self.view
+            .transcript
+            .push(user_prompt_line(text, Some(SystemTime::now())));
         // Record the prompt for Alt+↑/↓ recall (deduped, bash-style), and leave
         // history-browsing mode — a fresh submit always returns to the live
         // draft.
@@ -2010,6 +2012,7 @@ fn finish_turn_at(v: &mut crate::view::ViewState, finished: Instant) {
             turn_duration_label(elapsed),
             changed.added,
             changed.removed,
+            &view::wall_clock_label(SystemTime::now()),
         ));
     }
 }
@@ -2201,8 +2204,15 @@ fn summarize_args(args: &str) -> String {
 /// The echoed user turn keeps the composer's `>` direction marker inside a
 /// padded grey bubble. The orange brand mark remains exclusive to assistant
 /// output, so the two sides of the conversation separate at a glance.
-fn user_prompt_line(text: &str) -> Line<'static> {
-    Line::styled(format!("  > {text}  "), theme::palette().user_prompt())
+fn user_prompt_line(text: &str, at: Option<std::time::SystemTime>) -> Line<'static> {
+    // opencode #52748: the echoed prompt carries the submit wall clock, so a
+    // resumed conversation shows *when* each message was sent — the timestamp
+    // passed in is the recorded one, not the render time.
+    let ts = at.unwrap_or_else(std::time::SystemTime::now);
+    Line::from(vec![
+        Span::styled(format!("  > {text}  "), theme::palette().user_prompt()),
+        Span::styled(format!(" · {}", view::wall_clock_label(ts)), dim_style()),
+    ])
 }
 
 /// Rehydrate the visible transcript before a resumed TUI's first frame. The
@@ -2214,7 +2224,9 @@ fn restore_history(view: &mut ViewState, history: &[Turn]) {
 
     for turn in history {
         match turn {
-            Turn::User { content, .. } => view.transcript.push(user_prompt_line(content)),
+            Turn::User { content, ts, .. } => {
+                view.transcript.push(user_prompt_line(content, Some(*ts)))
+            }
             Turn::Assistant {
                 text,
                 reasoning,
@@ -3362,18 +3374,28 @@ mod tests {
 
     #[test]
     fn user_prompt_echo_is_a_grey_box_without_the_brand_logo() {
-        let line = user_prompt_line("hello");
+        let line = user_prompt_line("hello", None);
         let text: String = line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(text, "  > hello  ");
+        // The echoed prompt, then the opencode #52748 wall-clock suffix. "hello"
+        // renders as `  > hello  ` and the clock is the live HH:MM.
+        let half = text.split('·').collect::<Vec<_>>();
+        assert_eq!(half.len(), 2, "one timestamp suffix: {text:?}");
+        assert_eq!(half[0], "  > hello   ");
+        assert!(
+            half[1].trim().len() == 5,
+            "HH:MM local time suffix, got {text:?}"
+        );
         assert!(
             !text.contains(theme::DEFAULT_LOGO),
             "logo is reserved for output: {text}"
         );
-        let style = line.style;
+        // The bubble style lives on the prompt span (the timestamp suffix is
+        // deliberately dim, not part of the bubble).
+        let style = line.spans[0].style;
         assert!(
             style.bg == Some(Color::DarkGray)
                 || style

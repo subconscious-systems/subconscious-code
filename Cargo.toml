@@ -41,6 +41,8 @@ insta = "1"
 sha2 = "0.10"
 blake3 = "1"
 libc = "0.2"
+# Wall-clock turn/message timestamps in the TUI (opencode #52748).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dlr-sidecar = { path = "integrations/dlr/crates/sidecar" }
 
 [profile.release]
