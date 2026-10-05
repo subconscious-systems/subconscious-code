@@ -3003,11 +3003,19 @@ mod tests {
     #[test]
     fn suggested_path_grants_are_directory_scoped() {
         use rc_core::suggested_rule;
+        // A drive-lettered root on Windows: undrivved paths are root-relative
+        // (not absolute) there, and these asserts compare absolute-path
+        // behavior.
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
         assert_eq!(
             suggested_rule(
                 "Edit",
                 &serde_json::json!({"file_path": "src/app.rs"}),
-                Path::new("/repo")
+                &root.join("repo")
             ),
             "Edit(src/*)"
         );
@@ -3017,29 +3025,34 @@ mod tests {
             suggested_rule(
                 "Write",
                 &serde_json::json!({"file_path": "app.toml"}),
-                Path::new("/repo")
+                &root.join("repo")
             ),
             "Write(./*)"
         );
         // An absolute path inside the cwd is expressed relatively.
+        let repo = root.join("repo");
         assert_eq!(
             suggested_rule(
                 "Edit",
-                &serde_json::json!({"file_path": "/repo/config/x.toml"}),
-                Path::new("/repo")
+                &serde_json::json!({"file_path": repo
+                    .join("config")
+                    .join("x.toml")
+                    .to_string_lossy()}),
+                &repo
             ),
             "Edit(config/*)"
         );
         // Outside the cwd the grant is the exact approved file — the tightest
         // possible spec (opencode #52715: the old bare `Edit` fallback was a
         // global standing grant).
+        let outside = root.join("tmp").join("x");
         assert_eq!(
             suggested_rule(
                 "Edit",
-                &serde_json::json!({"file_path": "/tmp/x"}),
-                Path::new("/repo")
+                &serde_json::json!({"file_path": outside.to_string_lossy()}),
+                &repo
             ),
-            "Edit(/tmp/x)"
+            format!("Edit({})", outside.display())
         );
     }
 

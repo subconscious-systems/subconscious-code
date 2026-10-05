@@ -443,8 +443,14 @@ impl PermissionEngine {
         }
         // `~` expansion — `resolve_within_loose` would treat a literal `~`
         // directory as an ordinary (missing) name under the workspace.
+        // Windows holds the home directory in `USERPROFILE` (`HOME` is
+        // usually unset there), so an unset `HOME` falls back before the
+        // target is left unexpanded — an unexpanded `~/.ssh/…` would
+        // "resolve" as an in-workspace path and the redirect would skip its
+        // approval.
         let expanded = if let Some(rest) = target.strip_prefix("~/") {
             std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .map(|h| {
                     let mut p = PathBuf::from(h);
                     p.push(rest);
@@ -1464,21 +1470,37 @@ mod suggested_rule_tests {
         );
     }
 
+    /// A platform-absolute fixture root: `C:\` on Windows, `/` elsewhere.
+    /// Paths with no drive letter are root-relative — *not* absolute — on
+    /// Windows, so `is_absolute` and `strip_prefix` only behave like these
+    /// POSIX-shaped fixtures when the root carries a drive there.
+    fn fixture_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        }
+    }
+
     #[test]
     fn path_grants_scope_to_the_approved_directory() {
+        let repo = fixture_root().join("repo");
         assert_eq!(
             suggested_rule(
                 "Edit",
                 &serde_json::json!({"file_path": "src/app.rs"}),
-                Path::new("/repo")
+                &repo
             ),
             "Edit(src/*)"
         );
         assert_eq!(
             suggested_rule(
                 "Write",
-                &serde_json::json!({"file_path": "/repo/config/x.toml"}),
-                Path::new("/repo")
+                &serde_json::json!({"file_path": repo
+                    .join("config")
+                    .join("x.toml")
+                    .to_string_lossy()}),
+                &repo
             ),
             "Write(config/*)"
         );
@@ -1489,13 +1511,15 @@ mod suggested_rule_tests {
         // opencode #52715: the old fallback here was the bare tool name — a
         // global standing grant, the exact widening the upstream issue
         // reports. The tightest possible spec is the approved file itself.
+        let repo = fixture_root().join("repo");
+        let outside = fixture_root().join("tmp").join("x");
         assert_eq!(
             suggested_rule(
                 "Edit",
-                &serde_json::json!({"file_path": "/tmp/x"}),
-                Path::new("/repo")
+                &serde_json::json!({"file_path": outside.to_string_lossy()}),
+                &repo
             ),
-            "Edit(/tmp/x)"
+            format!("Edit({})", outside.display())
         );
         // No path at all (non-path tools): unchanged loosest fallback.
         assert_eq!(
