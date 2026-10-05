@@ -11,6 +11,9 @@ All notable changes to Subconscious Code are documented here. This project uses
   interactive UI, so `marathon -p "next message" --continue` (or
   `--resume <path>`) continues the conversation. A resumed run appends to the
   file it resumed. A run that records no turn leaves no file.
+- A resumed headless run's `--benchmark-report` and `--benchmark-trajectory`
+  now cover only that run's turns, tokens and cost. Before, they included the
+  whole resumed session, so a multi-step benchmark counted earlier steps again.
 
 ## [0.1.6] - 2026-09-09
 
