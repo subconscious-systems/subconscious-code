@@ -14,6 +14,12 @@ All notable changes to Subconscious Code are documented here. This project uses
 - A resumed headless run's `--benchmark-report` and `--benchmark-trajectory`
   now cover only that run's turns, tokens and cost. Before, they included the
   whole resumed session, so a multi-step benchmark counted earlier steps again.
+- The completion review is now its own flag, `--completion-review` (or
+  `SC_COMPLETION_REVIEW=1`). After the first stop that follows tool work, it
+  injects one completion-audit note and lets the agent continue. Before, it
+  turned on whenever `--benchmark-report` or `--benchmark-trajectory` was
+  given. Benchmark runs no longer get the review unless they pass
+  `--completion-review`, so by default they run as interactive users do.
 
 ## [0.1.6] - 2026-09-09
 

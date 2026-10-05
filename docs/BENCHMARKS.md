@@ -18,6 +18,11 @@ SC_API_KEY="your-api-key" marathon \
   -p "fix the task"
 ```
 
+The report and trajectory only record the run. They do not change how the
+agent behaves. Add `--completion-review` to inject one completion-audit note
+after the first stop that follows tool work. Interactive runs never get it, so
+leave it off to measure the agent as users run it.
+
 The report intentionally excludes prompt and tool-result content. The ATIF
 trajectory includes user-visible messages and tool activity, so treat it as
 sensitive. External orchestrators should invoke this CLI contract rather than
