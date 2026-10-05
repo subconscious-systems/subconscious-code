@@ -121,10 +121,11 @@ pub struct Settings {
     pub dlr_ingress_token_env: String,
     /// Extra repair symbols requested during a RESYNC/MISSING exchange.
     pub dlr_repair_margin_pct: u32,
-    /// Whether the TUI grabs the mouse. On by default so the wheel and trackpad
-    /// scroll conversation history immediately. `marathon` performs selection and
-    /// copies on release while captured; Ctrl+O releases the mouse when native
-    /// terminal selection is preferred.
+    /// Whether the TUI grabs the mouse. Off by default (codex #50370, #50466,
+    /// opencode #50242): capture breaks native terminal selection and tmux
+    /// copy mode, so it must be opt-in — `ui.mouse = true` in settings or
+    /// `SC_MOUSE=1`. The terminal's own wheel scrollback covers conversation
+    /// history without capture, and Ctrl+O still toggles capture live.
     pub mouse: bool,
 }
 
@@ -333,10 +334,12 @@ impl Settings {
         let mut dlr_url = DEFAULT_DLR_URL.to_string();
         let mut dlr_ingress_token_env = "SC_DLR_INGRESS_TOKEN".to_string();
         let mut dlr_repair_margin_pct = 5u32;
-        // Scrollback is a primary conversation action, so wheel/trackpad events
-        // work on first launch. Ctrl+O hands the mouse back to the terminal for
-        // native selection whenever that is preferable.
-        let mut mouse = true;
+        // Mouse capture is opt-in (codex #50370/#50466, opencode #50242):
+        // enabled only by an explicit `ui.mouse = true` layer or `SC_MOUSE=1`.
+        // The terminal's own scrollback handles the wheel natively, and mouse
+        // capture has a real cost: it breaks native text selection and tmux
+        // copy mode. Ctrl+O still toggles capture live in the TUI.
+        let mut mouse = false;
 
         // Later layers override earlier ones. User before project so a
         // committed project file beats a user global — matches §10.1 (project
@@ -952,12 +955,14 @@ mod tests {
         );
     }
 
-    /// Scrollback works with the wheel on first launch. Ctrl+O remains the
-    /// explicit escape hatch for native terminal selection.
+    /// Mouse capture is opt-in (codex #50370/#50466, opencode #50242): off
+    /// unless `SC_MOUSE=1` or a `ui.mouse = true` settings layer says
+    /// otherwise. The env-var override path itself is exercised by the
+    /// SC_MOUSE probe test elsewhere in this suite.
     #[test]
-    fn mouse_capture_is_on_for_scrollback_by_default() {
+    fn mouse_capture_is_off_by_default() {
         let s = Settings::load(Path::new("/nonexistent-project-dir"));
-        assert!(s.mouse, "default must enable wheel scrollback");
+        assert!(!s.mouse, "capture must be opt-in, not the default");
     }
 
     /// With the env var unset, the resolver is exactly the saved key — the

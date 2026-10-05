@@ -118,9 +118,10 @@ pub fn run(
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    // On by default so wheel/trackpad history works immediately. While captured,
-    // sc owns selection and copies on release via OSC 52; Ctrl+O (or ui.mouse =
-    // false) hands selection back to the terminal.
+    // Opt-in (codex #50370/#50466, opencode #50242): capture breaks native
+    // terminal selection and tmux copy mode, so it starts only when the user
+    // asked for it (ui.mouse = true / SC_MOUSE=1). While captured, sc owns
+    // selection and copies on release via OSC 52; Ctrl+O hands selection back.
     if mouse {
         execute!(stdout, EnableMouseCapture)?;
     }
