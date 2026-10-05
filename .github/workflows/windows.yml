@@ -18,6 +18,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - run: python -m unittest discover -s evaluations/tests -p 'test_*.py'
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test Windows PowerShell 5.1
         env:
@@ -27,6 +28,10 @@ jobs:
         run: |
           $env:SC_POWERSHELL_PATH = (Get-Command pwsh.exe).Source
           cargo test --locked -p rc-tools bash::tests
+      - name: Exercise the task evaluator with an offline scripted provider
+        env:
+          SC_TEST_BINARY: target/debug/marathon.exe
+        run: python -m unittest discover -s evaluations/tests -p 'test_*.py'
       - name: Test optional Git Bash backend
         env:
           SC_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe

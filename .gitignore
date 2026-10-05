@@ -4,6 +4,7 @@
 .DS_Store
 .pytest_cache/
 .ruff_cache/
+__pycache__/
 *.profraw
 
 # Generated benchmark outputs and internal working notes are not release source.

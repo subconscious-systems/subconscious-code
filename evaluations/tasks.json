@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "suite_id": "subconscious-tools-v1",
+  "source_revision": "7445d70454ff68536b68f8c7444d9dd376e498ff",
+  "grader": "graders/tool_contracts.rs",
+  "preserve_filter": "preserve::",
+  "preserve_tests": 3,
+  "tasks": [
+    {
+      "id": "glob_segments",
+      "issue": 25,
+      "goal_filter": "goal_glob::",
+      "goal_tests": 1,
+      "prompt": "Fix Glob's path-segment matching in crates/rc-tools. Its documented contract says ordinary wildcards match within one segment and ** is recursive. Currently *.rs also returns nested files, and src/*.rs returns deeper descendants. Preserve recursive patterns, hidden-path behavior, modification-time ordering, and the public tool API. Add relevant regressions and verify the change.",
+      "editable": [
+        "crates/rc-tools/src/*.rs",
+        "crates/rc-tools/tests/*.rs"
+      ],
+      "oracle_revision": "99131094b267b3914eb69d1bd73d6e17d97a4ce8",
+      "oracle_files": [
+        "crates/rc-tools/src/glob.rs"
+      ],
+      "oracle_patch": "oracles/glob_segments.patch",
+      "oracle_sha256": "8c1ea5c44347ad0f11319ee4c3ef63d25124eed45a983885433309f567cc9264"
+    },
+    {
+      "id": "grep_modes",
+      "issue": 27,
+      "goal_filter": "goal_grep_modes::",
+      "goal_tests": 1,
+      "prompt": "Fix inconsistent regex matching between Grep output modes in crates/rc-tools. A line-anchored pattern can match in content mode but disappear in files/count modes. A multiline match can appear in files/count modes but disappear in content mode. All modes must agree on matching semantics; content mode must include the covered lines and preserve correct line numbers and context. Handle LF, CRLF, and Unicode, preserve normal searches, and keep the public API unchanged. Add regressions and verify the change.",
+      "editable": [
+        "crates/rc-tools/src/*.rs",
+        "crates/rc-tools/tests/*.rs"
+      ],
+      "oracle_revision": "1dfdda76c8b3fa52ec185518b124589e32194437",
+      "oracle_files": [
+        "crates/rc-tools/src/grep.rs"
+      ],
+      "oracle_patch": "oracles/grep_modes.patch",
+      "oracle_sha256": "ed30711297f834eeca08532db771ba5a99a99c6b8e4ee1ad1981c816b64c5378"
+    },
+    {
+      "id": "read_many_budget",
+      "issue": 29,
+      "goal_filter": "goal_read_many::",
+      "goal_tests": 1,
+      "prompt": "Fix ReadMany's output allocation in crates/rc-tools. At configured budgets of 1 KiB or less it returns only headers even when the complete file bodies fit. Give each file a useful share of the available space, retain the exact combined byte ceiling, and handle small caps and multibyte UTF-8 safely. Preserve duplicate-path handling, read registration, and existing per-file limits. Keep the public API unchanged, add regressions, and verify the change.",
+      "editable": [
+        "crates/rc-tools/src/*.rs",
+        "crates/rc-tools/tests/*.rs"
+      ],
+      "oracle_revision": "f705dd326eb1b9eabeb6079a98c9e7917478118d",
+      "oracle_files": [
+        "crates/rc-tools/src/read_many.rs"
+      ],
+      "oracle_patch": "oracles/read_many_budget.patch",
+      "oracle_sha256": "e11a8ef6e7e2d90e0e56bd84c69b27d5628de94a6bf257d2cba650e1090adeda"
+    },
+    {
+      "id": "grep_many_budget",
+      "issue": 30,
+      "goal_filter": "goal_grep_many::",
+      "goal_tests": 1,
+      "prompt": "Fix GrepMany's bounded-output contract in crates/rc-tools. Small configured caps currently turn inner searches into unlimited searches, and final output can exceed the budget or crowd out later queries. Allocate bounded space fairly across query results and include labels and truncation markers within an exact UTF-8-safe byte ceiling. Preserve empty-input errors, cancellation, the 32-query limit, and the public API. Add regressions and verify the change.",
+      "editable": [
+        "crates/rc-tools/src/*.rs",
+        "crates/rc-tools/tests/*.rs"
+      ],
+      "oracle_revision": "3b1f898ea96575655cf8b685ba57df1a299f6681",
+      "oracle_files": [
+        "crates/rc-tools/src/grep_many.rs",
+        "crates/rc-tools/src/read_many.rs"
+      ],
+      "oracle_patch": "oracles/grep_many_budget.patch",
+      "oracle_sha256": "be5198c3e3040225f5a008b8ca4c79c97d04ae1c75b57fd18173b2648a3b4491"
+    },
+    {
+      "id": "grep_file_glob",
+      "issue": 33,
+      "goal_filter": "goal_file_glob::",
+      "goal_tests": 1,
+      "prompt": "Fix Grep's file-filter behavior when the search path is an explicit file. With a.rs containing a match, path=a.rs and glob=*.rs currently return nothing, although the same search without the glob succeeds. Matching filename globs must retain the file, and nonmatching globs must exclude it. Handle relative and absolute paths in every output mode, preserve directory searches and path containment, and keep the public API unchanged. Add regressions and verify the change.",
+      "editable": [
+        "crates/rc-tools/src/*.rs",
+        "crates/rc-tools/tests/*.rs"
+      ],
+      "oracle_revision": "2a5a0e47d4576480eb03ffa640d7da2e25b1442c",
+      "oracle_files": [
+        "crates/rc-tools/src/grep.rs"
+      ],
+      "oracle_patch": "oracles/grep_file_glob.patch",
+      "oracle_sha256": "cb26875e1a2664a873c587f48841295487ae92bbf572afd3980ac0feaa6bb95f"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+--- a/crates/rc-tools/src/grep.rs
++++ b/crates/rc-tools/src/grep.rs
+@@ -170,7 +170,7 @@
+             let path = entry.path();
+             let rel = path.strip_prefix(&root).unwrap_or(path);
+             if let Some(gm) = &glob_matcher {
+-                let base = rel.file_name().map(Path::new);
++                let base = path.file_name().map(Path::new);
+                 let matched = gm.is_match(rel) || base.is_some_and(|b| gm.is_match(b));
+                 if !matched {
+                     continue;

@@ -1,0 +1,14 @@
+--- a/crates/rc-tools/src/glob.rs
++++ b/crates/rc-tools/src/glob.rs
+@@ -107,7 +107,10 @@
+             None => std::fs::canonicalize(&ctx.cwd).unwrap_or_else(|_| ctx.cwd.clone()),
+         };
+ 
+-        let matcher = match globset::Glob::new(&inp.pattern) {
++        let matcher = match globset::GlobBuilder::new(&inp.pattern)
++            .literal_separator(true)
++            .build()
++        {
+             Ok(g) => g.compile_matcher(),
+             Err(e) => {
+                 return Ok(ToolOutcome::Error {

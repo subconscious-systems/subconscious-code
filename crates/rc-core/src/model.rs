@@ -162,6 +162,8 @@ impl EventSink for NullSink {}
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Model: Send + Sync {
+    // async_trait adds #[must_use] to a Future already marked must_use.
+    #[allow(clippy::double_must_use)]
     async fn complete(
         &self,
         req: ModelRequest,
