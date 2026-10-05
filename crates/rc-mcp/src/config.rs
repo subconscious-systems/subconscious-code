@@ -1,0 +1,475 @@
+//! MCP server configuration: the Claude Code / Cursor `mcpServers` shape.
+//!
+//! ```json
+//! { "mcpServers": {
+//!     "files":  { "command": "npx", "args": ["-y", "@scope/server"], "env": {"TOKEN": "${MY_TOKEN}"} },
+//!     "search": { "type": "http", "url": "https://example.com/mcp",
+//!                 "headers": { "Authorization": "Bearer ${SEARCH_TOKEN}" } }
+//! } }
+//! ```
+//!
+//! `type` (alias `transport`) is `stdio`, `http` or `streamable-http`; it is
+//! inferred from `command`/`url` when omitted. `${VAR}` and `${VAR:-default}`
+//! expand from the environment in commands, arguments, env values, URLs and
+//! headers, so secrets stay out of settings files.
+
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Wait this long for a server to start and list its tools.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wait this long for one tool call before reporting it as timed out.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One server, validated and with every `${VAR}` expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub name: String,
+    pub transport: Transport,
+    /// The transport as written in the config, before `${VAR}` expansion, so
+    /// `/mcp` and error messages never show a substituted secret.
+    pub display: String,
+    /// Every value substituted for a `${VAR}`. Server errors and stderr are
+    /// scrubbed of these before they are shown or logged.
+    pub secrets: Vec<String>,
+    pub startup_timeout: Duration,
+    pub tool_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: Option<PathBuf>,
+    },
+    Http {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+impl Transport {
+    /// A short human description: `stdio: npx -y …` or `http: https://…`.
+    pub fn describe(&self) -> String {
+        match self {
+            Transport::Stdio { command, args, .. } => {
+                let mut line = format!("stdio: {command}");
+                for arg in args {
+                    line.push(' ');
+                    line.push_str(arg);
+                }
+                line
+            }
+            Transport::Http { url, .. } => format!("http: {url}"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServer {
+    #[serde(rename = "type", alias = "transport")]
+    kind: Option<String>,
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    cwd: Option<String>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    disabled: bool,
+    startup_timeout_ms: Option<u64>,
+    tool_timeout_ms: Option<u64>,
+}
+
+/// Parse a `mcpServers` map into server configs. Returns the servers to start,
+/// in name order, and one error string per entry that could not be used, so a
+/// bad entry disables only itself.
+pub fn parse_servers(
+    raw: &BTreeMap<String, serde_json::Value>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<ServerConfig>, Vec<(String, String)>) {
+    let mut servers = Vec::new();
+    let mut errors = Vec::new();
+    for (name, value) in raw {
+        match parse_server(name, value, lookup) {
+            Ok(Some(server)) => servers.push(server),
+            Ok(None) => {}
+            Err(error) => errors.push((name.clone(), error)),
+        }
+    }
+    (servers, errors)
+}
+
+/// The process environment, for [`parse_servers`].
+pub fn env_lookup(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn parse_server(
+    name: &str,
+    value: &serde_json::Value,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<ServerConfig>, String> {
+    validate_name(name)?;
+    let raw: RawServer = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if raw.disabled {
+        return Ok(None);
+    }
+    let secrets = std::cell::RefCell::new(Vec::new());
+    let expand = |s: &str| -> Result<String, String> {
+        let (expanded, substituted) = expand_vars_tracked(s, lookup)?;
+        secrets.borrow_mut().extend(substituted);
+        Ok(expanded)
+    };
+    let kind = match (raw.kind.as_deref(), &raw.command, &raw.url) {
+        (Some(kind), _, _) => kind.to_ascii_lowercase(),
+        (None, Some(_), None) => "stdio".into(),
+        (None, None, Some(_)) => "http".into(),
+        (None, Some(_), Some(_)) => return Err("set either `command` or `url`, not both".into()),
+        (None, None, None) => return Err("needs a `command` (stdio) or a `url` (http)".into()),
+    };
+    let transport = match kind.as_str() {
+        "stdio" => {
+            if raw.url.is_some() || !raw.headers.is_empty() {
+                return Err("a stdio server takes `command`, not `url`/`headers`".into());
+            }
+            let command = raw
+                .command
+                .as_deref()
+                .ok_or("a stdio server needs a `command`")?;
+            Transport::Stdio {
+                command: expand(command)?,
+                args: raw.args.iter().map(|a| expand(a)).collect::<Result<_, _>>()?,
+                env: raw
+                    .env
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), expand(v)?)))
+                    .collect::<Result<_, String>>()?,
+                cwd: raw.cwd.as_deref().map(expand).transpose()?.map(PathBuf::from),
+            }
+        }
+        "http" | "streamable-http" | "streamable_http" | "streamablehttp" => {
+            if raw.command.is_some() || !raw.args.is_empty() || !raw.env.is_empty() {
+                return Err("an http server takes `url`, not `command`/`args`/`env`".into());
+            }
+            let written = raw.url.as_deref().ok_or("an http server needs a `url`")?;
+            let url = expand(written)?;
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(format!(
+                    "`url` must start with http:// or https://, got {written:?}"
+                ));
+            }
+            Transport::Http {
+                url,
+                headers: raw
+                    .headers
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), expand(v)?)))
+                    .collect::<Result<_, String>>()?,
+            }
+        }
+        "sse" => {
+            return Err(
+                "the legacy SSE transport is not supported; use the server's streamable HTTP endpoint (`type: http`)"
+                    .into(),
+            )
+        }
+        other => return Err(format!("unknown transport {other:?} (use stdio or http)")),
+    };
+    let display = match &transport {
+        Transport::Stdio { .. } => {
+            let mut line = format!("stdio: {}", raw.command.as_deref().unwrap_or_default());
+            for arg in &raw.args {
+                line.push(' ');
+                line.push_str(arg);
+            }
+            line
+        }
+        Transport::Http { .. } => format!("http: {}", raw.url.as_deref().unwrap_or_default()),
+    };
+    let secrets = secret_forms(secrets.into_inner());
+    Ok(Some(ServerConfig {
+        name: name.to_string(),
+        transport,
+        display,
+        secrets,
+        startup_timeout: raw
+            .startup_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
+        tool_timeout: raw
+            .tool_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_TOOL_TIMEOUT),
+    }))
+}
+
+/// Server names become part of wire tool names (`mcp__<server>__<tool>`), which
+/// providers restrict to `[a-zA-Z0-9_-]`. A `__` inside a name would make the
+/// server/tool split ambiguous.
+fn validate_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && !name.contains("__");
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "server name {name:?} must be 1-32 characters of [a-zA-Z0-9_-] without `__`"
+        ))
+    }
+}
+
+/// Expand `${VAR}` and `${VAR:-default}`. A `$` not followed by `{` is literal.
+/// An unset variable without a default is an error, so a missing secret fails
+/// the server loudly instead of sending an empty credential.
+pub fn expand_vars(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    expand_vars_tracked(input, lookup).map(|(expanded, _)| expanded)
+}
+
+/// [`expand_vars`], also returning each value taken from the environment.
+fn expand_vars_tracked(
+    input: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    let mut substituted = Vec::new();
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unclosed `${{` in {input:?}"))?;
+        let expr = &after[..end];
+        let (var, default) = match expr.split_once(":-") {
+            Some((var, default)) => (var, Some(default)),
+            None => (expr, None),
+        };
+        match (lookup(var).filter(|v| !v.is_empty()), default) {
+            (Some(value), _) => {
+                out.push_str(&value);
+                substituted.push(value);
+            }
+            (None, Some(default)) => out.push_str(default),
+            (None, None) => return Err(format!("environment variable {var} is not set")),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok((out, substituted))
+}
+
+/// Substituted values shorter than this are not scrubbed from messages: a port
+/// or `1` would scrub unrelated text, and is not a credential worth hiding.
+const MIN_SECRET_LEN: usize = 4;
+
+/// Every form a substituted value can take in a message: as is, each line of
+/// a multi-line value (stderr arrives a line at a time), and percent-encoded
+/// as an HTTP client writes it into a URL. Longest first, so a longer form is
+/// replaced before a shorter one inside it.
+fn secret_forms(values: Vec<String>) -> Vec<String> {
+    let mut forms = Vec::new();
+    for value in values {
+        let lines = value.lines().map(str::to_string).collect::<Vec<_>>();
+        for form in std::iter::once(value).chain(lines) {
+            forms.push(percent_encode(&form, false));
+            forms.push(percent_encode(&form, true));
+            forms.push(form);
+        }
+    }
+    forms.retain(|form| form.trim().len() >= MIN_SECRET_LEN);
+    forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    forms.dedup();
+    forms
+}
+
+/// Percent-encode every byte outside RFC 3986's unreserved set, as
+/// `encodeURIComponent` does, with upper- or lower-case hex.
+fn percent_encode(value: &str, lower: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else if lower {
+            out.push_str(&format!("%{byte:02x}"));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Replace every secret in `text` with `***`.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if !secret.is_empty() {
+            out = out.replace(secret.as_str(), "***");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn env(name: &str) -> Option<String> {
+        match name {
+            "TOKEN" => Some("t0k".into()),
+            "TOKEN_LONG" => Some("s3cret-value".into()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        }
+    }
+
+    fn parse(value: serde_json::Value) -> (Vec<ServerConfig>, Vec<(String, String)>) {
+        let raw: BTreeMap<String, serde_json::Value> = serde_json::from_value(value).unwrap();
+        parse_servers(&raw, &env)
+    }
+
+    #[test]
+    fn infers_transport_and_expands_variables() {
+        let (servers, errors) = parse(json!({
+            "files": {"command": "fs-${TOKEN}", "args": ["--key", "${TOKEN}"], "env": {"K": "${MISSING:-dflt}"}},
+            "search": {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ${TOKEN}"}},
+        }));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            servers[0].transport,
+            Transport::Stdio {
+                command: "fs-t0k".into(),
+                args: vec!["--key".into(), "t0k".into()],
+                env: BTreeMap::from([("K".into(), "dflt".into())]),
+                cwd: None,
+            }
+        );
+        assert_eq!(
+            servers[1].transport,
+            Transport::Http {
+                url: "https://example.com/mcp".into(),
+                headers: BTreeMap::from([("Authorization".into(), "Bearer t0k".into())]),
+            }
+        );
+        assert_eq!(servers[0].tool_timeout, DEFAULT_TOOL_TIMEOUT);
+    }
+
+    #[test]
+    fn harbor_transport_key_and_timeouts_are_accepted() {
+        let (servers, errors) = parse(json!({
+            "smoke": {"transport": "streamable-http", "url": "http://mcp:8000/mcp", "tool_timeout_ms": 5000},
+        }));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(matches!(servers[0].transport, Transport::Http { .. }));
+        assert_eq!(servers[0].tool_timeout, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn a_bad_entry_fails_only_itself() {
+        let (servers, errors) = parse(json!({
+            "good": {"command": "ok"},
+            "needs-secret": {"command": "x", "env": {"K": "${UNSET_SECRET}"}},
+            "empty-secret": {"url": "https://e.com/mcp", "headers": {"A": "${EMPTY}"}},
+            "legacy": {"type": "sse", "url": "https://e.com/sse"},
+            "both": {"command": "x", "url": "https://e.com"},
+            "bad__name": {"command": "x"},
+            "typo": {"comand": "x"},
+            "off": {"command": "x", "disabled": true},
+        }));
+        assert_eq!(
+            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+        let failed: Vec<&str> = errors.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            failed,
+            [
+                "bad__name",
+                "both",
+                "empty-secret",
+                "legacy",
+                "needs-secret",
+                "typo"
+            ]
+        );
+        assert!(errors.iter().any(|(_, e)| e.contains("UNSET_SECRET")));
+    }
+
+    #[test]
+    fn display_is_unexpanded_and_secrets_are_tracked() {
+        let (servers, _) = parse(json!({
+            "web": {"url": "https://e.com/mcp?key=${TOKEN_LONG}", "headers": {"A": "Bearer ${TOKEN_LONG}"}},
+            "cli": {"command": "srv", "args": ["--key", "${TOKEN_LONG}"]},
+        }));
+        let web = servers.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.display, "http: https://e.com/mcp?key=${TOKEN_LONG}");
+        assert_eq!(web.secrets, ["s3cret-value"]);
+        let cli = servers.iter().find(|s| s.name == "cli").unwrap();
+        assert_eq!(cli.display, "stdio: srv --key ${TOKEN_LONG}");
+        assert_eq!(
+            redact(
+                "GET https://e.com/mcp?key=s3cret-value failed",
+                &web.secrets
+            ),
+            "GET https://e.com/mcp?key=*** failed"
+        );
+    }
+
+    #[test]
+    fn encoded_and_per_line_forms_are_scrubbed() {
+        let lookup = |name: &str| match name {
+            "TOK" => Some("ab/cd+ef=gh@ij".to_string()),
+            "PEM" => Some("-----BEGIN KEY-----\nc2VjcmV0LWJvZHk=\n-----END KEY-----".to_string()),
+            _ => None,
+        };
+        let raw: BTreeMap<String, serde_json::Value> = serde_json::from_value(json!({
+            "web": {"url": "https://e.com/mcp?key=${TOK}"},
+            "cli": {"command": "srv", "env": {"KEY": "${PEM}"}},
+        }))
+        .unwrap();
+        let (servers, errors) = parse_servers(&raw, &lookup);
+        assert!(errors.is_empty(), "{errors:?}");
+        let web = &servers.iter().find(|s| s.name == "web").unwrap().secrets;
+        for leaked in [
+            "GET https://e.com/mcp?key=ab/cd+ef=gh@ij",
+            "GET https://e.com/mcp?key=ab%2Fcd%2Bef%3Dgh%40ij",
+            "GET https://e.com/mcp?key=ab%2fcd%2bef%3dgh%40ij",
+        ] {
+            let shown = redact(leaked, web);
+            assert_eq!(shown, "GET https://e.com/mcp?key=***", "{leaked}");
+        }
+        let cli = &servers.iter().find(|s| s.name == "cli").unwrap().secrets;
+        assert_eq!(
+            redact("bad key c2VjcmV0LWJvZHk= rejected", cli),
+            "bad key *** rejected"
+        );
+    }
+
+    #[test]
+    fn short_substitutions_are_not_treated_as_secrets() {
+        let (servers, _) = parse(json!({"s": {"command": "x", "args": ["${TOKEN}"]}}));
+        assert!(servers[0].secrets.is_empty());
+    }
+
+    #[test]
+    fn dollar_without_brace_is_literal() {
+        assert_eq!(
+            expand_vars("cost $5 ${TOKEN}", &env).unwrap(),
+            "cost $5 t0k"
+        );
+        assert!(expand_vars("${TOKEN", &env).is_err());
+    }
+}

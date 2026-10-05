@@ -48,8 +48,9 @@ partial turn, but it does not corrupt the readable session prefix.
 | `rc-tokenize` | Context-size estimation for observability |
 | `rc-algebra` | Hashing and state primitives used by the runtime and DLR path |
 
-`rc-mcp`, `rc-hooks`, and `rc-skills` reserve future boundaries; they do not yet
-provide user-facing integrations.
+`rc-mcp` connects MCP servers at session start and registers their tools in the
+same `ToolRegistry` as the built-in tools. `rc-hooks` and `rc-skills` reserve
+future boundaries; they do not yet provide user-facing integrations.
 
 ## Data ownership
 

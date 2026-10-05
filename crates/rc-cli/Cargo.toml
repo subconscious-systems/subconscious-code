@@ -26,9 +26,10 @@ rc-tui = { path = "../rc-tui" }
 rc-session = { path = "../rc-session" }
 rc-ctx = { path = "../rc-ctx" }
 rc-tokenize = { path = "../rc-tokenize" }
+rc-mcp = { path = "../rc-mcp" }
 tokio-stream.workspace = true
 clap.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tokio-util = { workspace = true }
 anyhow.workspace = true
 async-trait = { workspace = true }

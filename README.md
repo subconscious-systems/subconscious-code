@@ -10,9 +10,9 @@ tools, large-request streaming, and an optional delta transport for long agent
 conversations. The client is a single Rust binary with no Python or Node runtime.
 
 > Project status: active development. The core agent, terminal UI, session
-> persistence, tools, permissions, and HTTP DLR sidecar are implemented and
-> tested. MCP, hooks, and skills crates are placeholders and are not yet part of
-> the user-facing product.
+> persistence, tools, permissions, MCP servers, and HTTP DLR sidecar are
+> implemented and tested. Hooks and skills crates are placeholders and are not
+> yet part of the user-facing product.
 
 ## Why `marathon`
 
@@ -650,7 +650,7 @@ inside the workspace, and everything converges on `rc-cli`.
   layer 0   rc-proto        rc-perm        rc-tokenize      rc-config   rc-sandbox
             the wire        permissions    estimation       settings    confinement
 
-  stubs: rc-mcp, rc-hooks, rc-skills (declared, not yet implemented)
+  stubs: rc-hooks, rc-skills (declared, not yet implemented)
 ```
 
 Read as a table:
@@ -666,6 +666,7 @@ Read as a table:
 | `rc-ctx` | `rc-core`, `rc-proto`, `rc-tokenize` | System prompt, environment, `AGENTS.md`, `@file` expansion |
 | `rc-tools` | `rc-core`, `rc-perm`, `rc-sandbox` | `Read`, `ReadMany`, `Write`, `Append`, `Edit`, `Glob`, `Grep`, `GrepMany`, `List`, `Bash` |
 | `rc-session` | `rc-core` | JSONL persistence, resume, `/rewind` |
+| `rc-mcp` | `rc-core` | MCP client: stdio and streamable HTTP servers as `mcp__<server>__<tool>` tools |
 | `rc-rt` | `rc-core`, `rc-session` | Bounded/coalesced event transport, action ownership, async persistence |
 | `rc-tui` | `rc-rt`, `rc-core`, `rc-session`, `rc-config` | The ratatui frontend |
 | `rc-cli` | all of the above | Entry point, wiring, `doctor` |
@@ -834,5 +835,5 @@ rustup target add x86_64-unknown-linux-gnu
 cargo check -p rc-sandbox --target x86_64-unknown-linux-gnu --all-targets
 ```
 
-Planned work is tracked in the repository issue tracker. MCP, hooks, skills,
-and full compaction are not yet part of the user-facing product.
+Planned work is tracked in the repository issue tracker. Hooks, skills, and
+full compaction are not yet part of the user-facing product.

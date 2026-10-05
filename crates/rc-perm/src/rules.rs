@@ -172,7 +172,26 @@ fn is_mutating(tool: &str) -> bool {
     matches!(
         tool,
         "Edit" | "Write" | "Append" | "Bash" | "NotebookEdit" | "Task"
-    )
+    ) || is_mcp(tool)
+}
+
+/// MCP tools (`mcp__<server>__<tool>`) run arbitrary code in another process,
+/// so the defaults treat them like `Bash`: confirmed unless a rule allows them.
+fn is_mcp(tool: &str) -> bool {
+    tool.starts_with("mcp__")
+}
+
+/// Whether a rule's tool name covers `tool`. Besides an exact name, a rule of
+/// `mcp__<server>` covers every tool of that server, as in Claude Code.
+fn rule_covers(rule_tool: &str, tool: &str) -> bool {
+    if rule_tool == tool {
+        return true;
+    }
+    is_mcp(rule_tool)
+        && rule_tool["mcp__".len()..].find("__").is_none()
+        && tool
+            .strip_prefix(rule_tool)
+            .is_some_and(|rest| rest.starts_with("__"))
 }
 
 /// The mode's default decision when no rule matches (§7.3).
@@ -186,8 +205,8 @@ fn mode_default(tool: &str, mode: Mode) -> Decision {
             }
         }
         Mode::AcceptEdits => {
-            if tool == "Bash" {
-                Decision::Ask("Bash requires confirmation".into())
+            if tool == "Bash" || is_mcp(tool) {
+                Decision::Ask(format!("{tool} requires confirmation"))
             } else {
                 Decision::Allow
             }
@@ -440,7 +459,9 @@ impl PermissionChecker for PermissionEngine {
         // Session grants for path tools: a matching grant → Allow.
         if tool != "Bash" {
             for r in &grant_rules {
-                if r.tool == tool && (r.spec.is_none() || Self::path_matches(r, input, cwd)) {
+                if rule_covers(&r.tool, tool)
+                    && (r.spec.is_none() || Self::path_matches(r, input, cwd))
+                {
                     return Decision::Allow;
                 }
             }
@@ -458,17 +479,20 @@ impl PermissionChecker for PermissionEngine {
         }
         // deny → allow → ask, first match wins.
         for r in &self.deny {
-            if r.tool == tool && (r.spec.is_none() || Self::path_matches(r, input, cwd)) {
+            if rule_covers(&r.tool, tool) && (r.spec.is_none() || Self::path_matches(r, input, cwd))
+            {
                 return Decision::Deny("denied by a rule".into());
             }
         }
         for r in &self.allow {
-            if r.tool == tool && (r.spec.is_none() || Self::path_matches(r, input, cwd)) {
+            if rule_covers(&r.tool, tool) && (r.spec.is_none() || Self::path_matches(r, input, cwd))
+            {
                 return Decision::Allow;
             }
         }
         for r in &self.ask {
-            if r.tool == tool && (r.spec.is_none() || Self::path_matches(r, input, cwd)) {
+            if rule_covers(&r.tool, tool) && (r.spec.is_none() || Self::path_matches(r, input, cwd))
+            {
                 return Decision::Ask("asked by a rule".into());
             }
         }
@@ -514,6 +538,44 @@ mod tests {
     }
     fn cwd() -> PathBuf {
         std::env::temp_dir()
+    }
+
+    #[test]
+    fn mcp_tools_ask_by_default_and_follow_server_rules() {
+        let input = json!({"query": "x"});
+        let call = |e: &PermissionEngine, tool: &str| e.check(tool, &input, &cwd(), &roots(), &[]);
+        let default = eng(Mode::Default, &[], &[], &[]);
+        assert!(matches!(
+            call(&default, "mcp__web__search"),
+            Decision::Ask(_)
+        ));
+        let edits = eng(Mode::AcceptEdits, &[], &[], &[]);
+        assert!(matches!(call(&edits, "mcp__web__search"), Decision::Ask(_)));
+        let plan = eng(Mode::Plan, &[], &[], &[]);
+        assert!(matches!(call(&plan, "mcp__web__search"), Decision::Deny(_)));
+
+        // A server-wide rule covers that server's tools only.
+        let server = eng(Mode::Default, &["mcp__web__delete"], &["mcp__web"], &[]);
+        assert!(matches!(call(&server, "mcp__web__search"), Decision::Allow));
+        assert!(matches!(
+            call(&server, "mcp__web__delete"),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            call(&server, "mcp__webx__search"),
+            Decision::Ask(_)
+        ));
+        assert!(matches!(
+            call(&server, "mcp__other__search"),
+            Decision::Ask(_)
+        ));
+
+        // A session grant for one MCP tool allows it without a prompt.
+        let grants = vec!["mcp__web__search".to_string()];
+        assert!(matches!(
+            default.check("mcp__web__search", &input, &cwd(), &roots(), &grants),
+            Decision::Allow
+        ));
     }
     fn roots() -> Vec<PathBuf> {
         vec![cwd()]

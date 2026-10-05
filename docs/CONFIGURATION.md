@@ -163,6 +163,102 @@ headless Rust maintenance task might contain:
 Keep rules narrow. `--dangerously-skip-permissions` is intended for an already
 isolated environment and still enforces the catastrophic-command safety floor.
 
+MCP tools are confirmed in `default` and `acceptEdits` modes and denied in
+`plan` mode, like `Bash`. Allow one tool with its full name
+(`mcp__search__query`) or every tool of a server with `mcp__search`. A headless
+`-p` run cannot ask, so it denies any MCP tool that no rule allows: list the
+servers it may use in `permissions.allow`.
+
+## MCP servers
+
+Marathon connects to [Model Context Protocol](https://modelcontextprotocol.io)
+servers and offers their tools to the model as `mcp__<server>__<tool>`. The
+`mcpServers` block uses the same shape as Claude Code and Cursor, so an
+existing block can be pasted in:
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "env": { "LOG_LEVEL": "warn" }
+    },
+    "search": {
+      "type": "http",
+      "url": "https://search.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${SEARCH_TOKEN}" }
+    }
+  }
+}
+```
+
+| Field | Applies to | Meaning |
+| --- | --- | --- |
+| `type` (or `transport`) | all | `stdio` or `http` (`streamable-http`). Inferred from `command` or `url` when omitted |
+| `command`, `args`, `env`, `cwd` | stdio | The server process to start |
+| `url`, `headers` | http | A streamable HTTP endpoint |
+| `startup_timeout_ms` | all | Time to start and list tools (default 30000) |
+| `tool_timeout_ms` | all | Time for one tool call (default 300000) |
+| `disabled` | all | Keep the entry but do not start it |
+
+- `${VAR}` and `${VAR:-default}` expand from the environment in every string
+  field. Keep credentials in environment variables, not in settings files.
+- Server names may use letters, digits, `_` and `-`.
+- A stdio server starts with a minimal environment: `PATH`, `HOME`, `TMPDIR`,
+  `USER`, `LOGNAME`, `SHELL`, `TERM` and the locale variables (on Windows,
+  `PATH`, `PATHEXT`, `SystemRoot`, the temp and profile directories and the
+  other system variables Windows programs need), plus its own `env`. The model
+  API key and `SC_*` settings are not passed on. Add anything else a server
+  needs to its `env`, for example `"GITHUB_TOKEN": "${GITHUB_TOKEN}"`.
+- The legacy SSE transport is not supported. Use the server's streamable HTTP
+  endpoint.
+- `/mcp` and warnings show each server as written in the config, before
+  `${VAR}` expansion, and remove substituted values from error messages.
+
+A project's `.sc/settings.json` is chosen by whoever wrote the repository, so
+its servers do not start until you trust the project: pass
+`--trust-project-mcp`, or list the directory in your user settings:
+
+```json
+{ "trustedMcpProjects": ["~/work/my-repo"] }
+```
+
+Until then `/mcp` lists them as not started, and their values are not read or
+expanded. A project file cannot trust itself; only `~/.sc/settings.json` is
+read for this list. In a trusted project, project servers replace user
+servers of the same name, and `null` removes one.
+
+From the command line, `--mcp-config <file-or-json>` adds servers from a file or
+inline JSON holding the same `{"mcpServers": {...}}` object. Repeat it to layer
+several files. `--strict-mcp-config` ignores the settings files and uses only
+`--mcp-config`, which suits benchmark harnesses:
+
+```bash
+marathon -p "summarize the open issues" \
+  --mcp-config ./mcp.json --strict-mcp-config
+```
+
+The run above needs a rule such as `"allow": ["mcp__issues"]` in
+`.sc/settings.json` (or `--dangerously-skip-permissions` inside an isolated
+sandbox); without one, every MCP call is denied.
+
+All servers start in parallel before the first model request, so the tool list
+stays the same for the whole session. A server that fails to start, or exits
+later, does not stop the session: Marathon prints a warning, its tools return
+the error, and `/mcp` in the terminal UI shows each server's state, tools, and
+last stderr line. A server's stderr never reaches the terminal. When the
+session ends, or Marathon receives SIGINT, SIGTERM or SIGHUP (Ctrl-C, Ctrl-Break
+or closing the console on Windows), Marathon closes each connection and then
+stops the server's whole process tree, including processes a launcher such as
+`npx` started. On Linux a server is also killed if Marathon itself is killed.
+
+An MCP server is a program you choose to run, with your user's permissions.
+It is trusted from the moment it connects: `--sandbox` and `--sandbox-net`
+confine only the `Bash` tool, not MCP servers, and permission rules control
+which of a server's tools the model may call, not what the server itself does.
+Start only servers you would run yourself.
+
 ## Memory files
 
 Project instructions are loaded in this order:
