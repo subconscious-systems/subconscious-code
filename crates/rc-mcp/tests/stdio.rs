@@ -335,3 +335,57 @@ async fn http_connect_errors_do_not_leak_a_url_token() {
     }
     assert!(shown.contains("${TOK}"), "{shown}");
 }
+
+/// Kills the HTTP fixture when the test ends, pass or fail.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn http_servers_list_and_call_tools_with_configured_headers() {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rc-mcp-fixture"))
+        .arg("--http")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let _server = KillOnDrop(child);
+    let url = line.trim().strip_prefix("listening ").unwrap().to_string();
+
+    let raw: BTreeMap<String, serde_json::Value> = serde_json::from_value(json!({
+        "web": {"type": "http", "url": url, "headers": {"Authorization": "Bearer ${TOK}"}},
+    }))
+    .unwrap();
+    let lookup = |name: &str| (name == "TOK").then(|| "http-token-123".to_string());
+    let (servers, errors) = rc_mcp::parse_servers(&raw, &lookup);
+    assert!(errors.is_empty(), "{errors:?}");
+    let hub = McpHub::connect(servers, Vec::new(), Vec::new()).await;
+    assert!(hub.problems().is_empty(), "{:?}", hub.problems());
+
+    let (ok, body) = text(
+        tool(&hub, "mcp__web__echo")
+            .call(json!({"text": "over http"}), &ctx())
+            .await
+            .unwrap(),
+    );
+    assert!(ok, "{body}");
+    assert_eq!(body, "echo: over http");
+    let (ok, body) = text(
+        tool(&hub, "mcp__web__whoami")
+            .call(json!({}), &ctx())
+            .await
+            .unwrap(),
+    );
+    assert!(ok, "{body}");
+    assert_eq!(body, "Bearer http-token-123");
+    hub.shutdown().await;
+}

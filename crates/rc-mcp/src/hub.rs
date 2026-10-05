@@ -27,8 +27,10 @@ const STDERR_TAIL_LINES: usize = 20;
 /// A server that exits at once usually explains why on stderr, and the
 /// closed pipe can reach the client before those lines are read.
 const STDERR_SETTLE: Duration = Duration::from_secs(1);
-/// How long shutdown waits for a server to close cleanly before killing it.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long each graceful shutdown step (closing the connection, then waiting
+/// for the process) may take before the tree is killed. Two steps must fit in
+/// the caller's budget; the signal path also kills unconditionally afterwards.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// Where one server stands. `tools` lists the wire names it contributed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,9 +79,12 @@ pub(crate) struct ServerHandle {
     closed: AtomicBool,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     service: tokio::sync::Mutex<Option<Service>>,
-    /// The stdio server's process tree. Dropping it kills the tree, so the
-    /// server is gone even if the session ends without calling `shutdown`.
-    process: Mutex<Option<(tokio::process::Child, ProcessTree)>>,
+    /// The stdio server's direct child, reaped by `shutdown`.
+    child: Mutex<Option<tokio::process::Child>>,
+    /// The stdio server's process tree. It stays here, never moved into a
+    /// task, so [`McpHub::kill_now`] can always reach it; dropping it kills
+    /// the tree too.
+    tree: Mutex<Option<ProcessTree>>,
     /// A clone of the live peer, readable without awaiting the service lock.
     peer: Mutex<Option<Peer<RoleClient>>>,
 }
@@ -96,7 +101,8 @@ impl ServerHandle {
             closed: AtomicBool::new(false),
             stderr_tail: Arc::default(),
             service: tokio::sync::Mutex::new(None),
-            process: Mutex::new(None),
+            child: Mutex::new(None),
+            tree: Mutex::new(None),
             peer: Mutex::new(None),
         }
     }
@@ -160,18 +166,21 @@ impl ServerHandle {
         if let Some(service) = self.service.lock().await.take() {
             let _ = tokio::time::timeout(SHUTDOWN_GRACE, service.cancel()).await;
         }
-        let process = lock(&self.process).take();
-        if let Some((mut child, mut tree)) = process {
-            if tokio::time::timeout(SHUTDOWN_GRACE, child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.start_kill();
-            }
+        let child = lock(&self.child).take();
+        if let Some(mut child) = child {
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await;
             // The direct child may have exited while its own children (an
             // `npx` launcher's node process) live on in the group or job.
-            tree.kill();
+            self.kill_tree();
+            let _ = child.start_kill();
             let _ = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await;
+        }
+        self.kill_tree();
+    }
+
+    fn kill_tree(&self) {
+        if let Some(tree) = lock(&self.tree).as_mut() {
+            tree.kill();
         }
     }
 }
@@ -297,6 +306,14 @@ impl McpHub {
             tasks.spawn(async move { server.shutdown().await });
         }
         while tasks.join_next().await.is_some() {}
+    }
+
+    /// Kill every server's process tree at once, without waiting. For exit
+    /// paths that cannot wait for [`McpHub::shutdown`] to finish.
+    pub fn kill_now(&self) {
+        for server in &self.servers {
+            server.kill_tree();
+        }
     }
 
     /// The tools to add to the session's registry.
@@ -452,7 +469,8 @@ async fn start(
                 );
                 *lock(stderr_reader) = Some(reader);
             }
-            *lock(&handle.process) = Some((spawned.child, spawned.tree));
+            *lock(&handle.child) = Some(spawned.child);
+            *lock(&handle.tree) = Some(spawned.tree);
             client_config()
                 .serve((spawned.stdout, spawned.stdin))
                 .await

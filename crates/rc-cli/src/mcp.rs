@@ -123,6 +123,8 @@ pub(crate) fn stop_on_signal(hub: McpHub, restore_terminal: bool) {
     tokio::spawn(async move {
         let code = termination_signal().await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), hub.shutdown()).await;
+        // Whatever the graceful pass finished, no server may outlive the exit.
+        hub.kill_now();
         if restore_terminal {
             let _ = crossterm::terminal::disable_raw_mode();
             let _ = crossterm::execute!(
