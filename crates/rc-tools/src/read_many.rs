@@ -111,20 +111,30 @@ impl Tool for ReadMany {
         let omitted = paths.len().saturating_sub(MAX_FILES);
         paths.truncate(MAX_FILES);
 
-        // Divide the output budget across files so one large source file cannot
-        // crowd every later file out of the batch. Headers and the final
-        // omission marker get a separate small allowance, and a final hard cap
-        // below keeps the advertised bound exact.
-        let per_file_cap = self.output_cap.saturating_sub(1024) / paths.len().max(1);
+        let omission_note = if omitted > 0 {
+            format!("[… {omitted} additional paths omitted]\n")
+        } else {
+            String::new()
+        };
+        let headers: Vec<_> = paths
+            .iter()
+            .map(|path| format!("===== {path} =====\n"))
+            .collect();
+        // Reserve the actual labels, separators, and omission marker. A fixed
+        // 1 KiB reservation would discard every body under small output caps.
+        let overhead = headers.iter().fold(omission_note.len(), |total, header| {
+            total.saturating_add(header.len()).saturating_add(2)
+        });
+        let per_file_cap = self.output_cap.saturating_sub(overhead) / paths.len();
         let reader = Read::with_limits(self.default_limit, self.max_line_chars);
         let mut content = String::new();
         let mut truncated = omitted > 0;
 
-        for path in &paths {
+        for (path, header) in paths.iter().zip(&headers) {
             if ctx.cancel.is_cancelled() {
                 return Ok(ToolOutcome::Interrupted);
             }
-            content.push_str(&format!("===== {path} =====\n"));
+            content.push_str(header);
             let outcome = reader
                 .call(
                     json!({
@@ -156,9 +166,7 @@ impl Tool for ReadMany {
             content.push('\n');
         }
 
-        if omitted > 0 {
-            content.push_str(&format!("[… {omitted} additional paths omitted]\n"));
-        }
+        content.push_str(&omission_note);
         let (content, final_truncated) = truncate_utf8_bytes(&content, self.output_cap);
         truncated |= final_truncated;
 
@@ -178,14 +186,13 @@ fn truncate_utf8_bytes(text: &str, cap: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     const SENTINEL: &str = "\n[… section truncated]\n";
-    let mut end = cap.saturating_sub(SENTINEL.len()).min(text.len());
+    let sentinel = if SENTINEL.len() <= cap { SENTINEL } else { "" };
+    let mut end = cap.saturating_sub(sentinel.len()).min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     let mut output = text[..end].to_string();
-    if output.len() + SENTINEL.len() <= cap {
-        output.push_str(SENTINEL);
-    }
+    output.push_str(sentinel);
     (output, true)
 }
 
@@ -244,6 +251,35 @@ mod tests {
         let (content, truncated) = ok(outcome);
         assert!(truncated, "{content}");
         assert!(content.len() <= 160, "{} bytes", content.len());
+    }
+
+    #[tokio::test]
+    async fn small_budgets_keep_contents_from_every_file() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.path().join("b.txt"), "beta\n").unwrap();
+        for cap in [128, 160, 512, 1024, 2048] {
+            let (content, truncated) = ok(ReadMany::with_limits(0, 0, cap)
+                .call(
+                    json!({"file_paths": ["a.txt", "b.txt"]}),
+                    &test_ctx(root.path()),
+                )
+                .await
+                .unwrap());
+            assert!(content.contains("alpha"), "cap {cap}: {content}");
+            assert!(content.contains("beta"), "cap {cap}: {content}");
+            assert!(!truncated, "cap {cap}: {content}");
+            assert!(content.len() <= cap);
+        }
+    }
+
+    #[test]
+    fn tiny_caps_keep_a_utf8_safe_prefix_when_no_sentinel_fits() {
+        for (cap, expected) in [(1, ""), (2, "é"), (3, "é"), (4, "éé")] {
+            let (content, truncated) = truncate_utf8_bytes("ééé", cap);
+            assert!(truncated);
+            assert_eq!(content, expected);
+        }
     }
 
     #[test]
