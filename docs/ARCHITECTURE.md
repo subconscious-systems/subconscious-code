@@ -63,6 +63,16 @@ future boundaries; they do not yet provide user-facing integrations.
 - Tool-result projection can be bounded without deleting the complete session
   or file-change artifact.
 
+Manual `/compact` saves a bounded history handoff. It reserves up to 4,000
+characters for the latest user request and uses the rest of the existing
+16,000-character ceiling for recent activity. Tool targets and arguments receive
+short excerpts; tool output retains its beginning and end so diagnostics and
+command exit footers survive. Returned output, errors, denials, interrupted
+calls, and already-truncated output remain distinguishable. Hidden reasoning
+and model request diagnostics are excluded. The original session remains on
+disk; this handoff is a lossy context projection, not an independent judgment
+that the task is complete.
+
 ## Tool scheduling
 
 The permission pass is sequential and follows model order. Approved tools then

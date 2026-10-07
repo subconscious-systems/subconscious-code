@@ -822,7 +822,11 @@ async fn compact_persists_a_summary_and_moves_the_projection_boundary() {
         call_id: "old-tool".into(),
         tool: "Read".into(),
         result: rc_core::ToolResultBody::Ok {
-            content: "bulky raw tool output must leave context".into(),
+            content: format!(
+                "useful diagnostic prefix\n{}\nraw middle payload must leave context\n{}\nuseful verification footer",
+                "left bulky output ".repeat(2_000),
+                "right bulky output ".repeat(2_000)
+            ).into(),
             truncated: false,
         },
         duration: Default::default(),
@@ -855,13 +859,27 @@ async fn compact_persists_a_summary_and_moves_the_projection_boundary() {
         })
         .expect("persisted compaction marker");
     assert!(summary.contains("important result to retain"));
+    assert!(summary.contains("old request with bulky context"));
+    assert!(summary.contains("useful diagnostic prefix"));
+    assert!(summary.contains("useful verification footer"));
+    assert!(summary.chars().count() <= 16_000);
     assert!(!summary.contains("private reasoning is omitted"));
 
-    let projected = rc_core::project(&loaded.messages)
+    let projected_messages = rc_core::project(&loaded.messages);
+    // Only the system prompt and saved summary remain on the wire. The full
+    // raw tool result stays in the durable transcript, with bounded evidence
+    // represented inside the handoff instead of a live tool message.
+    assert_eq!(projected_messages.len(), 2);
+    assert!(loaded.messages.iter().any(|turn| matches!(turn,
+        Turn::ToolResult { result: rc_core::ToolResultBody::Ok { content, .. }, .. }
+            if content.contains("raw middle payload must leave context")
+    )));
+    let projected = projected_messages
         .into_iter()
         .map(|message| format!("{message:?}"))
         .collect::<String>();
-    assert!(!projected.contains("bulky raw tool output must leave context"));
+    assert!(!projected.contains("raw middle payload must leave context"));
+    assert!(projected.contains("useful verification footer"));
     assert!(projected.contains("important result to retain"));
 }
 

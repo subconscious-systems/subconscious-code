@@ -211,6 +211,23 @@ fn active_goal(turns: &[Turn]) -> Option<&str> {
 /// runtime. The newest entries win when the cap is reached.
 fn compaction_summary(turns: &[Turn]) -> String {
     const CAP_CHARS: usize = 16_000;
+    const ENTRY_CHARS: usize = 2_000;
+    let latest_request = turns.iter().enumerate().rev().find_map(|(index, turn)| {
+        if let Turn::User { content, .. } = turn {
+            Some((index, content))
+        } else {
+            None
+        }
+    });
+    // Keep task constraints outside the recency queue: a large answer or log
+    // must not spend the whole summary budget and erase the user's request.
+    let prefix = latest_request.map_or_else(String::new, |(_, content)| {
+        format!(
+            "Latest user request:\n{}\n\nRecent activity:\n",
+            summary_excerpt(content, 4_000)
+        )
+    });
+    let activity_budget = CAP_CHARS.saturating_sub(prefix.chars().count());
     let active_start = turns
         .iter()
         .rposition(|turn| {
@@ -223,16 +240,35 @@ fn compaction_summary(turns: &[Turn]) -> String {
             )
         })
         .unwrap_or(0);
-    let mut entries = Vec::new();
-    for turn in &turns[active_start..] {
+    // A rolling queue bounds temporary summary allocations as well as output.
+    // Excerpt source text before formatting; never clone a whole large log.
+    let mut entries = std::collections::VecDeque::<(String, usize)>::new();
+    let mut used = 0usize;
+    for (index, turn) in turns.iter().enumerate().skip(active_start) {
         let entry = match turn {
-            Turn::User { content, .. } => Some(format!("User: {content}")),
+            Turn::User { .. } if latest_request.is_some_and(|(latest, _)| latest == index) => None,
+            Turn::User { content, .. } => {
+                Some(format!("User: {}", summary_excerpt(content, ENTRY_CHARS)))
+            }
             Turn::Assistant { text, calls, .. } => {
                 let tools = calls
                     .iter()
-                    .map(|call| call.name.as_str())
+                    .take(8)
+                    .map(|call| {
+                        format!(
+                            "{} {}",
+                            summary_excerpt(&call.name, 64),
+                            summary_excerpt(&call.arguments, 256)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
+                let tools = if calls.len() > 8 {
+                    format!("{tools} [… {} additional calls]", calls.len() - 8)
+                } else {
+                    tools
+                };
+                let text = summary_excerpt(text, ENTRY_CHARS);
                 match (text.trim().is_empty(), tools.is_empty()) {
                     (false, true) => Some(format!("Assistant: {text}")),
                     (false, false) => Some(format!("Assistant: {text}\nTools used: {tools}")),
@@ -243,54 +279,99 @@ fn compaction_summary(turns: &[Turn]) -> String {
             Turn::SystemNote {
                 kind: NoteKind::Compaction,
                 text,
-            } => Some(format!("Previous summary: {text}")),
+            } => Some(format!(
+                "Previous summary: {}",
+                summary_excerpt(text, activity_budget.saturating_sub(32))
+            )),
             Turn::SystemNote {
                 kind: NoteKind::Notice | NoteKind::Recovery,
                 text,
-            } => Some(format!("Note: {text}")),
+            } => Some(format!("Note: {}", summary_excerpt(text, ENTRY_CHARS))),
+            Turn::ToolResult { tool, result, .. } => {
+                use rc_core::ToolResultBody;
+                let (status, body) = match result {
+                    ToolResultBody::Ok { content, truncated } => (
+                        if *truncated {
+                            "returned output, truncated"
+                        } else {
+                            "returned output"
+                        },
+                        content.as_ref(),
+                    ),
+                    ToolResultBody::Error { message, .. } => ("error", message.as_str()),
+                    ToolResultBody::Denied { reason } => ("denied", reason.as_str()),
+                    ToolResultBody::Interrupted => ("interrupted", "not completed"),
+                };
+                Some(format!(
+                    "Tool {} [{status}]: {}",
+                    summary_excerpt(tool, 64),
+                    summary_excerpt(body, 1_000)
+                ))
+            }
             Turn::SystemNote {
                 kind: NoteKind::Goal | NoteKind::ModeChange,
                 ..
             }
-            | Turn::ToolResult { .. }
             | Turn::Error { .. }
             | Turn::Cancelled { .. } => None,
         };
         if let Some(entry) = entry {
-            entries.push(entry);
+            let entry = summary_excerpt(&entry, activity_budget.saturating_sub(2));
+            let chars = entry.chars().count();
+            used += chars + 2; // includes the inter-entry separator
+            entries.push_back((entry, chars));
+            while used > activity_budget {
+                let excess = used - activity_budget;
+                let (oldest, chars) = entries.front_mut().expect("just added an entry");
+                if *chars <= excess {
+                    used -= *chars + 2;
+                    entries.pop_front();
+                } else {
+                    let clipped = summary_excerpt(oldest, *chars - excess);
+                    used -= *chars;
+                    *chars = clipped.chars().count();
+                    used += *chars;
+                    *oldest = clipped;
+                }
+            }
         }
     }
-
-    let mut kept = Vec::new();
-    let mut used = 0usize;
-    for entry in entries.into_iter().rev() {
-        let chars = entry.chars().count();
-        let remaining = CAP_CHARS.saturating_sub(used);
-        if remaining == 0 {
-            break;
-        }
-        if chars <= remaining {
-            used += chars;
-            kept.push(entry);
+    if entries.is_empty() {
+        return if prefix.is_empty() {
+            "No conversational content preceded this compaction.".into()
         } else {
-            let tail = entry
-                .chars()
-                .rev()
-                .take(remaining)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>();
-            kept.push(format!("[…older content elided…]{tail}"));
-            break;
-        }
+            prefix
+        };
     }
-    kept.reverse();
-    if kept.is_empty() {
-        "No conversational content preceded this compaction.".into()
-    } else {
-        kept.join("\n\n")
+    let body = entries
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("{prefix}{body}")
+}
+
+/// Keep both endpoints so file identifiers, diagnostics, and command exit
+/// footers survive. Work and allocation depend on the cap, not the log size.
+fn summary_excerpt(text: &str, cap: usize) -> String {
+    if text.char_indices().nth(cap).is_none() {
+        return text.to_string();
     }
+    const MARKER: &str = "\n[… middle omitted …]\n";
+    let marker_chars = MARKER.chars().count();
+    if cap <= marker_chars {
+        return text.chars().take(cap).collect();
+    }
+    let remaining = cap - marker_chars;
+    let head = remaining / 2;
+    let tail = remaining - head;
+    let head_end = text.char_indices().nth(head).map_or(0, |(index, _)| index);
+    let tail_start = text
+        .char_indices()
+        .rev()
+        .nth(tail - 1)
+        .map_or(text.len(), |(index, _)| index);
+    format!("{}{MARKER}{}", &text[..head_end], &text[tail_start..])
 }
 
 fn persisted_mode(mode: AgentMode) -> &'static str {
@@ -300,5 +381,166 @@ fn persisted_mode(mode: AgentMode) -> &'static str {
         AgentMode::Plan => "plan",
         AgentMode::Ask => "ask",
         AgentMode::Auto => "auto",
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use rc_core::{ToolCall, ToolResultBody};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    fn user(text: &str) -> Turn {
+        Turn::User {
+            content: text.into(),
+            ts: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn assistant(text: String, calls: Vec<ToolCall>) -> Turn {
+        Turn::Assistant {
+            text: text.into(),
+            reasoning: Some("hidden-reasoning-marker".into()),
+            calls,
+            usage: None,
+            cost: None,
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn latest_request_survives_a_large_assistant_response() {
+        let turns = vec![
+            user("Fix parser.rs; preserve the public API and test Unicode inputs."),
+            assistant("long answer ".repeat(10_000), vec![]),
+        ];
+        let summary = compaction_summary(&turns);
+        assert!(
+            summary.contains("preserve the public API"),
+            "task constraints disappeared"
+        );
+        assert!(summary.contains("test Unicode inputs"));
+        assert!(summary.chars().count() <= 16_000);
+        assert!(!summary.contains("hidden-reasoning-marker"));
+    }
+
+    #[test]
+    fn tool_command_and_failure_footer_survive_compaction() {
+        let turns = vec![
+            user("Fix the failing parser tests."),
+            assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "verify".into(),
+                    name: "Bash".into(),
+                    arguments: Arc::from(r#"{"command":"cargo test parser"}"#),
+                }],
+            ),
+            Turn::ToolResult {
+                call_id: "verify".into(),
+                tool: "Bash".into(),
+                result: ToolResultBody::Ok {
+                    content: format!(
+                        "parser diagnostic\n{}\nFAILED unicode_parser\nexit: 1",
+                        "log output ".repeat(20_000)
+                    )
+                    .into(),
+                    truncated: false,
+                },
+                duration: Duration::ZERO,
+            },
+        ];
+        let summary = compaction_summary(&turns);
+        assert!(summary.contains("cargo test parser"));
+        assert!(summary.contains("parser diagnostic"));
+        assert!(summary.contains("FAILED unicode_parser"));
+        assert!(summary.contains("exit: 1"));
+        assert!(summary.chars().count() <= 16_000);
+    }
+
+    #[test]
+    fn denied_failed_and_interrupted_tools_are_distinguished() {
+        let mut turns = vec![user("Update the file safely.")];
+        for (id, result) in [
+            (
+                "failed",
+                ToolResultBody::Error {
+                    message: "file changed since read".into(),
+                    retryable: false,
+                },
+            ),
+            (
+                "denied",
+                ToolResultBody::Denied {
+                    reason: "user refused edit".into(),
+                },
+            ),
+            ("interrupted", ToolResultBody::Interrupted),
+        ] {
+            turns.push(assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "Edit".into(),
+                    arguments: Arc::from(r#"{"file_path":"parser.rs"}"#),
+                }],
+            ));
+            turns.push(Turn::ToolResult {
+                call_id: id.into(),
+                tool: "Edit".into(),
+                result,
+                duration: Duration::ZERO,
+            });
+        }
+        let summary = compaction_summary(&turns);
+        assert!(summary.contains("file changed since read"));
+        assert!(summary.contains("user refused edit"));
+        assert!(summary.contains("interrupted"));
+        assert!(summary.contains("parser.rs"));
+    }
+
+    #[test]
+    fn repeated_compaction_remains_bounded_and_retains_the_latest_request() {
+        let mut turns = vec![user(
+            "Keep Unicode input valid and preserve the public API.",
+        )];
+        for round in 0..12 {
+            turns.push(assistant("🦀é 中 ".repeat(8_000), vec![]));
+            turns.push(Turn::ToolResult {
+                call_id: format!("verify-{round}"),
+                tool: "Bash".into(),
+                result: ToolResultBody::Ok {
+                    content: format!("latest verification {round}: 8 tests passed\nexit: 0").into(),
+                    truncated: false,
+                },
+                duration: Duration::ZERO,
+            });
+            let summary = compaction_summary(&turns);
+            assert!(summary.contains("preserve the public API"));
+            assert!(summary.contains(&format!("latest verification {round}: 8 tests passed")));
+            assert!(summary.chars().count() <= 16_000);
+            turns.push(Turn::SystemNote {
+                kind: NoteKind::Compaction,
+                text: summary,
+            });
+        }
+    }
+
+    #[test]
+    fn latest_request_after_a_compaction_replaces_the_pinned_request() {
+        let turns = vec![
+            user("Old request marker"),
+            Turn::SystemNote {
+                kind: NoteKind::Compaction,
+                text: "Previous task summary".into(),
+            },
+            user("New request marker: leave permissions unchanged."),
+            assistant("new activity ".repeat(5_000), vec![]),
+        ];
+        let summary = compaction_summary(&turns);
+        assert!(summary.starts_with("Latest user request:\nNew request marker"));
+        assert!(summary.contains("leave permissions unchanged"));
+        assert!(!summary.contains("Old request marker"));
     }
 }
