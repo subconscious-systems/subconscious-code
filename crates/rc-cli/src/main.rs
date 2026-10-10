@@ -981,6 +981,15 @@ async fn run_headless(
     print_result(&session, outcome);
     sink.print_context();
     sink.finalize(&session, outcome)?;
+    // Publish the complete diagnostic prefix before signaling failure to shell
+    // callers. An exhausted budget or cut stream is not a completed run, even
+    // when the provider emitted useful partial text.
+    if outcome != LoopOutcome::Stop {
+        anyhow::bail!(
+            "headless run did not complete: {}",
+            benchmark_outcome_label(outcome)
+        );
+    }
     Ok(())
 }
 

@@ -28,6 +28,38 @@ trajectory includes user-visible messages and tool activity, so treat it as
 sensitive. External orchestrators should invoke this CLI contract rather than
 requiring an adapter package from this repository.
 
+Headless exit status is part of that contract: `0` means the agent loop ended
+with a clean `stop`; `1` means it failed, exhausted a budget, stopped making
+progress, was cancelled, or received an incomplete response. Partial stdout,
+the final report, and the trajectory remain available on unsuccessful runs.
+Startup or artifact-writing failures also return `1`; CLI argument errors
+return `2`.
+
+A clean `stop` measures runtime completion, not whether a coding task was
+solved. Grade the resulting files and the task's acceptance tests independently.
+For example, a run that correctly reports a permission denial can stop normally
+without making the requested edit. Record resolved tasks separately from runtime
+failures, along with the model, revision, budgets, and multiple trial results.
+
+## Offline harness contracts
+
+Exercise the real binary through a local scripted SSE provider:
+
+```sh
+cargo test --locked -p rc-cli --test harness_contract
+```
+
+These tests cover clean completion, iteration and time limits, repeated partial
+answers, reasoning-only non-progress, content filtering, provider failure,
+permission denial, and a read–edit–verify workflow. They inspect terminal
+artifacts and the actual modified file instead of accepting an assistant's
+claim of success. Each run uses isolated configuration and a dummy credential;
+no live model API is used. The workspace CI jobs run this suite automatically.
+
+This suite checks deterministic harness behavior. Live-model task success still
+requires independently graded tasks under fixed model and resource budgets;
+passing these contracts does not establish a coding benchmark score.
+
 ## DLR and TTFT measurements
 
 [`integrations/dlr`](../integrations/dlr/README.md) contains protocol tests,
