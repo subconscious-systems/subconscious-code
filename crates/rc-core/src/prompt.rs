@@ -29,6 +29,8 @@ pub enum AskResponse {
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Prompter: Send + Sync {
+    // async_trait adds #[must_use] to a Future already marked must_use.
+    #[allow(clippy::double_must_use)]
     async fn ask(&self, tool: &str, input: &Value, reason: &str) -> AskResponse;
 }
 

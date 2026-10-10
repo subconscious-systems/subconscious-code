@@ -107,7 +107,10 @@ impl Tool for Glob {
             None => std::fs::canonicalize(&ctx.cwd).unwrap_or_else(|_| ctx.cwd.clone()),
         };
 
-        let matcher = match globset::Glob::new(&inp.pattern) {
+        let matcher = match globset::GlobBuilder::new(&inp.pattern)
+            .literal_separator(true)
+            .build()
+        {
             Ok(g) => g.compile_matcher(),
             Err(e) => {
                 return Ok(ToolOutcome::Error {
@@ -190,6 +193,50 @@ mod tests {
                 assert!(!content.contains("README.md"), "{content}");
             }
             o => panic!("expected ok, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcards_only_match_within_one_path_segment() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        for path in ["root.rs", "src/main.rs", "src/nested/deep.rs"] {
+            std::fs::write(dir.path().join(path), "x").unwrap();
+        }
+
+        for (pattern, expected) in [
+            ("*.rs", vec!["root.rs"]),
+            ("src/*.rs", vec!["src/main.rs"]),
+            ("src/????.rs", vec!["src/main.rs"]),
+            ("src/[mn]*.rs", vec!["src/main.rs"]),
+            ("src/**/*.rs", vec!["src/main.rs", "src/nested/deep.rs"]),
+            (
+                "**/*.rs",
+                vec!["root.rs", "src/main.rs", "src/nested/deep.rs"],
+            ),
+        ] {
+            let outcome = Glob::new()
+                .call(json!({"pattern": pattern}), &test_ctx(dir.path()))
+                .await
+                .unwrap();
+            let ToolOutcome::Ok { content, .. } = outcome else {
+                panic!("expected matches for {pattern}, got {outcome:?}");
+            };
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let mut actual: Vec<_> = content
+                .lines()
+                .map(|path| {
+                    std::path::Path::new(path)
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            actual.sort();
+            let mut expected = expected;
+            expected.sort();
+            assert_eq!(actual, expected, "pattern: {pattern}");
         }
     }
 
